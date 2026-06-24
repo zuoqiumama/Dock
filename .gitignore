@@ -1,0 +1,15 @@
+target/
+outputs/
+.codex-target*/
+.runtime-preview/
+.agents/
+.codex/
+docs/superpowers/
+**/*.rs.bk
+Cargo.lock.bak
+/_dbg.txt
+/_dbgo.txt
+/_o2.txt
+/_r2.txt
+/问题审查.md
+/规划.md

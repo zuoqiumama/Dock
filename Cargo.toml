@@ -1,0 +1,46 @@
+[package]
+name = "featherdock"
+version = "0.1.0"
+edition = "2021"
+description = "An ultra-light, GPU-composited macOS-style dock for Windows"
+license = "MIT"
+
+[dependencies]
+# Pinned to 0.58 on purpose: 0.59+ switched to raw-dylib linking which needs a
+# working 64-bit dlltool+as at build time. This machine only has a broken 32-bit
+# MinGW assembler, so we use 0.58 which ships PREBUILT import libs (windows-targets)
+# and needs no dlltool/as. See .cargo/config.toml for the matching linker setup.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_DirectComposition",
+    "Win32_Graphics_DirectWrite",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Accessibility",
+    "Win32_UI_Controls",
+    "Win32_UI_Shell",
+    "Win32_System_Com",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_Storage_FileSystem",
+    "Win32_Graphics_Imaging",
+    "Win32_Graphics_Dwm",
+    "Foundation_Numerics",
+] }
+
+# Smallest possible release binary — aligns with the "extreme low footprint" goal.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
