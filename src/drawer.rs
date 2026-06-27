@@ -68,17 +68,27 @@ const ICON: f32 = 46.0;
 const GAP_X: f32 = 6.0;
 const GAP_Y: f32 = 6.0;
 const RADIUS: f32 = 18.0;
-const OPEN_ANIM_SECS: f32 = 0.24;
+const OPEN_ANIM_SECS: f32 = 0.26;
 const CLOSE_ANIM_SECS: f32 = 0.13;
 /// How far (device px @96dpi) the panel rises into place as it pops open.
-const RISE: f32 = 11.0;
-const TILE_RISE: f32 = 8.0;
-const TILE_STAGGER_SECS: f32 = 0.010;
+const RISE: f32 = 12.0;
+const TILE_RISE: f32 = 9.0;
+const HEADER_RISE: f32 = 6.0;
+/// Seconds the open "cascade" front takes to sweep top→bottom across the viewport,
+/// so headers and tiles assemble as one wave instead of a flat per-index stagger.
+const WAVE_SECS: f32 = 0.09;
 const SECTION_H: f32 = 30.0; // per-category header row height
 const SECTION_GAP: f32 = 6.0; // vertical gap between category sections
 const ADD_H: f32 = 34.0; // the "new category" button row at the bottom
 /// Ignore a re-open landing right after a click-away close (avoids button-toggle flicker).
 const REOPEN_GUARD_MS: u32 = 220;
+
+/// Self-posted "render the next animation frame" message. Posting it (rather than ticking
+/// a 16ms `SetTimer`) lets the open/close animation render once per vsync — matching the
+/// dock's refresh-rate-smooth magnification on high-refresh panels — because `present(1)`
+/// blocks until vsync, then we re-post. When the animation settles we stop posting and the
+/// thread falls straight back to a blocking `GetMessage` (0% idle).
+const WM_ANIM: u32 = WM_APP + 0x30;
 
 const ID_CTX_OPEN: usize = 3101;
 const ID_CTX_PIN: usize = 3102;
@@ -118,6 +128,7 @@ struct Drawer {
     dpi: f32,
     width: f32,
     height: f32,
+    anchor_x: f32, // dock-button centre in client px → the pop's horizontal scale origin
     viewport_h: f32, // device px of the scrollable area (below the fixed title)
     scroll: f32,
     max_scroll: f32,
@@ -126,6 +137,7 @@ struct Drawer {
     editing: bool, // a rename/new-category popup is open → don't dismiss on deactivate
     closing: bool,
     anim_start: Instant,
+    anim_pending: bool, // a WM_ANIM frame is already queued → don't post a second
 }
 
 fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
@@ -160,10 +172,12 @@ fn ease_in_cubic(t: f32) -> f32 {
     t * t * t
 }
 
-fn tile_progress(open_elapsed: f32, index: usize) -> f32 {
-    let delay = index.min(14) as f32 * TILE_STAGGER_SECS;
-    let span = (OPEN_ANIM_SECS - delay).max(0.001);
-    smoothstep((open_elapsed - delay) / span)
+/// Snappy onset with a long, gentle settle — reads as more "premium" than cubic and,
+/// unlike a back-ease, never overshoots past 1.0 (the window is sized to the panel, so
+/// an overshoot would clip).
+fn ease_out_quint(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    1.0 - (1.0 - t).powi(5)
 }
 
 fn offset_rect(r: D2D_RECT_F, dx: f32, dy: f32) -> D2D_RECT_F {
@@ -233,6 +247,20 @@ fn to_d2d(r: drawer_layout::Rect) -> D2D_RECT_F {
 impl Drawer {
     fn grid_top(&self) -> f32 {
         HEADER_H * self.dpi
+    }
+
+    /// Per-row open progress (0→1) for a content-space element at vertical `content_top`.
+    /// Elements near the top of the viewport start first and lower ones follow, so the
+    /// whole drawer — section headers, tiles and the add button — assembles as a single
+    /// top-to-bottom wave. Closing returns 1.0 so the dismiss is a flat, quick fade.
+    fn row_progress(&self, elapsed: f32, content_top: f32) -> f32 {
+        if self.closing {
+            return 1.0;
+        }
+        let frac = ((content_top - self.scroll) / self.viewport_h.max(1.0)).clamp(0.0, 1.0);
+        let delay = frac * WAVE_SECS;
+        let span = (OPEN_ANIM_SECS - WAVE_SECS).max(0.001);
+        ease_out_cubic((elapsed - delay) / span)
     }
 
     /// Recompute the sections + geometry from the current entries and categories,
@@ -503,17 +531,19 @@ unsafe fn render(panel: &Drawer) {
         (1.0 - smoothstep(t), 1.0 - ease_in_cubic(t))
     } else {
         let t = (elapsed / OPEN_ANIM_SECS).clamp(0.0, 1.0);
-        (smoothstep(t), ease_out_cubic(t))
+        (smoothstep(t), ease_out_quint(t))
     };
     let dpi = panel.dpi;
     let s = |v: f32| v * dpi;
     let dc = panel.glass.dc();
 
-    // The whole panel subtly scales and rises from the dock button. Close reverses the
-    // same transform, keeping the motion spatial instead of snapping away.
+    // The whole panel subtly scales and rises from the dock button. We anchor the scale
+    // at the button's X (not the panel centre) so a panel clamped to a monitor edge still
+    // appears to grow *out of the button that summoned it*. Close reverses the same
+    // transform, keeping the motion spatial instead of snapping away.
     let open_scale = 0.96 + 0.04 * e;
     let open_dy = (1.0 - e) * RISE * dpi;
-    let base = scale_about(open_scale, panel.width / 2.0, panel.height, open_dy);
+    let base = scale_about(open_scale, panel.anchor_x, panel.height, open_dy);
 
     dc.BeginDraw();
     dc.Clear(Some(&rgba(0.0, 0.0, 0.0, 0.0)));
@@ -624,7 +654,10 @@ unsafe fn render(panel: &Drawer) {
             continue;
         }
         let sec = &panel.sections[band.section];
-        let hdr = to_d2d(band.header);
+        // Ride the same top-to-bottom wave as the tiles below this header.
+        let hp = panel.row_progress(elapsed, band.header.top);
+        let ha = a * hp;
+        let hdr = offset_rect(to_d2d(band.header), 0.0, (1.0 - hp) * s(HEADER_RISE));
         let is_custom = matches!(sec.kind, SectionKind::Custom(_));
         let name = if sec.entries.is_empty() {
             sec.name.clone()
@@ -643,10 +676,10 @@ unsafe fn render(panel: &Drawer) {
             &name,
             &panel.section,
             label_rc,
-            rgba(0.86, 0.88, 0.93, 0.92 * a),
+            rgba(0.86, 0.88, 0.93, 0.92 * ha),
             false,
         );
-        panel.brush.SetColor(&rgba(1.0, 1.0, 1.0, 0.07 * a));
+        panel.brush.SetColor(&rgba(1.0, 1.0, 1.0, 0.07 * ha));
         let ly = hdr.bottom - s(1.0);
         dc.FillRectangle(&rect(hdr.left, ly, hdr.right, ly + s(1.0)), &panel.brush);
         if is_custom {
@@ -657,7 +690,7 @@ unsafe fn render(panel: &Drawer) {
                 "\u{270E}",
                 &panel.center,
                 ren,
-                rgba(0.82, 0.85, 0.92, 0.7 * a),
+                rgba(0.82, 0.85, 0.92, 0.7 * ha),
                 false,
             );
             draw_text(
@@ -666,7 +699,7 @@ unsafe fn render(panel: &Drawer) {
                 "\u{2715}",
                 &panel.center,
                 del,
-                rgba(0.90, 0.62, 0.62, 0.7 * a),
+                rgba(0.90, 0.62, 0.62, 0.7 * ha),
                 false,
             );
         }
@@ -682,11 +715,7 @@ unsafe fn render(panel: &Drawer) {
             .as_ref()
             .is_some_and(|d| d.active && d.entry == cell.entry);
         let hovered = panel.hovered == i as i32 && panel.drag.is_none();
-        let cell_a = if panel.closing {
-            1.0
-        } else {
-            tile_progress(elapsed, i)
-        };
+        let cell_a = panel.row_progress(elapsed, cell.rect.top);
         let rise = (1.0 - cell_a) * s(TILE_RISE);
         draw_cell(
             panel,
@@ -698,17 +727,20 @@ unsafe fn render(panel: &Drawer) {
         );
     }
 
-    // "new category" button at the bottom of the content
-    let ab = to_d2d(panel.layout.add_button);
-    if ab.bottom >= vis_top && ab.top <= vis_bot {
+    // "new category" button at the bottom of the content (last to ride the wave in)
+    let ab0 = to_d2d(panel.layout.add_button);
+    if ab0.bottom >= vis_top && ab0.top <= vis_bot {
+        let abp = panel.row_progress(elapsed, panel.layout.add_button.top);
+        let aba = a * abp;
+        let ab = offset_rect(ab0, 0.0, (1.0 - abp) * s(HEADER_RISE));
         let round = D2D1_ROUNDED_RECT {
             rect: ab,
             radiusX: s(10.0),
             radiusY: s(10.0),
         };
-        panel.brush.SetColor(&rgba(1.0, 1.0, 1.0, 0.05 * a));
+        panel.brush.SetColor(&rgba(1.0, 1.0, 1.0, 0.05 * aba));
         dc.FillRoundedRectangle(&round, &panel.brush);
-        panel.brush.SetColor(&rgba(1.0, 1.0, 1.0, 0.16 * a));
+        panel.brush.SetColor(&rgba(1.0, 1.0, 1.0, 0.16 * aba));
         dc.DrawRoundedRectangle(&round, &panel.brush, s(1.0), None);
         let txt = rect(ab.left + s(10.0), ab.top, ab.right - s(10.0), ab.bottom);
         draw_text(
@@ -717,7 +749,7 @@ unsafe fn render(panel: &Drawer) {
             "＋  新建分类",
             &panel.section,
             txt,
-            rgba(0.82, 0.85, 0.90, 0.92 * a),
+            rgba(0.82, 0.85, 0.90, 0.92 * aba),
             false,
         );
     }
@@ -769,7 +801,16 @@ unsafe fn render(panel: &Drawer) {
     let _ = panel.glass.present();
 }
 
-/// Drive the open/close fade. Returns false once settled so the caller can drop the timer.
+/// Queue the next animation frame, unless one is already in flight (which would compound
+/// the self-post loop and double the render rate). Cleared as each WM_ANIM is handled.
+unsafe fn schedule_frame(hwnd: HWND, panel: &mut Drawer) {
+    if !panel.anim_pending {
+        panel.anim_pending = true;
+        let _ = PostMessageW(hwnd, WM_ANIM, WPARAM(0), LPARAM(0));
+    }
+}
+
+/// Drive the open/close fade. Returns false once settled so the caller stops re-posting.
 unsafe fn animate(hwnd: HWND, panel: &Drawer) -> bool {
     render(panel);
     let elapsed = panel.anim_start.elapsed().as_secs_f32();
@@ -794,8 +835,8 @@ unsafe fn start_close(hwnd: HWND, panel: &mut Drawer) {
     panel.drag = None;
     let _ = ReleaseCapture();
     panel.anim_start = Instant::now();
-    SetTimer(hwnd, 1, 16, None);
     render(panel);
+    schedule_frame(hwnd, panel);
 }
 
 /// Press on a tile arms a potential drag (it becomes a plain click if it never moves
@@ -1226,6 +1267,10 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
         y = y.max(info.rcWork.top + m);
     }
 
+    // The dock button's centre expressed in the panel's own client space (device px). The
+    // panel may have been clamped sideways, so this is where the pop should grow *from*.
+    let anchor_x = ((anchor_cx - x) as f32).clamp(0.0, width);
+
     let Ok(hwnd) = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP,
         class_name,
@@ -1281,6 +1326,7 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
         dpi,
         width,
         height,
+        anchor_x,
         viewport_h,
         scroll: 0.0,
         max_scroll,
@@ -1289,6 +1335,7 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
         editing: false,
         closing: false,
         anim_start: Instant::now(),
+        anim_pending: false,
     }));
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, panel as isize);
     PANEL_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
@@ -1296,7 +1343,7 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
     render(&*panel);
     let _ = ShowWindow(hwnd, SW_SHOW);
     let _ = SetForegroundWindow(hwnd);
-    SetTimer(hwnd, 1, 16, None);
+    schedule_frame(hwnd, &mut *panel);
 }
 
 /// Build the brush + the text formats (drawer title, section header, centred small
@@ -1375,9 +1422,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
     unsafe {
         let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Drawer;
         match msg {
-            WM_TIMER => {
-                if !ptr.is_null() && !animate(hwnd, &*ptr) {
-                    let _ = KillTimer(hwnd, 1);
+            WM_ANIM if !ptr.is_null() => {
+                // Render this frame, then re-post for the next vsync while still animating.
+                // `animate` may DestroyWindow on the final close frame (freeing `ptr`), so
+                // clear the in-flight flag *before* calling it and never touch `ptr` after.
+                (*ptr).anim_pending = false;
+                if animate(hwnd, &*ptr) {
+                    schedule_frame(hwnd, &mut *ptr);
                 }
                 LRESULT(0)
             }
@@ -1457,7 +1508,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_DESTROY => {
-                let _ = KillTimer(hwnd, 1);
                 LAST_CLOSED_TICK.store(GetTickCount(), Ordering::Relaxed);
                 PANEL_HWND.store(0, Ordering::Relaxed);
                 if !ptr.is_null() {
