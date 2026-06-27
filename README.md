@@ -16,19 +16,37 @@
   <img alt="License" src="https://img.shields.io/badge/License-MIT-35a46b?style=for-the-badge">
 </p>
 
-![FeatherDock preview](docs/images/featherdock-preview.png)
-
 <p align="center">
-  <img src="docs/images/featherdock-drawer.png" width="49%" alt="FeatherDock app drawer">
-  <img src="docs/images/featherdock-control.png" width="49%" alt="FeatherDock control center">
+  <img src="docs/images/dock.png" width="760" alt="FeatherDock 主条">
 </p>
 
-FeatherDock 是一个为 Windows 打造的轻量级 Dock。它用 Rust 和 Windows 原生图形栈实现悬停放大、点击弹跳、自动隐藏、运行窗口分组、DWM 缩略图预览、程序抽屉和控制中心，不依赖 Electron、WebView 或常驻扫描服务。
+FeatherDock 是一个 Windows 上的 Dock，用 Rust 直接写在系统原生图形栈上（DirectComposition + Direct2D + D3D11），不用 Electron 或 WebView，也没有常驻的后台扫描进程。可执行文件六百多 KB，放着不动的时候几乎不占 CPU。
+
+常用的功能都在：图标悬停放大，正在运行的窗口按程序归组、图标下标一个小圆点，悬停能看实时缩略图。另外有一个把桌面程序分类整理的程序抽屉，和一个管音量、网络、时间的控制中心。
+
+## 截图
+
+程序抽屉把桌面上的程序按你自己分的类列出来。可以拖动图标归类，右键能固定到 Dock、移除，或新建 / 重命名分类；`此电脑`、`回收站`、`控制面板` 这些也一并收了进来：
+
+<p align="center">
+  <img src="docs/images/drawer.png" width="300" alt="程序抽屉">
+</p>
+
+悬停一个正在运行的窗口，弹出它的实时缩略图：
+
+<p align="center">
+  <img src="docs/images/thumbnail.png" width="600" alt="窗口缩略图预览">
+</p>
+
+控制中心放了音量、网络 / 蓝牙 / 输入法，以及电量和时间：
+
+<p align="center">
+  <img src="docs/images/control-center.png" width="340" alt="控制中心">
+</p>
 
 ## Highlights
 
 - 原生 GPU 合成：DirectComposition + Direct2D + D3D11 + DirectWrite
-- 全新应用图标：同步提供 SVG、PNG、ICO 和 Windows resource 对象
 - Dock 动效：悬停放大、点击弹跳、自动隐藏滑入滑出、全屏/最大化时收起
 - 程序抽屉：玻璃弹层从 Dock 按钮位置展开，开合动画跟随屏幕刷新率（每个 vsync 渲染），分类标题与图标逐行波浪式淡入
 - 抽屉自定义：右键程序可 `固定到 Dock`、`移除该程序`、`放入分类`，也可新建/重命名/删除分类
