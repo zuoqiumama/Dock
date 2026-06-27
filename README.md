@@ -4,10 +4,10 @@
   <img src="assets/featherdock-256.png" width="96" height="96" alt="FeatherDock icon">
 </p>
 
-<h3 align="center">A tiny, GPU-composited dock for Windows.</h3>
+<h3 align="center">A tiny, GPU-composited dock and app drawer for Windows.</h3>
 
 <p align="center">
-  <strong>Rust</strong> · <strong>DirectComposition</strong> · <strong>Direct2D</strong> · <strong>D3D11</strong>
+  <strong>Rust</strong> · <strong>DirectComposition</strong> · <strong>Direct2D</strong> · <strong>D3D11</strong> · <strong>Win32</strong>
 </p>
 
 <p align="center">
@@ -18,52 +18,66 @@
 
 ![FeatherDock preview](docs/images/featherdock-preview.png)
 
-FeatherDock 是一个为 Windows 打造的轻量级 Dock。它把应用、文件、文件夹、
-图片和正在运行的窗口放在同一排，用 Rust + Windows 原生图形栈实现悬停放大、
-点击弹跳、自动隐藏和托盘管理。
+<p align="center">
+  <img src="docs/images/featherdock-drawer.png" width="49%" alt="FeatherDock app drawer">
+  <img src="docs/images/featherdock-control.png" width="49%" alt="FeatherDock control center">
+</p>
+
+FeatherDock 是一个为 Windows 打造的轻量级 Dock。它用 Rust 和 Windows 原生图形栈实现悬停放大、点击弹跳、自动隐藏、运行窗口分组、DWM 缩略图预览、程序抽屉和控制中心，不依赖 Electron、WebView 或常驻扫描服务。
 
 ## Highlights
 
-- 单文件发布：`release/FeatherDock.exe`
-- 当前优化构建约 **380 KiB**
-- DirectComposition + Direct2D + D3D11 + DirectWrite 原生 GPU 合成
-- 悬停放大、点击弹跳、底部边缘唤出和自动隐藏
-- 可固定应用、快捷方式、普通文件、文件夹和图片
-- 图片使用一次性 WIC 缩略图，其他内容使用 Windows Shell 图标
-- 右侧显示正在运行的窗口，中间用分隔线区分固定内容和运行窗口
-- 托盘菜单支持添加内容、切换 Dock 模式、打开设置和退出
-- 配置保存到 `%APPDATA%\FeatherDock\featherdock.toml`
-- 无 Electron、无 WebView、无额外应用运行时依赖
+- 原生 GPU 合成：DirectComposition + Direct2D + D3D11 + DirectWrite
+- 全新应用图标：同步提供 SVG、PNG、ICO 和 Windows resource 对象
+- Dock 动效：悬停放大、点击弹跳、自动隐藏滑入滑出、全屏/最大化时收起
+- 程序抽屉：Dock 内置应用抽屉按钮，玻璃弹层、自然开合动画和滚动布局
+- 抽屉自定义：右键程序可 `固定到 Dock`、`移除该程序`、`放入分类`，也可新建/重命名/删除分类
+- 系统入口：程序抽屉保留 `此电脑`、`回收站`、`控制面板`
+- 低资源策略：抽屉扫描结果写入缓存，按 TTL 和桌面签名失效；没有后台文件扫描器
+- 窗口体验：运行窗口按应用分组，悬停时按需创建 DWM 缩略图预览
+- 控制中心：从 Dock 打开任务栏模式、桌面图标、窗口预览等常用开关
+- 桌面模式：可隐藏 Windows 桌面图标，把桌面程序交给抽屉管理
+- 单文件发布：`build.ps1` 产出仓库根目录的 `FeatherDock.exe`
 
-## Download And Run
+## Build And Run
 
-当前仓库只保留一个发布版：
+可执行文件不提交到仓库。运行构建脚本后，最终产物会收敛到仓库根目录的单个 `FeatherDock.exe`：
 
-```text
-release/FeatherDock.exe
+```powershell
+.\build.ps1          # 构建 release 并生成根目录 FeatherDock.exe
+.\build.ps1 -Run     # 构建后立即启动
+.\build.ps1 -Clean   # 先 cargo clean，再从零构建
 ```
 
-双击即可启动。FeatherDock 会显示在主屏幕底部，并以 no-activate 的方式保持在
-顶层；右键托盘图标或 Dock 左侧的 Start tile 可以打开菜单。
+规则很简单：需要分发或日常运行时，只运行根目录的 `FeatherDock.exe`。`target\` 下的 exe 只是 cargo 构建缓存。
 
 ## Usage
 
-添加内容有两种方式：
+Dock 常用交互：
+
+- 悬停图标会放大，点击固定项目会启动或激活它。
+- 点击运行窗口项目会激活对应窗口；同一应用的多个窗口会归为一组。
+- 悬停运行窗口可显示 DWM 缩略图预览。
+- 左侧 Start 按钮打开 Windows 开始菜单，右侧 Control 按钮打开 FeatherDock 控制中心。
+- 托盘菜单和设置窗口可切换常驻 / 自动隐藏、任务栏显示策略、桌面图标隐藏和抽屉按钮。
+
+程序抽屉：
+
+- 点击 Dock 上的应用抽屉按钮打开桌面程序列表。
+- 抽屉会扫描用户桌面、OneDrive 桌面和公共桌面上的程序/快捷方式，并自动加入 `此电脑`、`回收站`、`控制面板`。
+- 右键程序可打开、固定到 Dock、移除该程序或放入分类。
+- 拖拽程序可调整分类位置；右键空白处可新建分类、恢复已移除项目或刷新程序列表。
+- 抽屉扫描结果缓存在 `%APPDATA%\FeatherDock\drawer-cache.tsv`，正常打开不会反复遍历 Shell namespace。
+
+添加 Dock 固定项：
 
 - 从 Explorer 拖入应用、快捷方式、文件、文件夹或图片。
 - 在托盘菜单中选择 `添加文件或应用...` 或 `添加文件夹...`。
-
-常用交互：
-
-- 悬停图标会放大。
-- 点击固定项目会打开它。
-- 点击运行窗口项目会激活对应窗口。
-- 右键固定项目可以打开、在 Explorer 中定位或从 Dock 移除。
-- 托盘菜单可以切换常驻模式和自动隐藏模式。
+- 从程序抽屉右键程序，选择 `固定到 Dock`。
 
 ## Configuration
 
-主配置文件：
+固定项配置：
 
 ```text
 %APPDATA%\FeatherDock\featherdock.toml
@@ -90,13 +104,28 @@ path = "C:\\Tools\\tool.exe"
 icon = "C:\\Tools\\tool.ico"
 ```
 
-Dock 行为设置保存在：
+Dock 行为设置：
 
 ```text
 %APPDATA%\FeatherDock\settings.toml
 ```
 
-支持常驻 / 自动隐藏、全屏应用前自动收起、以及任务栏显示策略。
+支持项包括：
+
+- `dock_mode = "always" | "autohide"`
+- `taskbar_mode = "show" | "autohide" | "hidden"`
+- `hide_on_fullscreen = true | false`
+- `hide_on_maximized = true | false`
+- `drawer_enabled = true | false`
+- `hide_desktop_icons = true | false`
+
+程序抽屉自定义：
+
+```text
+%APPDATA%\FeatherDock\drawer.toml
+```
+
+`drawer.toml` 保存用户分类和被移除的抽屉项目；移除只影响抽屉显示，不删除真实快捷方式或应用。
 
 ## Build From Source
 
@@ -106,7 +135,14 @@ Dock 行为设置保存在：
 - Rust stable toolchain
 - `rust-toolchain.toml` 中固定的 Windows GNU target
 
-命令：
+发布构建（推荐，产出唯一的 `FeatherDock.exe`）：
+
+```powershell
+.\build.ps1            # = cargo build --release + 收敛成根目录单个 exe
+.\build.ps1 -Clean     # 先 cargo clean，再从零构建
+```
+
+开发期的常用 cargo 命令：
 
 ```powershell
 cargo build
@@ -114,25 +150,38 @@ cargo test
 cargo build --release
 ```
 
+> 注意：直接用 `cargo build` / `cargo run` 会在 `target\` 下生成临时 exe。需要最终运行或分发的 exe 时，请用 `build.ps1`。
+
 本项目通过 `.cargo/gnu-linker.cmd` 定位 Rustup 自带的 GNU linker，并将
 `windows` crate 固定在 `0.58`，以使用预构建 import libraries，避免依赖本机
-`dlltool` 或 `as` 的状态。
+`dlltool` 或 `as` 的状态。应用图标资源使用预生成的 `assets/featherdock.res.o` 链接进 Windows 可执行文件。
 
 ## Project Layout
 
 | Path | Purpose |
 | --- | --- |
-| `src/main.rs` | Win32 window、DPI、消息循环、输入和启动行为 |
+| `src/main.rs` | Win32 window、DPI、消息循环、输入、托盘和全局状态 |
+| `src/dock.rs` | Dock 布局、放大曲线、自动隐藏和动画 easing |
+| `src/render.rs` | Direct2D 绘制圆角底座、图标、Start / Control / Drawer glyph |
 | `src/graphics.rs` | D3D11、DXGI、Direct2D、DirectComposition、图标 bitmap |
-| `src/dock.rs` | Dock 布局、放大曲线、动画 easing、命中测试 |
-| `src/render.rs` | Direct2D 绘制圆角底座、图标、fallback tile 和 glyph |
-| `src/content.rs` | 应用、文件、文件夹、图片的内容分类 |
-| `src/config.rs` | APPDATA 配置、旧配置迁移、去重、原子写入 |
-| `src/icons.rs` | WIC 图片缩略图和 Windows Shell 图标提取 |
-| `src/tray.rs` | 托盘图标、菜单、Explorer 重启恢复 |
+| `src/apps.rs` | 内置按钮、默认应用、运行窗口和固定项合并 |
+| `src/drawer.rs` | 程序抽屉窗口、开合动画、右键菜单、拖拽分类 |
+| `src/drawer_layout.rs` | 抽屉分类布局、命中测试和 drop target 计算 |
+| `src/drawer_input.rs` | 分类名称输入弹窗 |
+| `src/desktop_scan.rs` | Shell 桌面枚举、系统入口、抽屉缓存和启动逻辑 |
+| `src/categories.rs` | 抽屉分类、隐藏项和 `drawer.toml` 持久化 |
+| `src/control_center.rs` | FeatherDock 控制中心 |
+| `src/settings.rs` | `settings.toml` 设置模型 |
 | `src/settings_window.rs` | 原生设置窗口 |
+| `src/taskbar.rs` | Windows 任务栏 show / autohide / hidden 策略 |
+| `src/window_preview.rs` | DWM 窗口缩略图预览 |
+| `src/windows_list.rs` | WinEvent 驱动的运行窗口分组 |
+| `src/desktop_icons.rs` | Windows 桌面图标显示/隐藏 |
+| `src/watchdog.rs` | 进程异常退出后的任务栏恢复守护 |
+| `src/icons.rs` | WIC 图片缩略图、Shell 图标和 PIDL 图标提取 |
 | `assets/` | 应用图标和 Windows resource 资源 |
-| `release/` | 当前唯一发布版 |
+| `docs/images/` | README 截图 |
+| `build.ps1` | 唯一的发布构建脚本，产出根目录单个 `FeatherDock.exe` |
 
 ## Verification
 
@@ -143,8 +192,8 @@ Windows CI 会执行：
 - `cargo test`
 - `cargo build --release`
 
-本地重新发布时，先运行 `cargo build --release`，再把生成的 `featherdock.exe`
-复制到 `release/FeatherDock.exe`。
+本地重新发布只需运行 `build.ps1`，它会执行 `cargo build --release` 并在仓库根目录
+生成唯一的 `FeatherDock.exe`（同时清理 `target\` 下所有中间 exe）。
 
 ## License
 

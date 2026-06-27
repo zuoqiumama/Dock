@@ -1,5 +1,15 @@
 target/
 outputs/
+
+# The single canonical build artifact, produced by build.ps1 at the repo root.
+# It is a build output, not source — never commit it. Run build.ps1 to (re)create.
+/FeatherDock.exe
+/featherdock.exe
+# Legacy publish folder (removed); keep ignored so a stray copy can't sneak back.
+/release/
+# Local capture/debug images from manual UI checks.
+/_*.png
+
 .codex-target*/
 .runtime-preview/
 .agents/

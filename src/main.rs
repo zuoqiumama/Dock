@@ -9,24 +9,36 @@ use std::time::{Duration, Instant};
 mod app_icon;
 mod apps;
 mod autostart;
+mod categories;
 mod config;
 mod content;
+mod control_center;
+mod desktop_icons;
+mod desktop_scan;
 mod dock;
+mod drawer;
+mod drawer_input;
+mod drawer_layout;
 mod error_log;
+mod glass;
 mod graphics;
 mod icons;
 mod render;
 mod settings;
 mod settings_window;
 mod single_instance;
+mod sysctl;
 mod taskbar;
 mod tray;
+mod watchdog;
+mod window_preview;
 mod windows_list;
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    CreateRoundRectRgn, DeleteObject, GetMonitorInfoW, MonitorFromWindow, SetWindowRgn, HGDIOBJ,
+    HRGN, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::System::Com::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -73,20 +85,55 @@ struct App {
     hooks: Vec<HWINEVENTHOOK>,    // WinEvent hooks tracking open windows
     running_sig: Vec<isize>,      // last seen open-window handles (change detection)
     settings: settings::Settings, // persisted dock mode + fullscreen behavior
-    fullscreen_active: bool,      // a fullscreen app is in front on our monitor
+    fullscreen_active: bool,      // a fullscreen (borderless) app is in front on our monitor
+    maximized_active: bool,       // a maximized (captioned) window is in front on our monitor
     animating: bool,
     tracking: bool,
     full: (i32, i32, i32, i32), // full window rect (x, y, w, h)
     strip_h: i32,               // window height when collapsed to the reveal strip
     expanded: bool,             // true = full window, false = thin bottom strip
+    window_hidden: bool,        // fully SW_HIDE'd because a fullscreen app is in front
+    region_full: bool,          // input region: true = whole window, false = clipped to pill
+    pending_relayout: bool,     // shrink the window to fit once exit animations settle
+    pending_rebuild: bool, // a window-set/display change deferred while a fullscreen app owned the screen
     taskbar_invoked_at: Option<Instant>,
+    watchdog: Option<std::process::Child>, // sibling that restores the taskbar if we crash
 }
 
-/// Where `reveal` should ease to when the cursor is NOT over the dock: hidden in
-/// auto-hide mode or while a fullscreen app is in front, otherwise resident.
+/// True while a fullscreen app (game / video) is in front and we're set to yield to it.
+/// In this state the dock is fully hidden — not merely collapsed to the reveal strip —
+/// and ignores bottom-edge hover, so it can never pop over a game and kick an exclusive-
+/// fullscreen title back to the desktop.
+fn fullscreen_suppressed(app: &App) -> bool {
+    app.settings.hide_on_fullscreen && app.fullscreen_active
+}
+
+/// True while a *maximized* window is in front and we're set to yield to it: the dock
+/// retracts to its reveal strip so it doesn't cover the window, but a bottom-edge hover
+/// STILL summons it — unlike `fullscreen_suppressed`, which fully hides it and ignores
+/// hover. (A window can't be both: maximized has a caption, fullscreen does not.)
+fn maximized_retracted(app: &App) -> bool {
+    app.settings.hide_on_maximized && app.maximized_active
+}
+
+/// True if a borderless monitor-filling app (a fullscreen game / video) is in front on
+/// the dock's monitor — the cue to keep the dock COMPLETELY passive: no `SetWindowPos`
+/// on our window, no window reflow. Any z-order churn at that moment knocks such an app
+/// out of exclusive fullscreen and bounces it to the desktop (the "can't enter the game"
+/// bug). Checked fresh (not from cached state) since a display-mode change can arrive
+/// before the foreground event that updates `fullscreen_active`.
+unsafe fn fullscreen_app_present(hwnd: HWND) -> bool {
+    let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    windows_list::is_fullscreen_present(monitor)
+}
+
+/// Where `reveal` should ease to when the cursor is NOT over the dock: hidden in auto-hide
+/// mode, while a fullscreen app is in front, or while a maximized window is in front;
+/// otherwise resident.
 fn resting_target(app: &App) -> f32 {
     let hide = app.settings.dock_mode == settings::DockMode::AutoHide
-        || (app.settings.hide_on_fullscreen && app.fullscreen_active);
+        || fullscreen_suppressed(app)
+        || maximized_retracted(app);
     if hide {
         0.0
     } else {
@@ -117,18 +164,44 @@ fn pinned_items() -> Result<Vec<dock::DockItem>> {
     }
 }
 
-/// Assemble the full dock row: Start, pinned apps, then (if any open windows) a
-/// divider followed by one slot per running window.
-fn compose_items(running: &[windows_list::RunningWindow]) -> Result<Vec<dock::DockItem>> {
-    let mut items = Vec::with_capacity(running.len() + 6);
-    items.push(apps::start_item());
-    items.extend(pinned_items()?);
-    if !running.is_empty() {
-        items.push(apps::divider_item());
-        for window in running {
-            items.push(apps::running_item(&window.title, window.hwnd));
+/// Assemble the full dock row: Start, pinned apps, then (if any open windows that
+/// AREN'T already pinned) a divider followed by one slot per such window group.
+///
+/// A running window whose executable matches a pinned app is *merged into that pinned
+/// icon* (it gains a running dot and activates on click) rather than shown a second
+/// time on the right — so the dock never carries the same app twice (macOS-style).
+fn compose_items(
+    running: &[windows_list::RunningWindow],
+    drawer_enabled: bool,
+) -> Result<Vec<dock::DockItem>> {
+    let mut pinned = pinned_items()?;
+    let mut unpinned: Vec<windows_list::RunningGroup> = Vec::new();
+    for group in windows_list::group_by_application(running) {
+        match pinned.iter_mut().find(|item| {
+            item.windows.is_empty()
+                && item
+                    .path
+                    .as_deref()
+                    .is_some_and(|path| apps::exe_matches(path, &group.key))
+        }) {
+            Some(item) => apps::attach_running(item, &group),
+            None => unpinned.push(group),
         }
     }
+
+    let mut items = Vec::with_capacity(pinned.len() + unpinned.len() + 4);
+    items.push(apps::start_item());
+    if drawer_enabled {
+        items.push(apps::drawer_item());
+    }
+    items.extend(pinned);
+    if !unpinned.is_empty() {
+        items.push(apps::divider_item());
+        for group in &unpinned {
+            items.push(apps::running_item(group));
+        }
+    }
+    items.push(apps::control_item()); // always last → fixed far-right button
     Ok(items)
 }
 
@@ -174,17 +247,71 @@ unsafe fn show_error(owner: HWND, context: &str, error: impl std::fmt::Display) 
 
 /// Grow the window to full size (to show the dock) or shrink it to a thin bottom
 /// strip (so the area it used to cover becomes genuinely click-through).
+/// Where the dock should sit in the z-order. Normally the top of the topmost band;
+/// while the user has explicitly revealed the system taskbar (Start click), just
+/// *below* the taskbar so they can operate it on top of the dock.
+unsafe fn dock_z_insert_after(app: &App) -> HWND {
+    if app.taskbar_invoked_at.is_some() {
+        let tray = taskbar::tray_hwnd();
+        if !tray.is_invalid() {
+            return tray;
+        }
+    }
+    HWND_TOPMOST
+}
+
+/// Drop the dock just below the (revealed) taskbar so the taskbar is operable; both
+/// stay topmost. Called when a Start click reveals the taskbar.
+unsafe fn place_dock_behind_taskbar(dock: HWND) {
+    let tray = taskbar::tray_hwnd();
+    if tray.is_invalid() {
+        return;
+    }
+    let _ = SetWindowPos(
+        tray,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    );
+    let _ = SetWindowPos(
+        dock,
+        tray,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    );
+}
+
+/// Restore the dock to the top of the topmost band (its normal resting z-order).
+unsafe fn raise_dock_topmost(dock: HWND) {
+    let _ = SetWindowPos(
+        dock,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    );
+}
+
 unsafe fn set_expanded(hwnd: HWND, app: &mut App, expand: bool) -> Result<()> {
     if app.expanded == expand {
         return Ok(());
     }
     let (x, y, w, h) = app.full;
+    let z = dock_z_insert_after(app);
     if expand {
-        SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE)
+        SetWindowPos(hwnd, z, x, y, w, h, SWP_NOACTIVATE)
     } else {
         SetWindowPos(
             hwnd,
-            HWND_TOPMOST,
+            z,
             x,
             y + h - app.strip_h,
             w,
@@ -196,6 +323,54 @@ unsafe fn set_expanded(hwnd: HWND, app: &mut App, expand: bool) -> Result<()> {
     Ok(())
 }
 
+/// Fully show or hide the dock window for fullscreen suppression — distinct from the
+/// auto-hide *strip*. A hidden window is out of the z-order entirely, so it can neither
+/// kick an exclusive-fullscreen game to the desktop nor be summoned by a bottom-edge
+/// hover. On re-show we leave the geometry at full size and let `reveal` animate the
+/// dock back in.
+unsafe fn set_window_hidden(hwnd: HWND, app: &mut App, hide: bool) {
+    if app.window_hidden == hide {
+        return;
+    }
+    app.window_hidden = hide;
+    let _ = ShowWindow(hwnd, if hide { SW_HIDE } else { SW_SHOWNOACTIVATE });
+}
+
+/// Clip the window's *input* region to just the visible pill (at rest) or remove the clip
+/// so the whole window takes input (while hovering / animating, when magnified icons rise
+/// above the pill and must stay interactive).
+///
+/// This is what truly frees the head-room above and slack beside the dock: `HTTRANSPARENT`
+/// from `WM_NCHITTEST` does NOT pass clicks through for this layered DirectComposition
+/// window — the window physically covers the area and swallows the click. A real window
+/// region makes those pixels not belong to the window at all, so clicks reach the app
+/// beneath (e.g. a Send button just above the dock). Rounded to match the pill's corners.
+unsafe fn set_region_full(hwnd: HWND, app: &mut App, full: bool) {
+    if app.region_full == full {
+        return;
+    }
+    app.region_full = full;
+    if full {
+        // NULL region = the whole window receives input again.
+        let _ = SetWindowRgn(hwnd, HRGN::default(), BOOL(1));
+        return;
+    }
+    let (l, t, r, b) = app.dock.frame().pill;
+    let ellipse = (44.0 * app.dock.dpi) as i32; // 2x the 22*dpi pill corner radius
+    let rgn = CreateRoundRectRgn(
+        l.floor() as i32,
+        t.floor() as i32,
+        r.ceil() as i32 + 1, // CreateRoundRectRgn's right/bottom are exclusive
+        b.ceil() as i32 + 1,
+        ellipse,
+        ellipse,
+    );
+    // On success the system owns the region; on failure we still own it -> free it.
+    if SetWindowRgn(hwnd, rgn, BOOL(1)) == 0 {
+        let _ = DeleteObject(HGDIOBJ(rgn.0));
+    }
+}
+
 /// Rebuild the dock from a fresh scan of open windows (e.g. after a config edit).
 unsafe fn reload_app(hwnd: HWND, app: &mut App) -> Result<()> {
     let running = windows_list::enumerate_sorted();
@@ -203,37 +378,61 @@ unsafe fn reload_app(hwnd: HWND, app: &mut App) -> Result<()> {
     reload_with(hwnd, app, &running)
 }
 
-/// Rebuild the dock from an already-enumerated window set: recompose items, resize
-/// the swapchain + window, re-extract icons, and kick a frame.
+/// Rebuild the dock from an already-enumerated window set. Reconciles the desired
+/// items against the live ones in place, so surviving slots keep their animation
+/// state and icon while new windows ease *in* and closed ones collapse *out* — no
+/// wholesale rebuild, no snap. The window is sized to the merged row at its widest
+/// (entering + exiting both counted) so nothing clips; the slack is reclaimed once
+/// the exit animations settle (`relayout_to_fit`).
 unsafe fn reload_with(
     hwnd: HWND,
     app: &mut App,
     running: &[windows_list::RunningWindow],
 ) -> Result<()> {
-    let prev_reveal = app.dock.reveal;
-    let items = compose_items(running)?;
-    let (dpi, x, y, width, height) = monitor_layout(hwnd, &items)?;
+    window_preview::hide();
+    // The pill width is about to change as slots ease in/out — drop any pill clip so the
+    // reconcile animation isn't cut off; the settle re-clips to the new pill at rest.
+    set_region_full(hwnd, app, true);
+    let desired = compose_items(running, app.settings.drawer_enabled)?;
+    let remap = app.dock.reconcile(desired);
+    let (dpi, x, y, width, height) = monitor_layout(hwnd, &app.dock.items)?;
     app.gpu.resize(width, height)?;
-    app.dock = Dock::new(items, dpi, width as f32, height as f32);
-    // Keep the current slide position so a list change doesn't flash the dock in
-    // or out; ease toward whatever the mode/fullscreen state currently wants.
-    app.dock.reveal = prev_reveal;
+    app.gpu.remap_icons(&remap, &app.dock.items);
+    // Update geometry on the (preserved) dock; reveal stays put so a list change
+    // never flashes the dock in or out — ease toward what the mode currently wants.
+    app.dock.dpi = dpi;
+    app.dock.win_w = width as f32;
+    app.dock.win_h = height as f32;
     app.dock.reveal_target = resting_target(app);
-    app.gpu.load_icons(&app.dock.items, dpi);
     app.full = (x, y, width as i32, height as i32);
     app.strip_h = ((6.0 * dpi).round() as i32).max(4);
     app.expanded = true;
-    SetWindowPos(
-        hwnd,
-        HWND_TOPMOST,
-        x,
-        y,
-        width as i32,
-        height as i32,
-        SWP_NOACTIVATE,
-    )?;
+    app.pending_relayout = true;
+    let z = dock_z_insert_after(app);
+    SetWindowPos(hwnd, z, x, y, width as i32, height as i32, SWP_NOACTIVATE)?;
     app.gpu.render(&app.dock)?;
     app.animating = true;
+    Ok(())
+}
+
+/// Resize the window to exactly fit the current item row, recentred on the monitor.
+/// Called once the appear/disappear animations settle: we hold the window wide while
+/// slots collapse so they don't clip, then reclaim the slack here. No-op when already
+/// the right size, so it's safe to call on every settle.
+unsafe fn relayout_to_fit(hwnd: HWND, app: &mut App) -> Result<()> {
+    let (dpi, x, y, width, height) = monitor_layout(hwnd, &app.dock.items)?;
+    if width as i32 == app.full.2 && height as i32 == app.full.3 {
+        return Ok(());
+    }
+    app.gpu.resize(width, height)?;
+    app.dock.dpi = dpi;
+    app.dock.win_w = width as f32;
+    app.dock.win_h = height as f32;
+    app.full = (x, y, width as i32, height as i32);
+    app.strip_h = ((6.0 * dpi).round() as i32).max(4);
+    let z = dock_z_insert_after(app);
+    SetWindowPos(hwnd, z, x, y, width as i32, height as i32, SWP_NOACTIVATE)?;
+    app.gpu.render(&app.dock)?;
     Ok(())
 }
 
@@ -247,10 +446,36 @@ unsafe fn recover_gpu(hwnd: HWND, app: &mut App) -> Result<()> {
 }
 
 fn main() {
+    // Watchdog mode: a tiny sibling copy of ourselves that restores the taskbar if the
+    // dock dies abnormally. Handle it before any GUI / single-instance / COM setup.
+    if let Some(args) = watchdog::parse_args() {
+        watchdog::run(args);
+        return;
+    }
     if let Err(error) = run() {
         unsafe {
             show_error(HWND::default(), "FeatherDock 启动失败", error);
         }
+    }
+}
+
+/// Install a panic hook that restores the taskbar before the default hook runs (and, in
+/// release builds, the process aborts without unwinding). Without this, a panic after we
+/// hid the taskbar would leave the user with no visible taskbar.
+fn install_taskbar_panic_guard() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        unsafe { taskbar::restore() };
+        previous(info);
+    }));
+}
+
+/// Ensure the abnormal-exit watchdog is running whenever the taskbar is in a modified
+/// mode. Idempotent: spawns at most one watchdog for the dock's lifetime (a death while
+/// in `Show` mode needs no restore, so we don't bother in that case).
+unsafe fn ensure_watchdog(app: &mut App) {
+    if app.watchdog.is_none() && app.settings.taskbar_mode != settings::TaskbarMode::Show {
+        app.watchdog = watchdog::spawn(taskbar::original_autohide());
     }
 }
 
@@ -283,7 +508,8 @@ fn run() -> Result<()> {
 
         let dpi = GetDpiForSystem() as f32 / 96.0;
         let running = windows_list::enumerate_sorted();
-        let items = compose_items(&running)?;
+        let dock_settings = settings::load();
+        let items = compose_items(&running, dock_settings.drawer_enabled)?;
         let (win_w, win_h) = dock::window_size(&items, dpi);
         // Anchor the window's bottom to the true screen bottom so the auto-hide
         // reveal trigger sits at the very edge (slam the mouse down to summon it).
@@ -313,12 +539,18 @@ fn run() -> Result<()> {
         let tray = Tray::new(hwnd);
         // Track open windows event-driven (no polling) so the right zone stays live.
         let hooks = windows_list::install_hooks(hwnd);
-        let dock_settings = settings::load();
         let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         let fullscreen_active = windows_list::is_fullscreen_present(monitor);
+        let maximized_active = windows_list::is_maximized_present(monitor);
+        // If a previous run died without restoring the taskbar (power loss, or both the
+        // dock and its watchdog killed at once), put it back BEFORE we read the "original"
+        // state — otherwise we'd capture the stranded, invisible bar as the new baseline.
+        taskbar::recover_if_stranded();
         // Capture the user's taskbar auto-hide preference before we touch it, then
         // apply the saved mode (so a "hidden" choice persists across launches).
         taskbar::capture_original();
+        // A panic (release builds abort without unwinding) must still put the bar back.
+        install_taskbar_panic_guard();
         taskbar::apply(dock_settings.taskbar_mode);
         let app_ptr = Box::into_raw(Box::new(App {
             _instance: instance,
@@ -329,21 +561,45 @@ fn run() -> Result<()> {
             running_sig: running_sig(&running),
             settings: dock_settings,
             fullscreen_active,
+            maximized_active,
             animating: true, // ease to the resting state (resident or hidden)
             tracking: false,
             full: (x, y, win_w as i32, win_h as i32),
             strip_h: ((6.0 * dpi).round() as i32).max(4),
             expanded: true,
+            window_hidden: false,
+            region_full: true,
+            pending_relayout: false,
+            pending_rebuild: false,
             taskbar_invoked_at: None,
+            watchdog: None,
         }));
         // Ease toward the resting state: resident at the bottom by default, or
         // hidden if in auto-hide mode / a fullscreen app is already in front.
         (*app_ptr).dock.reveal_target = resting_target(&*app_ptr);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app_ptr as isize);
+        // Arm the external safety net if we modified the taskbar: a sibling process that
+        // restores it should we die abnormally (Task-Manager kill, crash, panic).
+        ensure_watchdog(&mut *app_ptr);
+        // If we start hidden, grow any pre-maximized windows into the freed work area
+        // (taskbar::apply already made the bar transparent + auto-hide above).
+        if (*app_ptr).settings.taskbar_mode == settings::TaskbarMode::Hidden {
+            taskbar::reflow_maximized_windows();
+        }
+        // Apply the saved "hide desktop icons" choice (restored on exit in `cleanup`).
+        if (*app_ptr).settings.hide_desktop_icons {
+            desktop_icons::set_hidden(true);
+        }
         DragAcceptFiles(hwnd, BOOL(1)); // files, folders, shortcuts, and applications
 
         (*app_ptr).gpu.render(&(*app_ptr).dock)?;
-        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        // Don't flash the dock on screen if a fullscreen app is already in front
+        // (e.g. the dock was relaunched while a game is running) — stay hidden.
+        if fullscreen_suppressed(&*app_ptr) {
+            (*app_ptr).window_hidden = true;
+        } else {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
 
         // Event-driven loop: block in GetMessage when idle (0% CPU); when
         // animating, drain input then render one vsync-paced frame.
@@ -372,6 +628,11 @@ fn run() -> Result<()> {
                     }
                 }
                 let moving = (*app_ptr).dock.tick();
+                // Drop slots that finished collapsing, keeping GPU icons in lockstep.
+                let removed = (*app_ptr).dock.take_finished_exits();
+                if !removed.is_empty() {
+                    (*app_ptr).gpu.drop_icons(&removed);
+                }
                 if let Err(render_error) = (*app_ptr).gpu.render(&(*app_ptr).dock) {
                     recover_gpu(hwnd, &mut *app_ptr).map_err(|recovery_error| {
                         Error::new(
@@ -386,12 +647,31 @@ fn run() -> Result<()> {
                 // bump tracks it at full refresh rate; stop only once it has left AND
                 // the icons eased back to rest — then idle returns to 0% CPU.
                 if !moving && (*app_ptr).dock.cursor_x.is_none() {
-                    // Fully hidden -> collapse the window to the strip so the area it
-                    // covered becomes click-through, then go idle.
+                    // Exit animations are done — reclaim the width we held for the
+                    // collapsing slots, shrinking the window back to fit the row.
+                    if (*app_ptr).pending_relayout {
+                        (*app_ptr).pending_relayout = false;
+                        if let Err(error) = relayout_to_fit(hwnd, &mut *app_ptr) {
+                            show_error(hwnd, "重新布局 Dock 失败", error);
+                        }
+                    }
+                    // Eased fully out. If a fullscreen app owns the screen, hide the
+                    // window ENTIRELY (no strip, no z-order presence) so it can't disturb
+                    // an exclusive-fullscreen game; otherwise collapse to the reveal strip
+                    // so the area it covered becomes click-through. Then go idle.
                     if (*app_ptr).dock.reveal <= 0.01 {
-                        if let Err(error) = set_expanded(hwnd, &mut *app_ptr, false) {
+                        if fullscreen_suppressed(&*app_ptr) {
+                            set_window_hidden(hwnd, &mut *app_ptr, true);
+                        } else if let Err(error) = set_expanded(hwnd, &mut *app_ptr, false) {
                             show_error(hwnd, "收起 Dock 窗口失败", error);
                         }
+                        // Strip is a thin sliver and a hidden window has no surface — no
+                        // head-room to clip, so the whole (tiny/absent) window takes input.
+                        set_region_full(hwnd, &mut *app_ptr, true);
+                    } else {
+                        // Resident at rest: clip the input region to the visible pill so
+                        // clicks above and beside it fall through to the app underneath.
+                        set_region_full(hwnd, &mut *app_ptr, false);
                     }
                     (*app_ptr).animating = false;
                 }
@@ -411,12 +691,29 @@ fn run() -> Result<()> {
 
 unsafe fn cleanup(app_ptr: *mut App) {
     if !app_ptr.is_null() {
-        // Never leave the user without a taskbar.
+        // Stop the watchdog first (while it's still blocked on us) so it can't also fire
+        // a redundant restore, then put the taskbar back ourselves. Never strand the user.
+        if let Some(mut watchdog) = (*app_ptr).watchdog.take() {
+            let _ = watchdog.kill();
+            let _ = watchdog.wait();
+        }
         taskbar::restore();
+        // Never leave the user with a blank desktop: put the icons back if we hid them.
+        if (*app_ptr).settings.hide_desktop_icons {
+            desktop_icons::set_hidden(false);
+        }
         windows_list::remove_hooks(std::mem::take(&mut (*app_ptr).hooks));
         (*app_ptr).tray.remove();
         drop(Box::from_raw(app_ptr));
     }
+}
+
+/// (Re-)enter the hidden resting state: make the taskbar transparent + auto-hide
+/// (freeing its row) and grow any maximized windows into the freed work area. Used on
+/// the deliberate hidden-entry paths (Explorer restart, settings switch).
+unsafe fn enter_hidden(_hwnd: HWND, _app: &mut App) {
+    taskbar::apply(settings::TaskbarMode::Hidden);
+    taskbar::reflow_maximized_windows();
 }
 
 /// Open an application, shortcut, file, or folder with the Windows Shell.
@@ -503,16 +800,28 @@ unsafe fn append_item(menu: HMENU, id: usize, text: &str) {
 }
 
 /// Right-click on a running window: window actions, plus pinning it to the dock.
-unsafe fn show_window_menu(owner: HWND, app: &mut App, target: isize) {
+/// `windows` are all open windows in this slot's app group (a running icon can stand
+/// for several windows); per-window closing is also available from the hover preview.
+unsafe fn show_window_menu(owner: HWND, app: &mut App, windows: &[isize]) {
+    let Some(&primary) = windows.first() else {
+        return;
+    };
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     let Ok(menu) = CreatePopupMenu() else { return };
-    append_item(menu, ID_WIN_MAXIMIZE, "最大化 / 还原");
-    append_item(menu, ID_WIN_MINIMIZE, "最小化");
+    if windows.len() == 1 {
+        append_item(menu, ID_WIN_MAXIMIZE, "最大化 / 还原");
+        append_item(menu, ID_WIN_MINIMIZE, "最小化");
+    }
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     append_item(menu, ID_WIN_PIN, "固定在 Dock");
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-    append_item(menu, ID_WIN_CLOSE, "关闭窗口");
+    let close_label = if windows.len() > 1 {
+        "关闭全部窗口"
+    } else {
+        "关闭窗口"
+    };
+    append_item(menu, ID_WIN_CLOSE, close_label);
     let _ = SetForegroundWindow(owner); // so the menu dismisses on click-away
     let cmd = TrackPopupMenu(
         menu,
@@ -525,10 +834,10 @@ unsafe fn show_window_menu(owner: HWND, app: &mut App, target: isize) {
     );
     let _ = DestroyMenu(menu);
     match cmd.0 as usize {
-        ID_WIN_CLOSE => windows_list::close_window(target),
-        ID_WIN_MINIMIZE => windows_list::minimize_window(target),
-        ID_WIN_MAXIMIZE => windows_list::toggle_maximize(target),
-        ID_WIN_PIN => pin_running_window(owner, app, target),
+        ID_WIN_CLOSE => windows.iter().for_each(|&w| windows_list::close_window(w)),
+        ID_WIN_MINIMIZE => windows_list::minimize_window(primary),
+        ID_WIN_MAXIMIZE => windows_list::toggle_maximize(primary),
+        ID_WIN_PIN => pin_running_window(owner, app, primary),
         _ => {}
     }
 }
@@ -547,13 +856,25 @@ unsafe fn pin_running_window(owner: HWND, app: &mut App, target: isize) {
     }
 }
 
-/// Right-click on a pinned item: open it, reveal it in Explorer, or unpin it.
-unsafe fn show_pinned_menu(owner: HWND, app: &mut App, path: &str) {
+/// Right-click on a pinned item: open it, reveal it in Explorer, or unpin it. When the
+/// pinned app is running, its open windows (`windows`) also get window actions —
+/// minimize / maximize / close — so a launched pinned app can be closed from the dock.
+unsafe fn show_pinned_menu(owner: HWND, app: &mut App, path: &str, windows: &[isize]) {
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     let Ok(menu) = CreatePopupMenu() else { return };
     append_item(menu, ID_PIN_OPEN, "打开");
     append_item(menu, ID_PIN_LOCATION, "打开文件所在位置");
+    if !windows.is_empty() {
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        if windows.len() == 1 {
+            append_item(menu, ID_WIN_MAXIMIZE, "最大化 / 还原");
+            append_item(menu, ID_WIN_MINIMIZE, "最小化");
+            append_item(menu, ID_WIN_CLOSE, "关闭窗口");
+        } else {
+            append_item(menu, ID_WIN_CLOSE, "关闭全部窗口");
+        }
+    }
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     append_item(menu, ID_PIN_REMOVE, "从 Dock 移除");
     let _ = SetForegroundWindow(owner);
@@ -574,6 +895,17 @@ unsafe fn show_pinned_menu(owner: HWND, app: &mut App, path: &str) {
             }
         }
         ID_PIN_LOCATION => reveal_in_explorer(path),
+        ID_WIN_CLOSE => windows.iter().for_each(|&w| windows_list::close_window(w)),
+        ID_WIN_MINIMIZE => {
+            if let Some(&w) = windows.first() {
+                windows_list::minimize_window(w);
+            }
+        }
+        ID_WIN_MAXIMIZE => {
+            if let Some(&w) = windows.first() {
+                windows_list::toggle_maximize(w);
+            }
+        }
         ID_PIN_REMOVE => match config::remove_item(path) {
             Ok(true) => {
                 if let Err(error) = reload_app(owner, app) {
@@ -656,6 +988,67 @@ unsafe fn run_tray_menu(hwnd: HWND, app: &mut App) {
     }
 }
 
+/// Screen-space anchor (center-x, top-y) just above dock item `i`'s icon, used to
+/// pop a glass panel (control center / app drawer) centered over the button.
+unsafe fn anchor_above(hwnd: HWND, app: &App, i: usize) -> (i32, i32) {
+    let frame = app.dock.frame();
+    let cx = frame
+        .icons
+        .iter()
+        .find(|ic| ic.idx == i)
+        .map(|ic| ic.cx)
+        .unwrap_or(0.0);
+    let top = frame.pill.1;
+    let mut wr = RECT::default();
+    let _ = GetWindowRect(hwnd, &mut wr);
+    (wr.left + cx as i32, wr.top + top as i32)
+}
+
+unsafe fn show_running_preview(hwnd: HWND, app: &App, index: usize) {
+    let Some(item) = app.dock.items.get(index) else {
+        window_preview::hide();
+        return;
+    };
+    // Any dock item with open windows previews them — both the right-side running
+    // apps and pinned apps that are running (their windows merged into the pinned icon).
+    if item.windows.is_empty() {
+        window_preview::hide();
+        return;
+    }
+    let frame = app.dock.frame();
+    let Some(icon) = frame.icons.iter().find(|icon| icon.idx == index) else {
+        window_preview::hide();
+        return;
+    };
+    let mut wr = RECT::default();
+    if GetWindowRect(hwnd, &mut wr).is_err() {
+        window_preview::hide();
+        return;
+    }
+    let key = item
+        .group_key
+        .as_deref()
+        .unwrap_or_else(|| item.label.as_str());
+    window_preview::show(
+        hwnd,
+        key,
+        &item.windows,
+        wr.left + icon.cx as i32,
+        wr.top + frame.pill.1 as i32,
+        app.dock.dpi,
+    );
+}
+
+unsafe fn update_running_preview(hwnd: HWND, app: &App, x: f32, y: f32) {
+    if let Some(index) = app.dock.hit_test(x, y) {
+        if !app.dock.items[index].windows.is_empty() {
+            show_running_preview(hwnd, app, index);
+            return;
+        }
+    }
+    window_preview::hide();
+}
+
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
@@ -667,14 +1060,33 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             if let Err(error) = app.tray.restore() {
                 show_error(hwnd, "恢复托盘图标失败", error);
             }
+            // Explorer restarted: the taskbar is back, visible and reserving its row.
+            // Re-apply the hidden state so the dock stays the only bar at the bottom.
+            if app.settings.taskbar_mode == settings::TaskbarMode::Hidden
+                && app.taskbar_invoked_at.is_none()
+            {
+                enter_hidden(hwnd, app);
+            }
             return LRESULT(0);
         }
         match msg {
             WM_MOUSEMOVE => {
+                // While a fullscreen app owns the screen, never let a bottom-edge hover
+                // summon the dock — popping it topmost would kick an exclusive-fullscreen
+                // game straight back to the desktop. This is the core fix.
+                if fullscreen_suppressed(app) {
+                    return LRESULT(0);
+                }
+                // Cursor is on the dock: take input across the whole window again so the
+                // magnification can bulge icons up above the pill without losing the mouse.
+                set_region_full(hwnd, app, true);
                 let _ = set_expanded(hwnd, app, true); // grow back to full so it can slide in
-                app.dock.cursor_x = Some((lparam.0 & 0xFFFF) as i16 as f32);
+                let x = (lparam.0 & 0xFFFF) as i16 as f32;
+                let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
+                app.dock.cursor_x = Some(x);
                 app.dock.reveal_target = 1.0; // mouse is over the dock zone -> reveal
                 app.animating = true;
+                update_running_preview(hwnd, app, x, y);
                 if !app.tracking {
                     let mut tme = TRACKMOUSEEVENT {
                         cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -689,14 +1101,27 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_MOUSELEAVE => {
                 app.dock.cursor_x = None;
+                let over_preview = window_preview::contains_cursor();
+                if !over_preview {
+                    window_preview::hide();
+                }
                 // Resident by default; slide away only in auto-hide mode or fullscreen.
-                let target = resting_target(app);
+                let target = if over_preview {
+                    1.0
+                } else {
+                    resting_target(app)
+                };
                 app.dock.reveal_target = target;
                 app.animating = true;
                 app.tracking = false;
                 LRESULT(0)
             }
             WM_NCHITTEST => {
+                // Fully click-through while a fullscreen app owns the screen, so the game
+                // gets every bit of input at the bottom edge and we generate no hover.
+                if fullscreen_suppressed(app) {
+                    return LRESULT(HTTRANSPARENT as isize);
+                }
                 // Only the dock zone grabs the mouse; everything else is click-through.
                 // When hidden, that zone shrinks to a thin strip at the screen's edge.
                 let sx = (lparam.0 & 0xFFFF) as i16 as i32;
@@ -706,7 +1131,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let cx = (sx - wr.left) as f32;
                 let cy = (sy - wr.top) as f32;
                 let (l, t, r, b) = if app.expanded {
-                    app.dock.interactive_hit_zone()
+                    // Dynamic: just the visible pill at rest, the full magnification
+                    // envelope only while the cursor is actually over the dock — so the
+                    // dock's box stops swallowing clicks above/beside it when unused.
+                    app.dock.pointer_hit_zone()
                 } else {
                     // collapsed strip: only the dock's horizontal span at the very edge
                     let (sl, sr) = app.dock.dock_span_x();
@@ -730,6 +1158,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         dock::ItemRole::Start => {
                             if taskbar::reveal_for_start_invocation(app.settings.taskbar_mode) {
                                 app.taskbar_invoked_at = Some(Instant::now());
+                                // Drop the dock behind the revealed taskbar so the user
+                                // can operate the taskbar on top of it.
+                                place_dock_behind_taskbar(hwnd);
                                 let _ = SetTimer(
                                     hwnd,
                                     TIMER_TASKBAR_REHIDE,
@@ -737,19 +1168,37 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                                     None,
                                 );
                             }
-                            windows_list::open_start_menu();
+                            if taskbar::should_open_start_menu_for_start_invocation(
+                                app.settings.taskbar_mode,
+                            ) {
+                                windows_list::open_start_menu();
+                            }
                             app.dock.bump(i);
                             app.animating = true;
                         }
                         dock::ItemRole::Running => {
-                            if let Some(raw) = item_hwnd {
+                            if app.dock.items[i].windows.len() > 1 {
+                                show_running_preview(hwnd, app, i);
+                            } else if let Some(raw) = item_hwnd {
                                 windows_list::activate(raw);
                                 app.dock.bump(i);
                                 app.animating = true;
                             }
                         }
                         dock::ItemRole::Pinned => {
-                            if let Some(path) = path {
+                            // A pinned app that's running activates its window(s) instead
+                            // of launching a duplicate (macOS-style). Right-click → 打开
+                            // still launches a fresh instance.
+                            let windows = app.dock.items[i].windows.len();
+                            if windows > 1 {
+                                show_running_preview(hwnd, app, i);
+                            } else if windows == 1 {
+                                if let Some(raw) = item_hwnd {
+                                    windows_list::activate(raw);
+                                    app.dock.bump(i);
+                                    app.animating = true;
+                                }
+                            } else if let Some(path) = path {
                                 match open_content(&path) {
                                     Ok(()) => {
                                         app.dock.bump(i);
@@ -758,6 +1207,20 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                                     Err(error) => show_error(hwnd, "打开内容失败", error),
                                 }
                             }
+                        }
+                        dock::ItemRole::Control => {
+                            // Anchor the panel above this button's center, then toggle.
+                            let (acx, atop) = anchor_above(hwnd, app, i);
+                            control_center::toggle(hwnd, acx, atop);
+                            app.dock.bump(i);
+                            app.animating = true;
+                        }
+                        dock::ItemRole::Drawer => {
+                            // Anchor the drawer above this button's center, then toggle.
+                            let (acx, atop) = anchor_above(hwnd, app, i);
+                            drawer::toggle(hwnd, acx, atop);
+                            app.dock.bump(i);
+                            app.animating = true;
                         }
                         dock::ItemRole::Divider => {}
                     }
@@ -769,20 +1232,22 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
                 if let Some(i) = app.dock.hit_test(x, y) {
                     let role = app.dock.items[i].role;
-                    let item_hwnd = app.dock.items[i].hwnd;
                     let path = app.dock.items[i].path.clone();
+                    // All open windows behind this dock slot (a running app can have many).
+                    let windows: Vec<isize> =
+                        app.dock.items[i].windows.iter().map(|w| w.hwnd).collect();
                     match role {
                         dock::ItemRole::Running => {
-                            if let Some(raw) = item_hwnd {
-                                show_window_menu(hwnd, app, raw);
-                            }
+                            show_window_menu(hwnd, app, &windows);
                         }
                         dock::ItemRole::Pinned => {
                             if let Some(path) = path {
-                                show_pinned_menu(hwnd, app, &path);
+                                show_pinned_menu(hwnd, app, &path, &windows);
                             }
                         }
                         dock::ItemRole::Start => run_tray_menu(hwnd, app),
+                        dock::ItemRole::Control => {}
+                        dock::ItemRole::Drawer => {}
                         dock::ItemRole::Divider => {}
                     }
                 }
@@ -817,19 +1282,42 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             windows_list::WM_WINDOWS_CHANGED => {
-                // Cheap on every event: re-check whether a fullscreen app is in
-                // front and retract / restore the dock accordingly.
+                // Cheap on every event: re-check whether a fullscreen (borderless) app or a
+                // maximized (captioned) window is in front and retract / restore the dock.
                 let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
                 let fullscreen = windows_list::is_fullscreen_present(monitor);
-                if fullscreen != app.fullscreen_active {
+                let maximized = windows_list::is_maximized_present(monitor);
+                if fullscreen != app.fullscreen_active || maximized != app.maximized_active {
                     app.fullscreen_active = fullscreen;
-                    let target = if app.dock.cursor_x.is_some() {
+                    app.maximized_active = maximized;
+                    // No longer fully suppressed (game closed, or fullscreen→maximized):
+                    // re-show the fully-hidden window so the reveal/strip can take over.
+                    if !fullscreen_suppressed(app) && app.window_hidden {
+                        set_window_hidden(hwnd, app, false);
+                    }
+                    // Fullscreen-suppressed -> force out (target 0) regardless of any stale
+                    // hover; otherwise honour the cursor (maximized stays hover-revealable).
+                    let target = if app.dock.cursor_x.is_some() && !fullscreen_suppressed(app) {
                         1.0
                     } else {
                         resting_target(app)
                     };
                     app.dock.reveal_target = target;
                     app.animating = true;
+                }
+                // A fullscreen app just left the foreground: apply any dock rebuild we
+                // deferred while it owned the screen (we keep the dock fully passive during
+                // fullscreen so we never kick a game out of exclusive mode).
+                if app.pending_rebuild && !fullscreen {
+                    app.pending_rebuild = false;
+                    if let Err(error) = reload_app(hwnd, app) {
+                        show_error(hwnd, "刷新窗口列表失败", error);
+                    }
+                    if app.settings.taskbar_mode == settings::TaskbarMode::Hidden
+                        && app.taskbar_invoked_at.is_none()
+                    {
+                        taskbar::reassert_hidden();
+                    }
                 }
                 // Expensive (wParam == 0 only): the window SET may have changed, so
                 // re-scan and rebuild if what we display actually differs.
@@ -846,7 +1334,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let sig = running_sig(&running);
                 if sig != app.running_sig {
                     app.running_sig = sig;
-                    if let Err(error) = reload_with(hwnd, app, &running) {
+                    // Never re-stack the dock (reload_with does SetWindowPos) while a
+                    // fullscreen app owns the screen — it kicks an exclusive-fullscreen
+                    // game to the desktop. Defer the rebuild until the game exits.
+                    if fullscreen_app_present(hwnd) {
+                        app.pending_rebuild = true;
+                    } else if let Err(error) = reload_with(hwnd, app, &running) {
                         show_error(hwnd, "刷新窗口列表失败", error);
                     }
                 }
@@ -864,9 +1357,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         let _ = KillTimer(hwnd, TIMER_TASKBAR_REHIDE);
                         app.taskbar_invoked_at = None;
                         taskbar::rehide_after_start_invocation(app.settings.taskbar_mode);
+                        raise_dock_topmost(hwnd); // taskbar gone → dock back on top
                     } else if app.settings.taskbar_mode != settings::TaskbarMode::Hidden {
                         let _ = KillTimer(hwnd, TIMER_TASKBAR_REHIDE);
                         app.taskbar_invoked_at = None;
+                        raise_dock_topmost(hwnd);
                     }
                 } else {
                     let _ = KillTimer(hwnd, TIMER_TASKBAR_REHIDE);
@@ -874,9 +1369,21 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             settings_window::WM_SETTINGS_CHANGED => {
-                // The settings window changed dock_mode / fullscreen behavior; re-read
-                // and ease to the new resting state. (taskbar_mode it applied itself.)
+                // The settings window changed dock_mode / fullscreen / taskbar mode and
+                // applied the taskbar mode itself; re-read and ease to the new resting
+                // state. If it switched us to hidden, defeat the auto-hide entry slide
+                // and grow maximized windows into the freed work area.
                 app.settings = settings::load();
+                if app.settings.taskbar_mode == settings::TaskbarMode::Hidden
+                    && app.taskbar_invoked_at.is_none()
+                {
+                    enter_hidden(hwnd, app);
+                }
+                // Re-assert the desktop-icon visibility to match the (possibly toggled)
+                // setting — idempotent, in case the settings window didn't apply it.
+                desktop_icons::set_hidden(app.settings.hide_desktop_icons);
+                // Switching into a taskbar-modifying mode at runtime arms the watchdog.
+                ensure_watchdog(app);
                 let target = if app.dock.cursor_x.is_some() {
                     1.0
                 } else {
@@ -894,8 +1401,29 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_DPICHANGED | WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
+                // A fullscreen game switching display mode broadcasts WM_DISPLAYCHANGE.
+                // Reacting now — re-stacking the dock topmost (reload_app) or reflowing
+                // windows — knocks the game out of exclusive fullscreen and bounces it to
+                // the desktop. Stay completely passive while a fullscreen app owns the
+                // screen; rebuild once it exits (see WM_WINDOWS_CHANGED).
+                if fullscreen_app_present(hwnd) {
+                    app.pending_rebuild = true;
+                    return LRESULT(0);
+                }
                 if let Err(error) = reload_app(hwnd, app) {
                     show_error(hwnd, "重新布局 Dock 失败", error);
+                }
+                // A display / work-area change can let the shell repaint the taskbar or
+                // re-reserve its row; re-assert the transparent auto-hide state (cheap
+                // and idempotent). On a resolution change also regrow maximized windows
+                // into the freed work area.
+                if app.settings.taskbar_mode == settings::TaskbarMode::Hidden
+                    && app.taskbar_invoked_at.is_none()
+                {
+                    taskbar::reassert_hidden();
+                    if msg == WM_DISPLAYCHANGE {
+                        taskbar::reflow_maximized_windows();
+                    }
                 }
                 LRESULT(0)
             }

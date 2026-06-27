@@ -112,50 +112,62 @@ impl Gpu {
         })
     }
 
-    /// Extract each app's real icon into a GPU bitmap (once, at startup).
+    /// Extract one item's real icon into a GPU bitmap. None => draw a glyph/vector.
+    /// Always extracted at max native resolution (256px) so it stays crisp through
+    /// magnification, then high-quality-downscaled at draw time.
+    unsafe fn extract_icon(&self, loader: &IconLoader, it: &DockItem) -> Option<ID2D1Bitmap1> {
+        let size = 256u32;
+        match it.role {
+            // Start + Control + Drawer use custom vector glyphs; the divider draws a line.
+            ItemRole::Start | ItemRole::Divider | ItemRole::Control | ItemRole::Drawer => None,
+            // Running window: prefer its app exe's full-res icon; fall back to the
+            // window's own icon (WM_GETICON, owned by the app — don't free).
+            ItemRole::Running => {
+                let hwnd = it.hwnd.map(|raw| HWND(raw as *mut core::ffi::c_void));
+                let exe_icon = |exe: &str| {
+                    loader.load(
+                        &self.dc,
+                        exe,
+                        size,
+                        crate::content::ContentKind::Application,
+                    )
+                };
+                it.icon
+                    .as_deref()
+                    .and_then(|exe| exe_icon(exe))
+                    .or_else(|| {
+                        hwnd.and_then(|hwnd| windows_list::process_exe_path(hwnd))
+                            .and_then(|exe| exe_icon(&exe))
+                    })
+                    .or_else(|| {
+                        hwnd.and_then(|hwnd| windows_list::window_icon(hwnd))
+                            .and_then(|hicon| loader.load_hicon(&self.dc, hicon))
+                    })
+            }
+            ItemRole::Pinned => {
+                let src = it.icon.as_deref().or(it.path.as_deref());
+                let kind = if it.icon.is_some() {
+                    src.map(std::path::Path::new)
+                        .map(crate::content::classify_path)
+                        .unwrap_or(it.kind)
+                } else {
+                    it.kind
+                };
+                src.and_then(|p| loader.load(&self.dc, p, size, kind))
+            }
+        }
+    }
+
+    /// Extract every item's icon into a GPU bitmap (e.g. at startup).
     pub unsafe fn load_icons(&mut self, items: &[DockItem], _dpi: f32) {
         let Ok(loader) = IconLoader::new() else {
+            self.icons = items.iter().map(|_| None).collect();
             return;
         };
-        // Always extract at the icon's max native resolution (256px) so it stays
-        // crisp through magnification, then high-quality-downscale at draw time.
-        let size = 256u32;
         self.icons = items
             .iter()
             .map(|it| {
-                let bmp = match it.role {
-                    // Start uses a custom vector glyph; the divider draws a line.
-                    ItemRole::Start | ItemRole::Divider => None,
-                    // Running window: prefer its app exe's full-res icon; fall back to
-                    // the window's own icon (WM_GETICON, owned by the app — don't free).
-                    ItemRole::Running => {
-                        let hwnd = it.hwnd.map(|raw| HWND(raw as *mut core::ffi::c_void));
-                        hwnd.and_then(|hwnd| windows_list::process_exe_path(hwnd))
-                            .and_then(|exe| {
-                                loader.load(
-                                    &self.dc,
-                                    &exe,
-                                    size,
-                                    crate::content::ContentKind::Application,
-                                )
-                            })
-                            .or_else(|| {
-                                hwnd.and_then(|hwnd| windows_list::window_icon(hwnd))
-                                    .and_then(|hicon| loader.load_hicon(&self.dc, hicon))
-                            })
-                    }
-                    ItemRole::Pinned => {
-                        let src = it.icon.as_deref().or(it.path.as_deref());
-                        let kind = if it.icon.is_some() {
-                            src.map(std::path::Path::new)
-                                .map(crate::content::classify_path)
-                                .unwrap_or(it.kind)
-                        } else {
-                            it.kind
-                        };
-                        src.and_then(|p| loader.load(&self.dc, p, size, kind))
-                    }
-                };
+                let bmp = self.extract_icon(&loader, it);
                 #[cfg(debug_assertions)]
                 eprintln!("[icon] {:<14} loaded={}", it.label, bmp.is_some());
                 bmp
@@ -163,8 +175,50 @@ impl Gpu {
             .collect();
     }
 
+    /// Realign the icon set to a reconciled item list (see `Dock::reconcile`). For
+    /// each merged slot, reuse the existing bitmap (`Some(old_index)`) — including a
+    /// closing window's, so it stays drawn while it collapses — or load a fresh one
+    /// (`None`). Far cheaper than re-extracting everything on each window open/close.
+    pub unsafe fn remap_icons(&mut self, remap: &[Option<usize>], items: &[DockItem]) {
+        let mut old = std::mem::take(&mut self.icons);
+        let loader = if remap.iter().any(Option::is_none) {
+            IconLoader::new().ok()
+        } else {
+            None
+        };
+        self.icons = remap
+            .iter()
+            .enumerate()
+            .map(|(p, src)| match src {
+                Some(oi) => old.get_mut(*oi).and_then(Option::take),
+                None => loader
+                    .as_ref()
+                    .and_then(|l| items.get(p).and_then(|it| self.extract_icon(l, it))),
+            })
+            .collect();
+    }
+
+    /// Drop the icon bitmaps at the given (ascending) indices, to stay in lockstep
+    /// with `Dock::take_finished_exits` when collapsed slots are removed.
+    pub fn drop_icons(&mut self, removed: &[usize]) {
+        if removed.is_empty() {
+            return;
+        }
+        let mut keep = removed.iter().copied().peekable();
+        let mut idx = 0;
+        self.icons.retain(|_| {
+            let drop = keep.peek() == Some(&idx);
+            if drop {
+                keep.next();
+            }
+            idx += 1;
+            !drop
+        });
+    }
+
     pub unsafe fn resize(&mut self, width: u32, height: u32) -> Result<()> {
-        self.icons.clear();
+        // Icons are device bitmaps independent of the swapchain backbuffer, so they
+        // survive a resize — the reconcile/remap path keeps them aligned to `items`.
         self.dc.SetTarget(None::<&ID2D1Image>);
         self.swapchain.ResizeBuffers(
             0,

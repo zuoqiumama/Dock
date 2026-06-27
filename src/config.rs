@@ -52,7 +52,9 @@ fn legacy_config_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("featherdock.toml"))
 }
 
-fn path_key(path: &Path) -> String {
+/// Normalize a path into a stable comparison key: forward slashes → backslashes,
+/// trailing separators dropped, lower-cased. Shared with the drawer's category store.
+pub fn path_key(path: &Path) -> String {
     path.to_string_lossy()
         .replace('/', "\\")
         .trim_end_matches('\\')

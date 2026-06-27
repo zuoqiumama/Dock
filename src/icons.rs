@@ -8,9 +8,10 @@ use windows::Win32::Graphics::Imaging::*;
 use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
 use windows::Win32::System::Com::*;
 use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
+use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
     SHDefExtractIconW, SHGetFileInfoW, SHGetImageList, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON,
-    SHGFI_SYSICONINDEX, SHIL_JUMBO,
+    SHGFI_PIDL, SHGFI_SYSICONINDEX, SHIL_JUMBO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
 
@@ -57,6 +58,20 @@ impl IconLoader {
     /// The caller still owns `hicon` — this does NOT destroy it.
     pub unsafe fn load_hicon(&self, dc: &ID2D1DeviceContext, hicon: HICON) -> Option<ID2D1Bitmap1> {
         self.to_bitmap(dc, hicon).ok()
+    }
+
+    /// The icon for a shell item identified by an absolute PIDL — covers virtual
+    /// desktop items (此电脑 / 回收站 / …) that have no filesystem path. Uses the 256px
+    /// JUMBO system image list so it stays crisp under magnification.
+    pub unsafe fn load_pidl(
+        &self,
+        dc: &ID2D1DeviceContext,
+        pidl: *const ITEMIDLIST,
+    ) -> Option<ID2D1Bitmap1> {
+        let hicon = jumbo_icon_pidl(pidl)?;
+        let bmp = self.to_bitmap(dc, hicon).ok();
+        let _ = DestroyIcon(hicon);
+        bmp
     }
 
     unsafe fn load_image(
@@ -126,6 +141,24 @@ unsafe fn jumbo_icon(path: &str) -> Option<HICON> {
         Some(&mut info),
         std::mem::size_of::<SHFILEINFOW>() as u32,
         SHGFI_SYSICONINDEX,
+    );
+    if ok == 0 {
+        return None;
+    }
+    let list: IImageList = SHGetImageList(SHIL_JUMBO as i32).ok()?;
+    list.GetIcon(info.iIcon, ILD_TRANSPARENT.0).ok()
+}
+
+/// The 256px JUMBO system icon for an absolute PIDL (virtual shell items). The HICON
+/// is freshly created by the image list, so the caller owns it (DestroyIcon).
+unsafe fn jumbo_icon_pidl(pidl: *const ITEMIDLIST) -> Option<HICON> {
+    let mut info = SHFILEINFOW::default();
+    let ok = SHGetFileInfoW(
+        PCWSTR(pidl as *const u16),
+        FILE_ATTRIBUTE_NORMAL,
+        Some(&mut info),
+        std::mem::size_of::<SHFILEINFOW>() as u32,
+        SHGFI_PIDL | SHGFI_SYSICONINDEX,
     );
     if ok == 0 {
         return None;

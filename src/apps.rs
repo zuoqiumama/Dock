@@ -7,7 +7,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::System::Registry::*;
 
 use crate::content::{classify_path, fallback_visual, ContentKind};
-use crate::dock::{DockItem, ItemRole};
+use crate::dock::{DockItem, ItemRole, RunningWindowRef};
 
 /// The leading Start button — opens the Windows Start menu. Drawn as a custom
 /// 4-pane glyph (see render.rs), so it needs no extracted icon.
@@ -21,6 +21,43 @@ pub fn start_item() -> DockItem {
         kind: ContentKind::Application,
         role: ItemRole::Start,
         hwnd: None,
+        group_key: None,
+        windows: Vec::new(),
+    }
+}
+
+/// The far-right control button — opens the glass control center. Drawn as a custom
+/// vector "sliders" glyph (see render.rs), so it needs no extracted icon.
+pub fn control_item() -> DockItem {
+    DockItem {
+        label: "控制中心".to_string(),
+        glyph: "\u{2699}", // ⚙ fallback only
+        color: (0.30, 0.32, 0.38),
+        path: None,
+        icon: None,
+        kind: ContentKind::Application,
+        role: ItemRole::Control,
+        hwnd: None,
+        group_key: None,
+        windows: Vec::new(),
+    }
+}
+
+/// The app-drawer button — opens the glass drawer listing every program on the
+/// desktop. Drawn as a custom 3x3 "app grid" glyph (see render.rs), so it needs no
+/// extracted icon.
+pub fn drawer_item() -> DockItem {
+    DockItem {
+        label: "应用抽屉".to_string(),
+        glyph: "\u{25A6}", // ▦ fallback only
+        color: (0.28, 0.30, 0.36),
+        path: None,
+        icon: None,
+        kind: ContentKind::Application,
+        role: ItemRole::Drawer,
+        hwnd: None,
+        group_key: None,
+        windows: Vec::new(),
     }
 }
 
@@ -35,22 +72,71 @@ pub fn divider_item() -> DockItem {
         kind: ContentKind::File,
         role: ItemRole::Divider,
         hwnd: None,
+        group_key: None,
+        windows: Vec::new(),
     }
 }
 
 /// A currently-open window; clicking it activates (or minimizes) that window.
-pub fn running_item(title: &str, hwnd: isize) -> DockItem {
+pub fn running_item(group: &crate::windows_list::RunningGroup) -> DockItem {
     let (glyph, color) = fallback_visual(ContentKind::Application);
+    let primary = group.windows.first().map(|window| window.hwnd);
     DockItem {
-        label: title.to_string(),
+        label: group.label.clone(),
         glyph,
         color,
         path: None,
-        icon: None,
+        icon: group.icon_path.clone(),
         kind: ContentKind::Application,
         role: ItemRole::Running,
-        hwnd: Some(hwnd),
+        hwnd: primary,
+        group_key: Some(group.key.clone()),
+        windows: group
+            .windows
+            .iter()
+            .map(|window| RunningWindowRef {
+                hwnd: window.hwnd,
+                title: window.title.clone(),
+            })
+            .collect(),
     }
+}
+
+/// Does a pinned app's launch path refer to the same executable as a running window
+/// group? Matches the full normalized path first, then falls back to the executable's
+/// file name — so a packaged app whose versioned WindowsApps path drifts after an
+/// update (e.g. `Claude_1.15200…\app\claude.exe`) still pairs with its running process.
+pub fn exe_matches(pinned_path: &str, group_key: &str) -> bool {
+    let pinned = pinned_path.trim().trim_matches('"').to_ascii_lowercase();
+    if pinned == group_key {
+        return true;
+    }
+    let file_of = |s: &str| {
+        Path::new(s)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.to_string())
+    };
+    match (file_of(&pinned), file_of(group_key)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Merge a running app's open windows into its pinned dock icon, so the pinned slot
+/// shows a running indicator and (on click) activates the window instead of launching
+/// a duplicate — the macOS behaviour. The icon/path stay the pinned item's own.
+pub fn attach_running(item: &mut DockItem, group: &crate::windows_list::RunningGroup) {
+    item.hwnd = group.windows.first().map(|window| window.hwnd);
+    item.group_key = Some(group.key.clone());
+    item.windows = group
+        .windows
+        .iter()
+        .map(|window| RunningWindowRef {
+            hwnd: window.hwnd,
+            title: window.title.clone(),
+        })
+        .collect();
 }
 
 /// Built-in default app set. Each entry falls back to a glyph/color if exe missing.
@@ -115,6 +201,8 @@ fn item(
         icon: None,
         role: ItemRole::Pinned,
         hwnd: None,
+        group_key: None,
+        windows: Vec::new(),
     }
 }
 
@@ -151,6 +239,8 @@ pub fn from_config(specs: &[crate::config::ItemSpec]) -> Vec<DockItem> {
                 kind,
                 role: ItemRole::Pinned,
                 hwnd: None,
+                group_key: None,
+                windows: Vec::new(),
             })
         })
         .collect()

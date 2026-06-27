@@ -1,15 +1,35 @@
 //! Control the real Windows taskbar: leave it, set it to auto-hide, or fully hide
-//! it. We capture the user's original auto-hide state at startup and ALWAYS restore
-//! the taskbar to visible on exit, so we never strand them without a taskbar.
+//! it. We capture the user's original auto-hide preference at startup and ALWAYS
+//! restore the taskbar to visible on exit, so we never strand them without one.
+//!
+//! "Hidden" is the key mode, and the recipe is subtle (verified empirically on
+//! Win11 26120):
+//!
+//! * The shell reserves a row of the desktop work area for an ALWAYS-ON-TOP taskbar
+//!   and re-asserts it continuously — `SPI_SETWORKAREA` to reclaim it is overridden
+//!   instantly, leaving an empty ~48px strip that breaks fullscreen. The ONLY way to
+//!   free that row is to put the shell appbar into AUTO-HIDE, where it stops reserving
+//!   space by construction.
+//! * But an auto-hide taskbar slides into view whenever the pointer touches the
+//!   bottom edge — which the user does constantly to reach the dock — and `SW_HIDE`
+//!   does NOT survive that (the first reveal re-shows it). So hiding the *window* is
+//!   not enough.
+//! * The fix that satisfies BOTH "no reserved row" AND "never appears on hover" is to
+//!   make the taskbar window itself invisible: `WS_EX_LAYERED` + a layered alpha of 0
+//!   renders it fully transparent whether the OS parks it as the 2px sliver or slides
+//!   it up on edge-hover, and `WS_EX_TRANSPARENT` lets clicks fall through it. Auto-
+//!   hide frees the row; alpha 0 hides the pixels. No `SW_HIDE`, no polling, no work-
+//!   area tug-of-war — set once, 0% idle.
+//!
+//! For an explicit Start-button click we make the bar opaque + interactive again and
+//! pin it ALWAYS-ON-TOP so it slides fully on-screen and is usable, then drop back to
+//! the transparent auto-hide state.
 
-use core::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
-};
 use windows::Win32::UI::Shell::{
     SHAppBarMessage, ABM_SETSTATE, ABS_ALWAYSONTOP, ABS_AUTOHIDE, APPBARDATA,
 };
@@ -18,52 +38,11 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use crate::settings::TaskbarMode;
 
 const ABM_GETSTATE: u32 = 4;
+const EX_INVISIBLE: i32 = WS_EX_LAYERED.0 as i32 | WS_EX_TRANSPARENT.0 as i32;
 
 /// The user's auto-hide preference, captured once at startup so "Show" restores it
 /// instead of forcing the taskbar always-on-top.
 static ORIGINAL_AUTOHIDE: AtomicBool = AtomicBool::new(false);
-
-/// The original desktop work area (left, top, right, bottom), captured at startup.
-/// When we fully hide the taskbar we expand the work area to the whole monitor so
-/// maximized / fullscreen apps actually fill the screen (no taskbar-sized gap), and
-/// we restore this on "Show" / exit.
-static ORIGINAL_WORK_AREA: [AtomicI32; 4] = [
-    AtomicI32::new(0),
-    AtomicI32::new(0),
-    AtomicI32::new(0),
-    AtomicI32::new(0),
-];
-static WORK_AREA_CAPTURED: AtomicBool = AtomicBool::new(false);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RectSpec {
-    left: i32,
-    top: i32,
-    right: i32,
-    bottom: i32,
-}
-
-impl RectSpec {
-    fn into_rect(self) -> RECT {
-        RECT {
-            left: self.left,
-            top: self.top,
-            right: self.right,
-            bottom: self.bottom,
-        }
-    }
-}
-
-impl From<RECT> for RectSpec {
-    fn from(rect: RECT) -> Self {
-        RectSpec {
-            left: rect.left,
-            top: rect.top,
-            right: rect.right,
-            bottom: rect.bottom,
-        }
-    }
-}
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -88,96 +67,58 @@ unsafe fn current_autohide() -> bool {
     (SHAppBarMessage(ABM_GETSTATE, &mut data) as u32 & ABS_AUTOHIDE) != 0
 }
 
-/// Capture the user's auto-hide preference AND the current work area once, at
-/// startup, before we change anything — so "Show"/exit restore exactly what they had.
+/// Capture the user's auto-hide preference once, at startup, before we change
+/// anything — so "Show"/exit restore exactly what they had.
 pub unsafe fn capture_original() {
     ORIGINAL_AUTOHIDE.store(current_autohide(), Ordering::Relaxed);
-    let mut work = RECT::default();
-    if SystemParametersInfoW(
-        SPI_GETWORKAREA,
-        0,
-        Some(&mut work as *mut RECT as *mut c_void),
-        SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
-    )
-    .is_ok()
-    {
-        ORIGINAL_WORK_AREA[0].store(work.left, Ordering::Relaxed);
-        ORIGINAL_WORK_AREA[1].store(work.top, Ordering::Relaxed);
-        ORIGINAL_WORK_AREA[2].store(work.right, Ordering::Relaxed);
-        ORIGINAL_WORK_AREA[3].store(work.bottom, Ordering::Relaxed);
-        WORK_AREA_CAPTURED.store(true, Ordering::Relaxed);
+}
+
+/// The user's auto-hide preference captured at startup — handed to the watchdog so it
+/// can restore the real original even though it never ran `capture_original` itself.
+pub fn original_autohide() -> bool {
+    ORIGINAL_AUTOHIDE.load(Ordering::Relaxed)
+}
+
+/// Path of the on-disk guard marker (next to settings.toml). Its *presence* means "we
+/// diverged the taskbar from the user's own state and have not cleanly restored it yet";
+/// its contents record the original auto-hide preference so recovery is exact.
+fn guard_path() -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("FeatherDock")
+        .join("taskbar.guard")
+}
+
+/// Drop the guard marker before we modify the taskbar.
+fn mark_guarded(original_autohide: bool) {
+    let path = guard_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
+    let _ = std::fs::write(&path, if original_autohide { "1" } else { "0" });
 }
 
-unsafe fn set_work_area(mut rect: RECT) {
-    let _ = SystemParametersInfoW(
-        SPI_SETWORKAREA,
-        0,
-        Some(&mut rect as *mut RECT as *mut c_void),
-        SPIF_SENDCHANGE,
-    );
+/// Clear the guard marker: the taskbar is back to the user's own state.
+pub fn clear_guard() {
+    let _ = std::fs::remove_file(guard_path());
 }
 
-fn reclaimed_work_area(taskbar_monitor: RectSpec) -> RectSpec {
-    taskbar_monitor
+/// The recorded original auto-hide preference, if a guard marker is present.
+fn guarded_original() -> Option<bool> {
+    let text = std::fs::read_to_string(guard_path()).ok()?;
+    Some(text.trim().starts_with('1'))
 }
 
-#[cfg(test)]
-fn maximized_window_target(mode: TaskbarMode, monitor: RectSpec, work_area: RectSpec) -> RectSpec {
-    match mode {
-        TaskbarMode::Hidden => monitor,
-        TaskbarMode::Show | TaskbarMode::AutoHide => work_area,
-    }
-}
-
-fn should_refresh_maximized_windows(_mode: TaskbarMode, work_area_changed: bool) -> bool {
-    work_area_changed
-}
-
-unsafe fn primary_monitor_bounds() -> RectSpec {
-    RectSpec {
-        left: 0,
-        top: 0,
-        right: GetSystemMetrics(SM_CXSCREEN),
-        bottom: GetSystemMetrics(SM_CYSCREEN),
-    }
-}
-
-unsafe fn monitor_rects_for_window(hwnd: HWND) -> Option<(RectSpec, RectSpec)> {
-    if hwnd.is_invalid() {
-        return None;
-    }
-    let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-    let mut info = MONITORINFO {
-        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-        ..Default::default()
-    };
-    if GetMonitorInfoW(monitor, &mut info).as_bool() {
-        Some((info.rcMonitor.into(), info.rcWork.into()))
-    } else {
-        None
-    }
-}
-
-unsafe fn taskbar_monitor_bounds() -> RectSpec {
-    monitor_rects_for_window(primary())
-        .map(|(monitor, _)| monitor)
-        .unwrap_or_else(|| primary_monitor_bounds())
-}
-
-/// Expand the taskbar monitor's work area to its full bounds (used when hiding).
-unsafe fn reclaim_work_area() {
-    set_work_area(reclaimed_work_area(taskbar_monitor_bounds()).into_rect());
-}
-
-unsafe fn restore_work_area() {
-    if WORK_AREA_CAPTURED.load(Ordering::Relaxed) {
-        set_work_area(RECT {
-            left: ORIGINAL_WORK_AREA[0].load(Ordering::Relaxed),
-            top: ORIGINAL_WORK_AREA[1].load(Ordering::Relaxed),
-            right: ORIGINAL_WORK_AREA[2].load(Ordering::Relaxed),
-            bottom: ORIGINAL_WORK_AREA[3].load(Ordering::Relaxed),
-        });
+/// If a previous run modified the taskbar and died without restoring it — power loss, or
+/// both the dock AND its watchdog killed at once — the guard marker is still on disk. Put
+/// the taskbar back to the recorded original and clear the marker. MUST run *before*
+/// `capture_original`, so we never capture a stranded (auto-hidden + invisible) bar as
+/// the new baseline.
+pub unsafe fn recover_if_stranded() {
+    if let Some(original_autohide) = guarded_original() {
+        restore_to(original_autohide);
+        clear_guard();
     }
 }
 
@@ -202,17 +143,15 @@ unsafe fn set_autohide(autohide: bool) {
 fn autohide_for_mode(mode: TaskbarMode, original_autohide: bool) -> bool {
     match mode {
         TaskbarMode::Show => original_autohide,
+        // Auto-hide AND fully-hidden both want the shell in auto-hide state: that's
+        // what frees the desktop work area (no reserved row). They differ only in
+        // whether the taskbar is left visible (AutoHide) or made transparent (Hidden).
         TaskbarMode::AutoHide | TaskbarMode::Hidden => true,
     }
 }
 
-fn should_disable_autohide_for_start_invocation(_mode: TaskbarMode) -> bool {
-    false
-}
-
-/// Show or hide every top-level window of a class (covers multi-monitor secondaries).
-unsafe fn show_class(class: &str, show: bool) {
-    let cmd = if show { SW_SHOW } else { SW_HIDE };
+/// Run `f` over every top-level window of `class` (covers multi-monitor secondaries).
+unsafe fn for_each_window_of_class(class: &str, mut f: impl FnMut(HWND)) {
     let name = wide(class);
     let mut hwnd = FindWindowExW(
         HWND::default(),
@@ -222,14 +161,67 @@ unsafe fn show_class(class: &str, show: bool) {
     )
     .unwrap_or_default();
     while !hwnd.is_invalid() {
-        let _ = ShowWindow(hwnd, cmd);
+        f(hwnd);
         hwnd = FindWindowExW(HWND::default(), hwnd, PCWSTR(name.as_ptr()), PCWSTR::null())
             .unwrap_or_default();
     }
 }
 
+/// Show or hide every taskbar window of a class. Idempotent: only touches windows
+/// whose visibility actually differs from `show`.
+unsafe fn show_class(class: &str, show: bool) {
+    let cmd = if show { SW_SHOW } else { SW_HIDE };
+    for_each_window_of_class(class, |hwnd| {
+        if IsWindowVisible(hwnd).as_bool() != show {
+            let _ = ShowWindow(hwnd, cmd);
+        }
+    });
+}
+
+/// Make the taskbar windows fully transparent (alpha 0) and click-through, so they
+/// never paint anything — even the 2px auto-hide sliver or an edge-hover slide-in —
+/// and never eat clicks meant for the dock or the desktop below.
+unsafe fn make_taskbar_transparent() {
+    for class in ["Shell_TrayWnd", "Shell_SecondaryTrayWnd"] {
+        for_each_window_of_class(class, |hwnd| {
+            let ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
+            if ex & EX_INVISIBLE != EX_INVISIBLE {
+                SetWindowLongW(hwnd, GWL_EXSTYLE, ex | EX_INVISIBLE);
+            }
+            let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 0, LWA_ALPHA);
+        });
+    }
+}
+
+/// Undo `make_taskbar_transparent`: drop the layered + click-through styles so the
+/// bar paints and responds normally again.
+unsafe fn make_taskbar_opaque() {
+    for class in ["Shell_TrayWnd", "Shell_SecondaryTrayWnd"] {
+        for_each_window_of_class(class, |hwnd| {
+            let ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
+            if ex & EX_INVISIBLE != 0 {
+                SetWindowLongW(hwnd, GWL_EXSTYLE, ex & !EX_INVISIBLE);
+            }
+        });
+    }
+}
+
+/// Re-assert the hidden state after the shell may have changed things (display
+/// change, work-area broadcast, etc.): make sure it's still auto-hide + transparent.
+/// Cheap and idempotent, so it's safe to call on frequent events.
+pub unsafe fn reassert_hidden() {
+    if !current_autohide() {
+        set_autohide(true);
+    }
+    make_taskbar_transparent();
+}
+
 pub fn should_reveal_for_start_invocation(mode: TaskbarMode) -> bool {
     mode == TaskbarMode::Hidden
+}
+
+pub fn should_open_start_menu_for_start_invocation(mode: TaskbarMode) -> bool {
+    mode != TaskbarMode::Hidden
 }
 
 pub fn should_rehide_after_start_invocation(
@@ -240,31 +232,26 @@ pub fn should_rehide_after_start_invocation(
     mode == TaskbarMode::Hidden && grace_elapsed && !pointer_over_taskbar
 }
 
-/// In full-hide mode, temporarily show the real taskbar for an explicit Start
-/// button click. We keep the reclaimed work area in place, so this behaves like
-/// an overlay and does not resize maximized windows.
+/// In full-hide mode, temporarily show the real taskbar for an explicit Start-button
+/// click: make it opaque + interactive and pin it ALWAYS-ON-TOP so it slides fully
+/// on-screen and is usable.
 pub unsafe fn reveal_for_start_invocation(mode: TaskbarMode) -> bool {
     if !should_reveal_for_start_invocation(mode) {
         return false;
     }
+    make_taskbar_opaque();
+    set_autohide(false);
     show_class("Shell_TrayWnd", true);
     show_class("Shell_SecondaryTrayWnd", true);
-    if should_disable_autohide_for_start_invocation(mode) {
-        set_autohide(false);
-    }
     true
 }
 
+/// Return to the hidden resting state after a Start-button reveal.
 pub unsafe fn rehide_after_start_invocation(mode: TaskbarMode) {
     if mode != TaskbarMode::Hidden {
         return;
     }
-    set_autohide(autohide_for_mode(
-        mode,
-        ORIGINAL_AUTOHIDE.load(Ordering::Relaxed),
-    ));
-    show_class("Shell_TrayWnd", false);
-    show_class("Shell_SecondaryTrayWnd", false);
+    apply(TaskbarMode::Hidden);
 }
 
 unsafe fn window_class(hwnd: HWND) -> String {
@@ -291,47 +278,14 @@ fn is_taskbar_window_class(class: &str) -> bool {
     )
 }
 
+/// Windows we must never "reflow" as if they were ordinary maximized app windows:
+/// the shell's own surfaces, the desktop, and our dock.
 fn is_shell_or_dock_window_class(class: &str) -> bool {
     is_taskbar_window_class(class)
         || matches!(
             class,
             "Progman" | "WorkerW" | "FeatherDockWindow" | "Windows.UI.Core.CoreWindow"
         )
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MaximizedWindowRefresh {
-    ReapplyMaximize,
-    Skip,
-}
-
-fn maximized_window_refresh_action(
-    visible: bool,
-    zoomed: bool,
-    class: &str,
-) -> MaximizedWindowRefresh {
-    if visible && zoomed && !is_shell_or_dock_window_class(class) {
-        MaximizedWindowRefresh::ReapplyMaximize
-    } else {
-        MaximizedWindowRefresh::Skip
-    }
-}
-
-unsafe fn refresh_maximized_windows(_mode: TaskbarMode) {
-    let _ = EnumWindows(Some(refresh_maximized_window), LPARAM(0));
-}
-
-unsafe extern "system" fn refresh_maximized_window(hwnd: HWND, _lparam: LPARAM) -> BOOL {
-    let action = maximized_window_refresh_action(
-        IsWindowVisible(hwnd).as_bool(),
-        IsZoomed(hwnd).as_bool(),
-        &window_class(hwnd),
-    );
-    if action == MaximizedWindowRefresh::ReapplyMaximize {
-        let _ = ShowWindow(hwnd, SW_RESTORE);
-        let _ = ShowWindow(hwnd, SW_MAXIMIZE);
-    }
-    BOOL(1)
 }
 
 pub unsafe fn pointer_over_taskbar() -> bool {
@@ -352,54 +306,78 @@ pub unsafe fn pointer_over_taskbar() -> bool {
     false
 }
 
+/// After we free the work area (by auto-hiding the taskbar), windows that were
+/// maximized while the taskbar still reserved its row stay ~48px short until
+/// re-maximized. Cycle each maximized app window's maximize so it re-fits the now-full
+/// screen. Called only on deliberate hidden-entry paths (startup, mode switch,
+/// Explorer restart, resolution change) — never on hot/frequent events.
+pub unsafe fn reflow_maximized_windows() {
+    let _ = EnumWindows(Some(reflow_one), LPARAM(0));
+}
+
+unsafe extern "system" fn reflow_one(hwnd: HWND, _lparam: LPARAM) -> BOOL {
+    if IsWindowVisible(hwnd).as_bool()
+        && IsZoomed(hwnd).as_bool()
+        && !is_shell_or_dock_window_class(&window_class(hwnd))
+    {
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+        let _ = ShowWindow(hwnd, SW_MAXIMIZE);
+    }
+    BOOL(1)
+}
+
 pub unsafe fn apply(mode: TaskbarMode) {
-    let work_area_changed = true;
+    let original = ORIGINAL_AUTOHIDE.load(Ordering::Relaxed);
+    let autohide = autohide_for_mode(mode, original);
     match mode {
-        // "Show" = leave it as the user had it (respect their original auto-hide).
+        // "Show" = leave it as the user had it (respect their original auto-hide). Back
+        // to their own state -> nothing for an abnormal exit to undo: clear the guard.
         TaskbarMode::Show => {
-            restore_work_area();
-            show_class("Shell_TrayWnd", true);
-            show_class("Shell_SecondaryTrayWnd", true);
-            set_autohide(autohide_for_mode(
-                mode,
-                ORIGINAL_AUTOHIDE.load(Ordering::Relaxed),
-            ));
-            if should_refresh_maximized_windows(mode, work_area_changed) {
-                refresh_maximized_windows(mode);
-            }
+            restore_to(autohide);
+            clear_guard();
         }
-        // OS-managed auto-hide already reclaims the work area for maximized windows.
+        // OS-managed auto-hide: freed work area, slides in (visibly) on edge-hover.
+        // Diverges from the user's state, so mark the guard for crash recovery.
         TaskbarMode::AutoHide => {
-            restore_work_area();
+            mark_guarded(original);
+            make_taskbar_opaque();
+            set_autohide(autohide);
             show_class("Shell_TrayWnd", true);
             show_class("Shell_SecondaryTrayWnd", true);
-            set_autohide(autohide_for_mode(
-                mode,
-                ORIGINAL_AUTOHIDE.load(Ordering::Relaxed),
-            ));
-            if should_refresh_maximized_windows(mode, work_area_changed) {
-                refresh_maximized_windows(mode);
-            }
         }
-        // Fully hidden: reclaim the work area so apps fill the whole screen (no gap).
+        // Fully hidden: transparent FIRST (so the auto-hide transition below never
+        // flashes on screen), then auto-hide to free the work area. The bar stays
+        // WS_VISIBLE but alpha-0, so it shows nothing whether parked as the sliver or
+        // slid up on hover, yet reserves no row — the "pure dock" behaviour. Mark the
+        // guard: stranded in this state, the user has no visible taskbar at all.
         TaskbarMode::Hidden => {
-            set_autohide(autohide_for_mode(
-                mode,
-                ORIGINAL_AUTOHIDE.load(Ordering::Relaxed),
-            ));
-            show_class("Shell_TrayWnd", false);
-            show_class("Shell_SecondaryTrayWnd", false);
-            reclaim_work_area();
-            if should_refresh_maximized_windows(mode, work_area_changed) {
-                refresh_maximized_windows(mode);
-            }
+            mark_guarded(original);
+            make_taskbar_transparent();
+            set_autohide(autohide);
         }
     }
 }
 
-/// Restore the taskbar to the user's original state. Always call this on exit.
+/// Put the taskbar back to a usable, visible state with an explicitly supplied auto-hide
+/// preference. Takes the value as an argument (rather than reading the captured static)
+/// so the watchdog process — which never ran `capture_original` — and on-launch recovery
+/// can both call it.
+pub unsafe fn restore_to(original_autohide: bool) {
+    make_taskbar_opaque();
+    set_autohide(original_autohide);
+    show_class("Shell_TrayWnd", true);
+    show_class("Shell_SecondaryTrayWnd", true);
+}
+
+/// Restore the taskbar to the user's original state. Always call this on a clean exit.
 pub unsafe fn restore() {
     apply(TaskbarMode::Show);
+}
+
+/// The primary taskbar window, so the dock can sit just below it in z-order while
+/// the user has the taskbar explicitly revealed (and operate it on top of the dock).
+pub unsafe fn tray_hwnd() -> HWND {
+    primary()
 }
 
 #[cfg(test)]
@@ -438,82 +416,48 @@ mod tests {
     }
 
     #[test]
-    fn hidden_mode_reclaims_the_taskbar_monitor_full_bounds() {
-        let monitor = RectSpec {
-            left: 0,
-            top: 0,
-            right: 2560,
-            bottom: 1600,
-        };
-
-        assert_eq!(reclaimed_work_area(monitor), monitor);
-    }
-
-    #[test]
-    fn hidden_mode_refreshes_maximized_windows_to_monitor_not_old_work_area() {
-        let monitor = RectSpec {
-            left: 0,
-            top: 0,
-            right: 2560,
-            bottom: 1600,
-        };
-        let old_work_area = RectSpec {
-            left: 0,
-            top: 0,
-            right: 2560,
-            bottom: 1560,
-        };
-
-        assert_eq!(
-            maximized_window_target(TaskbarMode::Hidden, monitor, old_work_area),
-            monitor
-        );
-        assert_eq!(
-            maximized_window_target(TaskbarMode::Show, monitor, old_work_area),
-            old_work_area
-        );
-    }
-
-    #[test]
-    fn start_invocation_rehide_does_not_refresh_maximized_windows() {
-        assert!(should_refresh_maximized_windows(TaskbarMode::Hidden, true));
-        assert!(!should_refresh_maximized_windows(
-            TaskbarMode::Hidden,
-            false
+    fn hidden_start_invocation_reveals_taskbar_without_synthesizing_win_key() {
+        assert!(!should_open_start_menu_for_start_invocation(
+            TaskbarMode::Hidden
+        ));
+        assert!(should_open_start_menu_for_start_invocation(
+            TaskbarMode::Show
+        ));
+        assert!(should_open_start_menu_for_start_invocation(
+            TaskbarMode::AutoHide
         ));
     }
 
     #[test]
-    fn maximized_window_refresh_uses_system_maximize_cycle() {
-        assert_eq!(
-            maximized_window_refresh_action(true, true, "Chrome_WidgetWin_1"),
-            MaximizedWindowRefresh::ReapplyMaximize
-        );
-        assert_eq!(
-            maximized_window_refresh_action(true, false, "Chrome_WidgetWin_1"),
-            MaximizedWindowRefresh::Skip
-        );
-        assert_eq!(
-            maximized_window_refresh_action(true, true, "Shell_TrayWnd"),
-            MaximizedWindowRefresh::Skip
-        );
-    }
-
-    #[test]
-    fn hidden_mode_keeps_system_autohide_enabled_to_release_work_area() {
+    fn hidden_and_autohide_free_the_work_area_via_shell_autohide() {
+        // Both hidden and auto-hide put the shell in auto-hide state, which is what
+        // reclaims the desktop work area (no reserved row). "Show" respects whatever
+        // the user originally had.
         assert!(autohide_for_mode(TaskbarMode::Hidden, false));
+        assert!(autohide_for_mode(TaskbarMode::Hidden, true));
         assert!(autohide_for_mode(TaskbarMode::AutoHide, false));
+        assert!(autohide_for_mode(TaskbarMode::AutoHide, true));
         assert!(!autohide_for_mode(TaskbarMode::Show, false));
         assert!(autohide_for_mode(TaskbarMode::Show, true));
     }
 
     #[test]
-    fn explicit_start_invocation_does_not_disable_autohide() {
-        assert!(!should_disable_autohide_for_start_invocation(
-            TaskbarMode::Hidden
-        ));
-        assert!(!should_disable_autohide_for_start_invocation(
-            TaskbarMode::Show
-        ));
+    fn invisible_exstyle_is_layered_plus_click_through() {
+        assert_eq!(
+            EX_INVISIBLE,
+            WS_EX_LAYERED.0 as i32 | WS_EX_TRANSPARENT.0 as i32
+        );
+        // Layered is required for an alpha of 0 to take effect; transparent makes the
+        // (invisible) bar click-through so it never eats dock/desktop clicks.
+        assert_ne!(EX_INVISIBLE & WS_EX_LAYERED.0 as i32, 0);
+        assert_ne!(EX_INVISIBLE & WS_EX_TRANSPARENT.0 as i32, 0);
+    }
+
+    #[test]
+    fn never_reflow_shell_or_dock_surfaces() {
+        assert!(is_shell_or_dock_window_class("Shell_TrayWnd"));
+        assert!(is_shell_or_dock_window_class("WorkerW"));
+        assert!(is_shell_or_dock_window_class("FeatherDockWindow"));
+        assert!(!is_shell_or_dock_window_class("Chrome_WidgetWin_1"));
     }
 }

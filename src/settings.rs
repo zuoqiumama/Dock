@@ -65,9 +65,20 @@ impl TaskbarMode {
 #[derive(Clone, Copy)]
 pub struct Settings {
     pub dock_mode: DockMode,
-    /// In Always mode, hide the dock while a fullscreen app is in front.
+    /// In Always mode, FULLY hide the dock while a fullscreen app (game/video) is in
+    /// front — and don't let a bottom-edge hover summon it (never disturb the game).
     pub hide_on_fullscreen: bool,
+    /// In Always mode, retract the dock to its reveal strip while a *maximized* window is
+    /// in front, so it doesn't cover the window — but a bottom-edge hover still summons
+    /// it (unlike fullscreen). Classic auto-hide, scoped to "something is maximized".
+    pub hide_on_maximized: bool,
     pub taskbar_mode: TaskbarMode,
+    /// Show the app-drawer button (the "app grid" launcher) on the dock. Off → the
+    /// dock omits it entirely, for users who don't want the drawer.
+    pub drawer_enabled: bool,
+    /// Hide the Windows desktop icons (the SysListView32 toggle Explorer's right-click
+    /// "Show desktop icons" flips). Reversible, non-destructive; restored on exit.
+    pub hide_desktop_icons: bool,
 }
 
 impl Default for Settings {
@@ -75,17 +86,23 @@ impl Default for Settings {
         Settings {
             dock_mode: DockMode::Always,
             hide_on_fullscreen: true,
+            hide_on_maximized: true,
             taskbar_mode: TaskbarMode::Show,
+            drawer_enabled: true,
+            hide_desktop_icons: false,
         }
     }
 }
 
 const HEADER: &str = "\
 # FeatherDock settings.
-# dock_mode = \"always\"  -> resident at the bottom (retracts only for fullscreen apps)
+# dock_mode = \"always\"  -> resident at the bottom (retracts for fullscreen/maximized)
 # dock_mode = \"autohide\" -> classic auto-hide (reveal by hitting the bottom edge)
-# hide_on_fullscreen = true | false
+# hide_on_fullscreen = true | false  (fullscreen game: fully hidden, no hover-reveal)
+# hide_on_maximized  = true | false  (maximized window: retract to strip, hover reveals)
 # taskbar_mode = \"show\" | \"autohide\" | \"hidden\"
+# drawer_enabled = true | false  (show the app-drawer button on the dock)
+# hide_desktop_icons = true | false  (hide the Windows desktop icons while running)
 ";
 
 fn settings_path() -> PathBuf {
@@ -120,10 +137,19 @@ pub fn load() -> Settings {
             "hide_on_fullscreen" => {
                 settings.hide_on_fullscreen = value.eq_ignore_ascii_case("true");
             }
+            "hide_on_maximized" => {
+                settings.hide_on_maximized = value.eq_ignore_ascii_case("true");
+            }
             "taskbar_mode" => {
                 if let Some(mode) = TaskbarMode::parse(value) {
                     settings.taskbar_mode = mode;
                 }
+            }
+            "drawer_enabled" => {
+                settings.drawer_enabled = value.eq_ignore_ascii_case("true");
+            }
+            "hide_desktop_icons" => {
+                settings.hide_desktop_icons = value.eq_ignore_ascii_case("true");
             }
             _ => {}
         }
@@ -138,10 +164,13 @@ pub fn save(settings: &Settings) -> io::Result<()> {
         fs::create_dir_all(parent)?;
     }
     let body = format!(
-        "{HEADER}\ndock_mode = \"{}\"\nhide_on_fullscreen = {}\ntaskbar_mode = \"{}\"\n",
+        "{HEADER}\ndock_mode = \"{}\"\nhide_on_fullscreen = {}\nhide_on_maximized = {}\ntaskbar_mode = \"{}\"\ndrawer_enabled = {}\nhide_desktop_icons = {}\n",
         settings.dock_mode.as_str(),
         settings.hide_on_fullscreen,
-        settings.taskbar_mode.as_str()
+        settings.hide_on_maximized,
+        settings.taskbar_mode.as_str(),
+        settings.drawer_enabled,
+        settings.hide_desktop_icons
     );
     fs::write(&path, body)
 }
@@ -155,6 +184,7 @@ mod tests {
         // Defaults when empty.
         assert!(matches!(Settings::default().dock_mode, DockMode::Always));
         assert!(Settings::default().hide_on_fullscreen);
+        assert!(Settings::default().hide_on_maximized);
 
         assert_eq!(DockMode::parse("autohide"), Some(DockMode::AutoHide));
         assert_eq!(DockMode::parse("ALWAYS"), Some(DockMode::Always));

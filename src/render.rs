@@ -6,7 +6,7 @@ use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 
-use crate::dock::{Dock, ItemRole, BASE_ICON, CORNER};
+use crate::dock::{Dock, ItemRole, BASE_ICON, CORNER, ENTER_RISE};
 
 const IDENTITY: Matrix3x2 = Matrix3x2 {
     M11: 1.0,
@@ -69,15 +69,30 @@ pub unsafe fn draw(
     for ic in &frame.icons {
         let item = &dock.items[ic.idx];
 
-        // The divider is a static separator: draw a line, no scaling.
-        if item.role == ItemRole::Divider {
-            dc.SetTransform(&IDENTITY);
-            draw_divider(dc, brush, ic.cx, frame.baseline, base);
+        // `presence` (0..1) animates a slot appearing/disappearing: the icon scales
+        // up from / down to nothing, fades by the same factor, and a new one rises
+        // gently into place. Skip the degenerate fully-collapsed frame.
+        let p = ic.presence;
+        if p <= 0.001 {
             continue;
         }
 
-        // scale about the icon's bottom-center, then lift by the click-hop offset
-        dc.SetTransform(&scale_about(ic.scale, ic.cx, frame.baseline, -ic.bounce_y));
+        // The divider is a static separator: draw a line, fading with presence.
+        if item.role == ItemRole::Divider {
+            dc.SetTransform(&IDENTITY);
+            draw_divider(dc, brush, ic.cx, frame.baseline, base, p);
+            continue;
+        }
+
+        // Scale about the icon's bottom-center (magnify * presence), lift by the
+        // click-hop, and sink slightly while not fully present so it rises in/out.
+        let rise = (1.0 - p) * ENTER_RISE * base;
+        dc.SetTransform(&scale_about(
+            ic.scale * p,
+            ic.cx,
+            frame.baseline,
+            -ic.bounce_y + rise,
+        ));
 
         let tile = D2D_RECT_F {
             left: ic.cx - base / 2.0,
@@ -92,6 +107,18 @@ pub unsafe fn draw(
             continue;
         }
 
+        // The Control button is drawn as a crisp "sliders" vector glyph.
+        if item.role == ItemRole::Control {
+            draw_control(dc, brush, tile);
+            continue;
+        }
+
+        // The Drawer button is drawn as a crisp 3x3 "app grid" vector glyph.
+        if item.role == ItemRole::Drawer {
+            draw_drawer(dc, brush, tile);
+            continue;
+        }
+
         match icons.get(ic.idx).and_then(|o| o.as_ref()) {
             // Real application icon: draw the bitmap (transform scales it crisply).
             Some(bmp) => {
@@ -100,7 +127,7 @@ pub unsafe fn draw(
                 dc.DrawBitmap(
                     bmp,
                     Some(&dest),
-                    1.0,
+                    p,
                     D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
                     None,
                     None,
@@ -113,9 +140,9 @@ pub unsafe fn draw(
                     radiusX: base * CORNER,
                     radiusY: base * CORNER,
                 };
-                brush.SetColor(&color(item.color.0, item.color.1, item.color.2, 1.0));
+                brush.SetColor(&color(item.color.0, item.color.1, item.color.2, p));
                 dc.FillRoundedRectangle(&rr, brush);
-                brush.SetColor(&color(1.0, 1.0, 1.0, 0.97));
+                brush.SetColor(&color(1.0, 1.0, 1.0, 0.97 * p));
                 let wide: Vec<u16> = item.glyph.encode_utf16().collect();
                 dc.DrawText(
                     &wide,
@@ -127,6 +154,18 @@ pub unsafe fn draw(
                 );
             }
         }
+    }
+
+    // Running indicators: a small dot under any app that has open windows — both
+    // pinned apps that are running (merged) and the right-side open windows. Drawn
+    // unscaled (IDENTITY) so it stays a subtle, constant-size cue under the icon.
+    dc.SetTransform(&IDENTITY);
+    for ic in &frame.icons {
+        let item = &dock.items[ic.idx];
+        if item.windows.is_empty() || ic.presence <= 0.02 {
+            continue;
+        }
+        draw_running_dot(dc, brush, ic.cx, frame.baseline, base, ic.presence);
     }
     dc.SetTransform(&IDENTITY);
 }
@@ -165,19 +204,22 @@ unsafe fn draw_divider(
     cx: f32,
     baseline: f32,
     base: f32,
+    presence: f32,
 ) {
     let half = (base * 0.022).max(1.0); // ~2px line, scales gently with DPI
+                                        // Grow the line in from the baseline as the slot opens, so it doesn't pop.
+    let height = base * 0.72 * presence;
     let line = D2D1_ROUNDED_RECT {
         rect: D2D_RECT_F {
             left: cx - half,
-            top: baseline - base * 0.82,
+            top: baseline - base * 0.10 - height,
             right: cx + half,
             bottom: baseline - base * 0.10,
         },
         radiusX: half,
         radiusY: half,
     };
-    brush.SetColor(&color(1.0, 1.0, 1.0, 0.18));
+    brush.SetColor(&color(1.0, 1.0, 1.0, 0.18 * presence));
     dc.FillRoundedRectangle(&line, brush);
 }
 
@@ -207,6 +249,92 @@ unsafe fn draw_start(dc: &ID2D1DeviceContext, brush: &ID2D1SolidColorBrush, tile
         };
         dc.FillRoundedRectangle(&pane, brush);
     }
+}
+
+/// The Control button: two horizontal slider tracks with offset knobs (a "control
+/// center / sliders" feel), drawn as vectors so it stays crisp under magnification.
+unsafe fn draw_control(dc: &ID2D1DeviceContext, brush: &ID2D1SolidColorBrush, tile: D2D_RECT_F) {
+    let size = tile.right - tile.left;
+    let pad = size * 0.26;
+    let left = tile.left + pad;
+    let right = tile.right - pad;
+    let track_h = size * 0.05;
+    let knob_r = size * 0.10;
+    // (vertical position as a fraction of the tile, knob position along the track)
+    for (fy, kx) in [(0.40, 0.66_f32), (0.62, 0.34_f32)] {
+        let y = tile.top + size * fy;
+        let track = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left,
+                top: y - track_h,
+                right,
+                bottom: y + track_h,
+            },
+            radiusX: track_h,
+            radiusY: track_h,
+        };
+        brush.SetColor(&color(0.92, 0.94, 0.98, 0.85));
+        dc.FillRoundedRectangle(&track, brush);
+        let knob_x = left + (right - left) * kx;
+        brush.SetColor(&color(1.0, 1.0, 1.0, 1.0));
+        dc.FillEllipse(
+            &D2D1_ELLIPSE {
+                point: D2D_POINT_2F { x: knob_x, y },
+                radiusX: knob_r,
+                radiusY: knob_r,
+            },
+            brush,
+        );
+    }
+}
+
+/// The Drawer button: a 3x3 grid of rounded squares (an "app drawer / Launchpad"
+/// feel), drawn as vectors so it stays crisp under magnification.
+unsafe fn draw_drawer(dc: &ID2D1DeviceContext, brush: &ID2D1SolidColorBrush, tile: D2D_RECT_F) {
+    let size = tile.right - tile.left;
+    let pad = size * 0.24;
+    let cell = (size - 2.0 * pad) / 3.0;
+    let dot = cell * 0.40; // half-extent of each rounded square
+    brush.SetColor(&color(0.92, 0.94, 0.98, 0.92));
+    for row in 0..3 {
+        for col in 0..3 {
+            let cx = tile.left + pad + cell * (col as f32 + 0.5);
+            let cy = tile.top + pad + cell * (row as f32 + 0.5);
+            let pane = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    left: cx - dot,
+                    top: cy - dot,
+                    right: cx + dot,
+                    bottom: cy + dot,
+                },
+                radiusX: dot * 0.42,
+                radiusY: dot * 0.42,
+            };
+            dc.FillRoundedRectangle(&pane, brush);
+        }
+    }
+}
+
+/// A small "running" dot centered under an icon, in the pill's bottom padding.
+unsafe fn draw_running_dot(
+    dc: &ID2D1DeviceContext,
+    brush: &ID2D1SolidColorBrush,
+    cx: f32,
+    baseline: f32,
+    base: f32,
+    presence: f32,
+) {
+    let radius = (base * 0.045).max(2.0);
+    let y = baseline + base * 0.09; // just below the icon, inside the pill padding
+    brush.SetColor(&color(1.0, 1.0, 1.0, 0.72 * presence));
+    dc.FillEllipse(
+        &D2D1_ELLIPSE {
+            point: D2D_POINT_2F { x: cx, y },
+            radiusX: radius,
+            radiusY: radius,
+        },
+        brush,
+    );
 }
 
 /// Uniform scale `s` about anchor (ax, ay) — bottom-center, so icons grow upward —

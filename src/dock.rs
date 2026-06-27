@@ -22,6 +22,10 @@ pub const REVEAL_TAU: f32 = 0.14; // auto-hide slide smoothing (seconds)
 pub const HIDE_SLIVER: f32 = 3.0; // visible sliver when hidden (logical px)
 pub const TRIGGER_PX: f32 = 4.0; // bottom hot-zone height that reveals the dock
 pub const DIVIDER_W: f32 = 16.0; // width of the separator slot (logical px)
+pub const ENTER_TAU: f32 = 0.17; // appear easing — slot opens + icon scales/fades in
+pub const EXIT_TAU: f32 = 0.13; // disappear easing — a touch quicker than the open
+pub const PRESENCE_GONE: f32 = 0.015; // below this, a fully-exited slot is dropped
+pub const ENTER_RISE: f32 = 0.16; // how far (fraction of icon) a new icon rises into place
 
 /// What a slot in the dock represents — drives layout, magnification, hit-testing
 /// and what a click does. The dock row is ordered: Start, pinned…, Divider,
@@ -33,6 +37,27 @@ pub enum ItemRole {
     Pinned,  // launches `path` via the shell
     Running, // activates the open window identified by `hwnd`
     Divider, // a vertical separator: no icon, no magnify, not clickable
+    Control, // far-right button: opens the glass control center
+    Drawer,  // opens the glass app drawer (all desktop programs)
+}
+
+/// A stable identity for a slot, so the dock can be *reconciled* across rebuilds
+/// (match surviving items, animate new ones in and closed ones out) instead of
+/// being thrown away and recreated. Two items are "the same slot" iff keys match.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum ItemKey {
+    Start,
+    Divider,
+    Control,
+    Drawer,
+    Pinned(String),  // by launch path (falls back to icon source, then label)
+    Running(String), // by application group key
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunningWindowRef {
+    pub hwnd: isize,
+    pub title: String,
 }
 
 /// Resting width of a slot in logical px (before DPI + magnification).
@@ -52,6 +77,61 @@ pub struct DockItem {
     pub kind: ContentKind,
     pub role: ItemRole,
     pub hwnd: Option<isize>, // for Running items: the window to activate
+    pub group_key: Option<String>,
+    pub windows: Vec<RunningWindowRef>,
+}
+
+impl DockItem {
+    /// Stable identity used to reconcile the dock across rebuilds (see `ItemKey`).
+    pub fn key(&self) -> ItemKey {
+        match self.role {
+            ItemRole::Start => ItemKey::Start,
+            ItemRole::Divider => ItemKey::Divider,
+            ItemRole::Control => ItemKey::Control,
+            ItemRole::Drawer => ItemKey::Drawer,
+            ItemRole::Running => ItemKey::Running(
+                self.group_key
+                    .clone()
+                    .unwrap_or_else(|| format!("hwnd:{}", self.hwnd.unwrap_or(0))),
+            ),
+            ItemRole::Pinned => ItemKey::Pinned(
+                self.path
+                    .clone()
+                    .or_else(|| self.icon.clone())
+                    .unwrap_or_else(|| self.label.clone()),
+            ),
+        }
+    }
+}
+
+/// Per-slot animation state. `presence` (0..1) drives the appear/disappear of a
+/// slot: its layout width and its icon's scale/opacity all scale by it, so a slot
+/// smoothly grows open when added and collapses shut when removed.
+#[derive(Clone, Copy)]
+struct Slot {
+    scale: f32,           // magnification, eased toward the cursor bell
+    bounce: f32,          // click-hop phase, 1.0 -> 0.0
+    presence: f32,        // 0 = absent (collapsed), 1 = fully present
+    presence_target: f32, // 1 while alive, 0 once removed (then eased out + dropped)
+}
+
+impl Slot {
+    fn present() -> Slot {
+        Slot {
+            scale: 1.0,
+            bounce: 0.0,
+            presence: 1.0,
+            presence_target: 1.0,
+        }
+    }
+    fn entering() -> Slot {
+        Slot {
+            scale: 1.0,
+            bounce: 0.0,
+            presence: 0.0,
+            presence_target: 1.0,
+        }
+    }
 }
 
 pub struct IconFrame {
@@ -59,6 +139,7 @@ pub struct IconFrame {
     pub cx: f32,
     pub scale: f32,
     pub bounce_y: f32, // upward offset from the click hop
+    pub presence: f32, // 0..1 appear/disappear factor (icon scale + opacity)
 }
 
 pub struct Frame {
@@ -69,8 +150,7 @@ pub struct Frame {
 
 pub struct Dock {
     pub items: Vec<DockItem>,
-    pub scale: Vec<f32>,
-    pub bounce: Vec<f32>, // per-item click-hop phase, 1.0 -> 0.0
+    slots: Vec<Slot>, // per-item animation state, kept in lockstep with `items`
     pub cursor_x: Option<f32>,
     pub reveal: f32,        // 0 = fully hidden (slid down), 1 = fully shown
     pub reveal_target: f32, // where reveal is easing toward
@@ -101,8 +181,8 @@ impl Dock {
         let n = items.len();
         Dock {
             items,
-            scale: vec![1.0; n],
-            bounce: vec![0.0; n],
+            // Whatever is present at construction starts fully shown (no intro animation).
+            slots: vec![Slot::present(); n],
             cursor_x: None,
             // Start shown; main.rs decides the resting target from settings + the
             // fullscreen state (always-resident vs. auto-hide vs. fullscreen retract).
@@ -151,10 +231,30 @@ impl Dock {
         self.hit_zone(self.reveal > 0.02)
     }
 
+    /// The client-space rectangle that should actually intercept the mouse, sized
+    /// dynamically by whether the cursor is currently over the dock:
+    ///
+    /// * **Hovering** (`cursor_x` set) → the full magnification envelope, so the pointer
+    ///   stays captured as icons bulge up *above* the pill and the row widens.
+    /// * **At rest** (`cursor_x` clear) → just the visible pill, so the tall head-room and
+    ///   side bulge that the envelope reserves don't swallow clicks on whatever sits just
+    ///   above or beside the dock (e.g. a Send button overlapping the old oversized box).
+    ///
+    /// Entering works because the pill itself is interactive: the moment the cursor
+    /// lands on it, `WM_MOUSEMOVE` sets `cursor_x` and the zone expands on the next hit
+    /// test; leaving fires `WM_MOUSELEAVE`, clearing `cursor_x` and shrinking it back.
+    pub fn pointer_hit_zone(&self) -> (f32, f32, f32, f32) {
+        if self.cursor_x.is_some() {
+            self.interactive_hit_zone()
+        } else {
+            self.frame().pill
+        }
+    }
+
     /// Start the click hop for item `i`.
     pub fn bump(&mut self, i: usize) {
-        if let Some(b) = self.bounce.get_mut(i) {
-            *b = 1.0;
+        if let Some(s) = self.slots.get_mut(i) {
+            s.bounce = 1.0;
         }
     }
 
@@ -165,13 +265,21 @@ impl Dock {
     fn rest_centers(&self) -> Vec<f32> {
         let (_, gap) = self.metrics();
         let n = self.items.len();
-        let widths: Vec<f32> = (0..n).map(|i| self.item_w(i)).collect();
-        let row: f32 = widths.iter().sum::<f32>() + gap * n.saturating_sub(1) as f32;
+        // Un-magnified widths, but still collapsed by `presence` so an opening or
+        // closing slot's gap shrinks with it (matches `frame`'s geometry at scale=1).
+        let widths: Vec<f32> = (0..n)
+            .map(|i| self.item_w(i) * self.slots[i].presence)
+            .collect();
+        let row: f32 =
+            widths.iter().sum::<f32>() + (1..n).map(|i| gap * self.slots[i].presence).sum::<f32>();
         let mut x = (self.win_w - row) / 2.0;
         let mut centers = Vec::with_capacity(n);
-        for w in &widths {
-            centers.push(x + w / 2.0);
-            x += w + gap;
+        for i in 0..n {
+            if i > 0 {
+                x += gap * self.slots[i].presence;
+            }
+            centers.push(x + widths[i] / 2.0);
+            x += widths[i];
         }
         centers
     }
@@ -208,16 +316,26 @@ impl Dock {
             } else {
                 self.target(rc[i])
             };
-            let d = tg - self.scale[i];
+            let d = tg - self.slots[i].scale;
             if d.abs() > 0.002 {
                 moving = true;
-                self.scale[i] += d * alpha;
+                self.slots[i].scale += d * alpha;
             } else {
-                self.scale[i] = tg;
+                self.slots[i].scale = tg;
             }
-            if self.bounce[i] > 0.0 {
-                self.bounce[i] = (self.bounce[i] - dt / BOUNCE_DUR).max(0.0);
+            if self.slots[i].bounce > 0.0 {
+                self.slots[i].bounce = (self.slots[i].bounce - dt / BOUNCE_DUR).max(0.0);
                 moving = true;
+            }
+            // appear/disappear: open a bit slower than we close, both frame-rate independent.
+            let pt = self.slots[i].presence_target;
+            let dp = pt - self.slots[i].presence;
+            if dp.abs() > 0.0005 {
+                let tau = if dp > 0.0 { ENTER_TAU } else { EXIT_TAU };
+                self.slots[i].presence += dp * (1.0 - (-dt / tau).exp());
+                moving = true;
+            } else {
+                self.slots[i].presence = pt;
             }
         }
         // auto-hide slide easing
@@ -243,24 +361,33 @@ impl Dock {
                 pill: (0.0, 0.0, 0.0, 0.0),
             };
         }
-        let widths: Vec<f32> = (0..n).map(|i| self.item_w(i) * self.scale[i]).collect();
-        let total: f32 = widths.iter().sum::<f32>() + gap * (n as f32 - 1.0);
+        // Width AND the gap before each slot collapse with `presence`, so adding or
+        // removing an item slides its neighbours over smoothly instead of snapping.
+        let widths: Vec<f32> = (0..n)
+            .map(|i| self.item_w(i) * self.slots[i].scale * self.slots[i].presence)
+            .collect();
+        let total: f32 =
+            widths.iter().sum::<f32>() + (1..n).map(|i| gap * self.slots[i].presence).sum::<f32>();
         let mut x = (self.win_w - total) / 2.0;
         // auto-hide slide: shown floats SHOWN_GAP above the bottom; hidden slides down.
         let shown_baseline = self.win_h - (PILL_PAD_Y + SHOWN_GAP) * self.dpi;
         let baseline = shown_baseline + (1.0 - self.reveal) * self.hide_slide();
         let mut icons = Vec::with_capacity(n);
         for i in 0..n {
+            if i > 0 {
+                x += gap * self.slots[i].presence;
+            }
             let w = widths[i];
             // single smooth hop: 0 at phase 1 -> peak at 0.5 -> 0 at phase 0
-            let bounce_y = (self.bounce[i] * std::f32::consts::PI).sin() * BOUNCE_AMP * base;
+            let bounce_y = (self.slots[i].bounce * std::f32::consts::PI).sin() * BOUNCE_AMP * base;
             icons.push(IconFrame {
                 idx: i,
                 cx: x + w / 2.0,
-                scale: self.scale[i],
+                scale: self.slots[i].scale,
                 bounce_y,
+                presence: self.slots[i].presence,
             });
-            x += w + gap;
+            x += w;
         }
         let pill_l = icons[0].cx - widths[0] / 2.0 - PILL_PAD_X * self.dpi;
         let pill_r = icons[n - 1].cx + widths[n - 1] / 2.0 + PILL_PAD_X * self.dpi;
@@ -279,7 +406,11 @@ impl Dock {
             if self.items[ic.idx].role == ItemRole::Divider {
                 continue; // separators aren't clickable
             }
-            let w = self.item_w(ic.idx) * ic.scale;
+            // A slot that's collapsing away (its window already closed) isn't a target.
+            if self.slots[ic.idx].presence_target == 0.0 {
+                continue;
+            }
+            let w = self.item_w(ic.idx) * ic.scale * ic.presence;
             if x >= ic.cx - w / 2.0
                 && x <= ic.cx + w / 2.0
                 && y >= f.baseline - w
@@ -289,6 +420,127 @@ impl Dock {
             }
         }
         None
+    }
+
+    /// Reconcile the live item set with a freshly-composed desired list. Items that
+    /// persist keep their animation state (and icon); items only in the new list are
+    /// inserted *entering* (presence 0 -> 1); items only in the old list are kept but
+    /// marked *exiting* (presence -> 0) so they collapse before being dropped.
+    ///
+    /// Returns, for each merged slot, `Some(old_index)` if its icon can be reused or
+    /// `None` if a fresh icon must be loaded — letting the GPU layer realign its
+    /// bitmaps without re-extracting everything (and without blanking a closing icon).
+    pub fn reconcile(&mut self, desired: Vec<DockItem>) -> Vec<Option<usize>> {
+        let old_items = std::mem::take(&mut self.items);
+        let old_slots = std::mem::take(&mut self.slots);
+        let (m, d) = (old_items.len(), desired.len());
+
+        let old_keys: std::collections::HashSet<ItemKey> =
+            old_items.iter().map(DockItem::key).collect();
+        let desired_keys: std::collections::HashSet<ItemKey> =
+            desired.iter().map(DockItem::key).collect();
+
+        // Move-out buffers so we can take ownership of each side by index.
+        let mut old_items: Vec<Option<DockItem>> = old_items.into_iter().map(Some).collect();
+        let mut desired: Vec<Option<DockItem>> = desired.into_iter().map(Some).collect();
+
+        let mut items = Vec::with_capacity(m + d);
+        let mut slots = Vec::with_capacity(m + d);
+        let mut remap = Vec::with_capacity(m + d);
+
+        // Two-pointer merge. Both lists list common keys in the same relative order
+        // (Start, pinned…, divider, running sorted by hwnd), so common keys line up.
+        let (mut i, mut j) = (0, 0);
+        while i < m || j < d {
+            let old_only = i < m && !desired_keys.contains(&old_items[i].as_ref().unwrap().key());
+            if old_only {
+                items.push(old_items[i].take().unwrap());
+                let mut s = old_slots[i];
+                s.presence_target = 0.0; // exiting: collapse, then get dropped
+                slots.push(s);
+                remap.push(Some(i));
+                i += 1;
+                continue;
+            }
+            let new_only = j < d && !old_keys.contains(&desired[j].as_ref().unwrap().key());
+            if new_only {
+                items.push(desired[j].take().unwrap());
+                slots.push(Slot::entering());
+                remap.push(None);
+                j += 1;
+                continue;
+            }
+            if i < m && j < d {
+                // Common slot: keep its animation + icon, but adopt the fresh data.
+                debug_assert_eq!(
+                    old_items[i].as_ref().unwrap().key(),
+                    desired[j].as_ref().unwrap().key()
+                );
+                items.push(desired[j].take().unwrap());
+                let mut s = old_slots[i];
+                s.presence_target = 1.0; // revive if it had been mid-exit
+                slots.push(s);
+                remap.push(Some(i));
+                i += 1;
+                j += 1;
+                continue;
+            }
+            // Unreachable in practice (one side drained); fall through defensively.
+            if i < m {
+                items.push(old_items[i].take().unwrap());
+                let mut s = old_slots[i];
+                s.presence_target = 0.0;
+                slots.push(s);
+                remap.push(Some(i));
+                i += 1;
+            } else {
+                items.push(desired[j].take().unwrap());
+                slots.push(Slot::entering());
+                remap.push(None);
+                j += 1;
+            }
+        }
+
+        self.items = items;
+        self.slots = slots;
+        remap
+    }
+
+    /// Drop slots that have finished exiting (collapsed to nothing). Returns their
+    /// indices — ascending — so the GPU layer can drop the matching icon bitmaps and
+    /// stay in lockstep. Call once per frame after `tick`.
+    pub fn take_finished_exits(&mut self) -> Vec<usize> {
+        let removed: Vec<usize> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.presence_target == 0.0 && s.presence <= PRESENCE_GONE)
+            .map(|(i, _)| i)
+            .collect();
+        if removed.is_empty() {
+            return removed;
+        }
+        let mut keep = removed.iter().copied().peekable();
+        let mut idx = 0;
+        self.items.retain(|_| {
+            let drop = keep.peek() == Some(&idx);
+            if drop {
+                keep.next();
+            }
+            idx += 1;
+            !drop
+        });
+        let mut keep = removed.iter().copied().peekable();
+        let mut idx = 0;
+        self.slots.retain(|_| {
+            let drop = keep.peek() == Some(&idx);
+            if drop {
+                keep.next();
+            }
+            idx += 1;
+            !drop
+        });
+        removed
     }
 }
 
@@ -300,6 +552,47 @@ mod tests {
         Dock::new(Vec::new(), 1.0, 400.0, 140.0)
     }
 
+    fn item(role: ItemRole, hwnd: Option<isize>, path: Option<&str>) -> DockItem {
+        DockItem {
+            label: String::new(),
+            glyph: "",
+            color: (0.0, 0.0, 0.0),
+            path: path.map(str::to_string),
+            icon: None,
+            kind: ContentKind::Application,
+            role,
+            hwnd,
+            group_key: hwnd.map(|value| format!("hwnd:{value}")),
+            windows: hwnd
+                .map(|value| {
+                    vec![RunningWindowRef {
+                        hwnd: value,
+                        title: String::new(),
+                    }]
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    fn start() -> DockItem {
+        item(ItemRole::Start, None, None)
+    }
+    fn divider() -> DockItem {
+        item(ItemRole::Divider, None, None)
+    }
+    fn running(hwnd: isize) -> DockItem {
+        item(ItemRole::Running, Some(hwnd), None)
+    }
+
+    fn keys(dock: &Dock) -> Vec<ItemKey> {
+        dock.items.iter().map(DockItem::key).collect()
+    }
+
+    fn seeded(items: Vec<DockItem>) -> Dock {
+        // Start with the items already present (presence == 1), like a fresh launch.
+        Dock::new(items, 1.0, 1200.0, 140.0)
+    }
+
     #[test]
     fn visible_hide_animation_keeps_full_interactive_zone() {
         let mut dock = dock();
@@ -307,5 +600,116 @@ mod tests {
         assert_eq!(dock.interactive_hit_zone(), dock.hit_zone(true));
         dock.reveal = 0.0;
         assert_eq!(dock.interactive_hit_zone(), dock.hit_zone(false));
+    }
+
+    #[test]
+    fn hit_zone_tightens_to_the_pill_at_rest_and_expands_on_hover() {
+        let mut dock = seeded(vec![start(), running(10)]);
+        dock.reveal = 1.0;
+        // At rest the interceptable area is exactly the visible pill.
+        dock.cursor_x = None;
+        assert_eq!(dock.pointer_hit_zone(), dock.frame().pill);
+        // While hovering it expands to the full magnification envelope.
+        dock.cursor_x = Some(dock.win_w / 2.0);
+        assert_eq!(dock.pointer_hit_zone(), dock.interactive_hit_zone());
+        // The resting zone's top edge sits strictly lower than the hover envelope's:
+        // the head-room reserved above the pill for bulging icons is gone when unused.
+        dock.cursor_x = None;
+        let rest_top = dock.pointer_hit_zone().1;
+        dock.cursor_x = Some(dock.win_w / 2.0);
+        let hover_top = dock.pointer_hit_zone().1;
+        assert!(
+            rest_top > hover_top,
+            "rest_top {rest_top} should be below hover_top {hover_top}"
+        );
+    }
+
+    #[test]
+    fn opening_a_window_inserts_an_entering_slot_keeping_others() {
+        let mut dock = seeded(vec![start(), running(10)]);
+        let remap = dock.reconcile(vec![start(), divider(), running(10), running(20)]);
+        assert_eq!(
+            keys(&dock),
+            vec![
+                ItemKey::Start,
+                ItemKey::Divider,
+                ItemKey::Running("hwnd:10".to_string()),
+                ItemKey::Running("hwnd:20".to_string())
+            ]
+        );
+        // Start + running(10) reuse their icons; divider + running(20) are new.
+        assert_eq!(remap, vec![Some(0), None, Some(1), None]);
+        // The pre-existing window stays fully present; the new one starts collapsed.
+        assert_eq!(dock.slots[2].presence, 1.0);
+        assert_eq!(dock.slots[3].presence, 0.0);
+        assert_eq!(dock.slots[3].presence_target, 1.0);
+    }
+
+    #[test]
+    fn closing_a_window_keeps_it_exiting_then_drops_it() {
+        let mut dock = seeded(vec![start(), divider(), running(10), running(20)]);
+        dock.reconcile(vec![start(), divider(), running(10)]);
+        // running(20) is retained, collapsing out — not gone yet, so neighbours glide.
+        assert_eq!(keys(&dock).len(), 4);
+        let exiting = keys(&dock)
+            .iter()
+            .position(|k| *k == ItemKey::Running("hwnd:20".to_string()))
+            .unwrap();
+        assert_eq!(dock.slots[exiting].presence_target, 0.0);
+        assert!(dock.take_finished_exits().is_empty()); // still visible -> kept
+
+        // Drive presence to ~0 and confirm it (and only it) gets dropped.
+        dock.slots[exiting].presence = 0.0;
+        assert_eq!(dock.take_finished_exits(), vec![exiting]);
+        assert_eq!(
+            keys(&dock),
+            vec![
+                ItemKey::Start,
+                ItemKey::Divider,
+                ItemKey::Running("hwnd:10".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn middle_insertion_lands_between_the_right_neighbours() {
+        let mut dock = seeded(vec![start(), divider(), running(10), running(30)]);
+        // A new window whose handle sorts between the two existing ones.
+        let remap = dock.reconcile(vec![
+            start(),
+            divider(),
+            running(10),
+            running(20),
+            running(30),
+        ]);
+        assert_eq!(
+            keys(&dock),
+            vec![
+                ItemKey::Start,
+                ItemKey::Divider,
+                ItemKey::Running("hwnd:10".to_string()),
+                ItemKey::Running("hwnd:20".to_string()),
+                ItemKey::Running("hwnd:30".to_string())
+            ]
+        );
+        assert_eq!(remap, vec![Some(0), Some(1), Some(2), None, Some(3)]);
+    }
+
+    #[test]
+    fn reopening_a_closing_window_revives_it() {
+        let mut dock = seeded(vec![start(), divider(), running(10)]);
+        dock.reconcile(vec![start()]); // divider + running(10) start exiting
+        let r = keys(&dock)
+            .iter()
+            .position(|k| *k == ItemKey::Running("hwnd:10".to_string()))
+            .unwrap();
+        dock.slots[r].presence = 0.4; // mid-collapse
+        dock.reconcile(vec![start(), divider(), running(10)]); // it's back
+        let r = keys(&dock)
+            .iter()
+            .position(|k| *k == ItemKey::Running("hwnd:10".to_string()))
+            .unwrap();
+        assert_eq!(dock.slots[r].presence_target, 1.0);
+        assert_eq!(dock.slots[r].presence, 0.4); // eases back up from where it was
     }
 }

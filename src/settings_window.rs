@@ -36,6 +36,8 @@ const ID_PIN_LIST: usize = 131;
 const ID_PIN_ADD: usize = 132;
 const ID_PIN_REMOVE: usize = 133;
 const ID_AUTOSTART: usize = 141;
+const ID_DRAWER_ENABLED: usize = 142;
+const ID_HIDE_DESKTOP_ICONS: usize = 143;
 const ID_CLOSE: usize = 151;
 
 const BST_CHECKED: usize = 1;
@@ -49,6 +51,8 @@ struct SettingsState {
     dock_radios: [HWND; 2],
     fullscreen: HWND,
     autostart: HWND,
+    drawer_enabled: HWND,
+    hide_desktop: HWND,
     pin_list: HWND,
     pin_paths: Vec<String>,
     font: HFONT,
@@ -193,7 +197,7 @@ pub unsafe fn open(dock_hwnd: HWND) {
         left: 0,
         top: 0,
         right: (420.0 * scale) as i32,
-        bottom: (518.0 * scale) as i32,
+        bottom: (612.0 * scale) as i32,
     };
     let _ = AdjustWindowRectEx(&mut rect, style, false, WINDOW_EX_STYLE(0));
     let win_w = rect.right - rect.left;
@@ -309,10 +313,24 @@ pub unsafe fn open(dock_hwnd: HWND) {
     mk("添加…", push, ID_PIN_ADD, (322, 278, 74, 26));
     mk("移除", push, ID_PIN_REMOVE, (322, 310, 74, 26));
 
-    mk("启动", group, 0, (12, 412, 396, 50));
-    let autostart_cb = mk("开机自启", check, ID_AUTOSTART, (26, 434, 366, 24));
+    mk("程序抽屉 / 桌面", group, 0, (12, 410, 396, 88));
+    let drawer_cb = mk(
+        "启用程序抽屉（Dock 上的应用网格按钮）",
+        check,
+        ID_DRAWER_ENABLED,
+        (26, 434, 366, 24),
+    );
+    let hide_desktop_cb = mk(
+        "隐藏桌面图标（退出时自动恢复）",
+        check,
+        ID_HIDE_DESKTOP_ICONS,
+        (26, 462, 366, 24),
+    );
 
-    mk("关闭", push, ID_CLOSE, (332, 470, 76, 28));
+    mk("启动", group, 0, (12, 506, 396, 50));
+    let autostart_cb = mk("开机自启", check, ID_AUTOSTART, (26, 528, 366, 24));
+
+    mk("关闭", push, ID_CLOSE, (332, 564, 76, 28));
 
     let _ = EnumChildWindows(hwnd, Some(theme_child), LPARAM(0));
 
@@ -334,6 +352,8 @@ pub unsafe fn open(dock_hwnd: HWND) {
     );
     set_checked(fullscreen, current.hide_on_fullscreen);
     set_checked(autostart_cb, autostart::is_enabled());
+    set_checked(drawer_cb, current.drawer_enabled);
+    set_checked(hide_desktop_cb, current.hide_desktop_icons);
 
     let state = Box::into_raw(Box::new(SettingsState {
         dock_hwnd,
@@ -342,6 +362,8 @@ pub unsafe fn open(dock_hwnd: HWND) {
         dock_radios,
         fullscreen,
         autostart: autostart_cb,
+        drawer_enabled: drawer_cb,
+        hide_desktop: hide_desktop_cb,
         pin_list,
         pin_paths: Vec::new(),
         font,
@@ -443,6 +465,18 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                             error_log::write("设置页开机自启失败", &error);
                             set_checked(state.autostart, autostart::is_enabled());
                         }
+                    }
+                    ID_DRAWER_ENABLED => {
+                        // Show/hide the dock's app-drawer button → the dock must rebuild.
+                        state.settings.drawer_enabled = checked(state.drawer_enabled);
+                        let _ = settings::save(&state.settings);
+                        notify(state, WM_PINS_CHANGED);
+                    }
+                    ID_HIDE_DESKTOP_ICONS => {
+                        // Apply live; persisted so it re-applies next launch and restores on exit.
+                        state.settings.hide_desktop_icons = checked(state.hide_desktop);
+                        let _ = settings::save(&state.settings);
+                        crate::desktop_icons::set_hidden(state.settings.hide_desktop_icons);
                     }
                     ID_CLOSE => {
                         let _ = DestroyWindow(hwnd);
