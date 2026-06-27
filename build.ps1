@@ -63,6 +63,17 @@ if ($Clean) {
     if ($LASTEXITCODE -ne 0) { throw "cargo clean failed (exit $LASTEXITCODE)" }
 }
 
+# Keep local build paths out of the shipped binary. Dependency panic-location
+# strings would otherwise embed absolute paths like
+# C:\Users\<name>\.cargo\registry\... — leaking the Windows username into the
+# distributed exe (`strip` removes symbols but not these rodata strings). We
+# remap the home and cargo-registry prefixes to neutral names. The prefixes are
+# read from the environment, so no username is ever hardcoded in this repo.
+# Note: setting RUSTFLAGS overrides .cargo/config.toml's rustflags, so the
+# self-contained-link flag is repeated here (the linker setting still applies).
+$cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
+$env:RUSTFLAGS = "-C link-self-contained=yes --remap-path-prefix=$env:USERPROFILE=/home --remap-path-prefix=$cargoHome=/cargo"
+
 Write-Host '==> cargo build --release' -ForegroundColor Cyan
 cargo build --release
 if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed (exit $LASTEXITCODE)" }
