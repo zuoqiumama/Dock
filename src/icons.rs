@@ -17,6 +17,26 @@ use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
 
 use crate::content::ContentKind;
 
+pub struct OwnedIcon {
+    hicon: HICON,
+}
+
+impl OwnedIcon {
+    pub fn raw(&self) -> HICON {
+        self.hicon
+    }
+}
+
+impl Drop for OwnedIcon {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.hicon.is_invalid() {
+                let _ = DestroyIcon(self.hicon);
+            }
+        }
+    }
+}
+
 pub struct IconLoader {
     wic: IWICImagingFactory,
 }
@@ -46,12 +66,8 @@ impl IconLoader {
         // SHDefExtractIconW at the requested (large) size handles exe/lnk/ico best,
         // the JUMBO (256px) system image list covers folders/files, and the 32px
         // shell icon is only a last resort.
-        let hicon = extract(path, size)
-            .or_else(|| jumbo_icon(path))
-            .or_else(|| shell_icon(path))?;
-        let bmp = self.to_bitmap(dc, hicon).ok();
-        let _ = DestroyIcon(hicon);
-        bmp
+        let icon = source_icon(path, size)?;
+        self.to_bitmap(dc, icon.raw()).ok()
     }
 
     /// Turn an existing HICON (e.g. a running window's icon) into a GPU bitmap.
@@ -68,10 +84,8 @@ impl IconLoader {
         dc: &ID2D1DeviceContext,
         pidl: *const ITEMIDLIST,
     ) -> Option<ID2D1Bitmap1> {
-        let hicon = jumbo_icon_pidl(pidl)?;
-        let bmp = self.to_bitmap(dc, hicon).ok();
-        let _ = DestroyIcon(hicon);
-        bmp
+        let icon = source_icon_pidl(pidl)?;
+        self.to_bitmap(dc, icon.raw()).ok()
     }
 
     unsafe fn load_image(
@@ -126,8 +140,19 @@ impl IconLoader {
             0.0,
             WICBitmapPaletteTypeMedianCut,
         )?;
-        Ok(dc.CreateBitmapFromWicBitmap(&conv, None)?)
+        dc.CreateBitmapFromWicBitmap(&conv, None)
     }
+}
+
+pub unsafe fn source_icon(path: &str, size: u32) -> Option<OwnedIcon> {
+    extract(path, size)
+        .or_else(|| jumbo_icon(path))
+        .or_else(|| shell_icon(path))
+        .map(|hicon| OwnedIcon { hicon })
+}
+
+pub unsafe fn source_icon_pidl(pidl: *const ITEMIDLIST) -> Option<OwnedIcon> {
+    jumbo_icon_pidl(pidl).map(|hicon| OwnedIcon { hicon })
 }
 
 /// The 256px JUMBO system icon for a path — sharp at any dock size. The HICON is

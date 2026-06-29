@@ -17,6 +17,12 @@ const IDENTITY: Matrix3x2 = Matrix3x2 {
     M32: 0.0,
 };
 
+#[derive(Clone, Copy)]
+struct RunningDotStyle {
+    rgb: (f32, f32, f32),
+    alpha: f32,
+}
+
 fn fit_rect(container: D2D_RECT_F, source_w: f32, source_h: f32) -> D2D_RECT_F {
     if source_w <= 0.0 || source_h <= 0.0 {
         return container;
@@ -45,6 +51,7 @@ pub unsafe fn draw(
 ) {
     let frame = dock.frame();
     let base = BASE_ICON * dock.dpi;
+    let theme = dock.theme.visual();
 
     dc.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
 
@@ -60,9 +67,14 @@ pub unsafe fn draw(
         radiusX: 22.0 * dock.dpi,
         radiusY: 22.0 * dock.dpi,
     };
-    brush.SetColor(&color(0.11, 0.11, 0.13, 0.58));
+    brush.SetColor(&color(
+        theme.pill_rgb.0,
+        theme.pill_rgb.1,
+        theme.pill_rgb.2,
+        theme.pill_alpha,
+    ));
     dc.FillRoundedRectangle(&pill, brush);
-    brush.SetColor(&color(1.0, 1.0, 1.0, 0.10));
+    brush.SetColor(&color(1.0, 1.0, 1.0, theme.border_alpha));
     dc.DrawRoundedRectangle(&pill, brush, 1.0 * dock.dpi, None);
 
     // --- icons: one scale transform each, then a vector tile + emoji ---
@@ -80,7 +92,15 @@ pub unsafe fn draw(
         // The divider is a static separator: draw a line, fading with presence.
         if item.role == ItemRole::Divider {
             dc.SetTransform(&IDENTITY);
-            draw_divider(dc, brush, ic.cx, frame.baseline, base, p);
+            draw_divider(
+                dc,
+                brush,
+                ic.cx,
+                frame.baseline,
+                base,
+                p,
+                theme.divider_alpha,
+            );
             continue;
         }
 
@@ -160,37 +180,26 @@ pub unsafe fn draw(
     // pinned apps that are running (merged) and the right-side open windows. Drawn
     // unscaled (IDENTITY) so it stays a subtle, constant-size cue under the icon.
     dc.SetTransform(&IDENTITY);
+    let running_dot = RunningDotStyle {
+        rgb: theme.dot_rgb,
+        alpha: theme.dot_alpha,
+    };
     for ic in &frame.icons {
         let item = &dock.items[ic.idx];
         if item.windows.is_empty() || ic.presence <= 0.02 {
             continue;
         }
-        draw_running_dot(dc, brush, ic.cx, frame.baseline, base, ic.presence);
+        draw_running_dot(
+            dc,
+            brush,
+            ic.cx,
+            frame.baseline,
+            base,
+            ic.presence,
+            running_dot,
+        );
     }
     dc.SetTransform(&IDENTITY);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fits_wide_thumbnail_without_distortion() {
-        let rect = fit_rect(
-            D2D_RECT_F {
-                left: 0.0,
-                top: 0.0,
-                right: 100.0,
-                bottom: 100.0,
-            },
-            200.0,
-            100.0,
-        );
-        assert_eq!(rect.left, 0.0);
-        assert_eq!(rect.right, 100.0);
-        assert_eq!(rect.top, 25.0);
-        assert_eq!(rect.bottom, 75.0);
-    }
 }
 
 fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
@@ -205,6 +214,7 @@ unsafe fn draw_divider(
     baseline: f32,
     base: f32,
     presence: f32,
+    alpha: f32,
 ) {
     let half = (base * 0.022).max(1.0); // ~2px line, scales gently with DPI
                                         // Grow the line in from the baseline as the slot opens, so it doesn't pop.
@@ -219,7 +229,7 @@ unsafe fn draw_divider(
         radiusX: half,
         radiusY: half,
     };
-    brush.SetColor(&color(1.0, 1.0, 1.0, 0.18 * presence));
+    brush.SetColor(&color(1.0, 1.0, 1.0, alpha * presence));
     dc.FillRoundedRectangle(&line, brush);
 }
 
@@ -323,10 +333,16 @@ unsafe fn draw_running_dot(
     baseline: f32,
     base: f32,
     presence: f32,
+    style: RunningDotStyle,
 ) {
     let radius = (base * 0.045).max(2.0);
     let y = baseline + base * 0.09; // just below the icon, inside the pill padding
-    brush.SetColor(&color(1.0, 1.0, 1.0, 0.72 * presence));
+    brush.SetColor(&color(
+        style.rgb.0,
+        style.rgb.1,
+        style.rgb.2,
+        style.alpha * presence,
+    ));
     dc.FillEllipse(
         &D2D1_ELLIPSE {
             point: D2D_POINT_2F { x: cx, y },
@@ -347,5 +363,28 @@ fn scale_about(s: f32, ax: f32, ay: f32, dy: f32) -> Matrix3x2 {
         M22: s,
         M31: ax * (1.0 - s),
         M32: ay * (1.0 - s) + dy,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fits_wide_thumbnail_without_distortion() {
+        let rect = fit_rect(
+            D2D_RECT_F {
+                left: 0.0,
+                top: 0.0,
+                right: 100.0,
+                bottom: 100.0,
+            },
+            200.0,
+            100.0,
+        );
+        assert_eq!(rect.left, 0.0);
+        assert_eq!(rect.right, 100.0);
+        assert_eq!(rect.top, 25.0);
+        assert_eq!(rect.bottom, 75.0);
     }
 }

@@ -134,7 +134,7 @@ impl Gpu {
                 };
                 it.icon
                     .as_deref()
-                    .and_then(|exe| exe_icon(exe))
+                    .and_then(&exe_icon)
                     .or_else(|| {
                         hwnd.and_then(|hwnd| windows_list::process_exe_path(hwnd))
                             .and_then(|exe| exe_icon(&exe))

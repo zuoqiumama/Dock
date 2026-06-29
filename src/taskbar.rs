@@ -44,6 +44,11 @@ const EX_INVISIBLE: i32 = WS_EX_LAYERED.0 as i32 | WS_EX_TRANSPARENT.0 as i32;
 /// instead of forcing the taskbar always-on-top.
 static ORIGINAL_AUTOHIDE: AtomicBool = AtomicBool::new(false);
 
+/// Whether this process ever put the taskbar into a non-`Show` state (auto-hide or
+/// hidden). If we never touched it, the clean-exit `restore()` is a no-op — otherwise we
+/// would clobber an auto-hide preference the user changed *themselves* while we ran.
+static TASKBAR_TOUCHED: AtomicBool = AtomicBool::new(false);
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -339,6 +344,7 @@ pub unsafe fn apply(mode: TaskbarMode) {
         // OS-managed auto-hide: freed work area, slides in (visibly) on edge-hover.
         // Diverges from the user's state, so mark the guard for crash recovery.
         TaskbarMode::AutoHide => {
+            TASKBAR_TOUCHED.store(true, Ordering::Relaxed);
             mark_guarded(original);
             make_taskbar_opaque();
             set_autohide(autohide);
@@ -351,6 +357,7 @@ pub unsafe fn apply(mode: TaskbarMode) {
         // slid up on hover, yet reserves no row — the "pure dock" behaviour. Mark the
         // guard: stranded in this state, the user has no visible taskbar at all.
         TaskbarMode::Hidden => {
+            TASKBAR_TOUCHED.store(true, Ordering::Relaxed);
             mark_guarded(original);
             make_taskbar_transparent();
             set_autohide(autohide);
@@ -370,7 +377,13 @@ pub unsafe fn restore_to(original_autohide: bool) {
 }
 
 /// Restore the taskbar to the user's original state. Always call this on a clean exit.
+/// No-op if this process never diverged the taskbar from "Show": in that case the bar is
+/// already in whatever state the user wants, and re-applying our captured baseline would
+/// undo an auto-hide toggle they flipped themselves while we were running.
 pub unsafe fn restore() {
+    if !TASKBAR_TOUCHED.load(Ordering::Relaxed) {
+        return;
+    }
     apply(TaskbarMode::Show);
 }
 

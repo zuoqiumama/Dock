@@ -10,8 +10,9 @@ use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, CreateSolidBrush, DeleteObject, FillRect, SetBkColor, SetBkMode, SetTextColor,
-    HBRUSH, HDC, HFONT, HGDIOBJ, TRANSPARENT,
+    CreateFontW, CreateSolidBrush, DeleteObject, FillRect, GetMonitorInfoW, MonitorFromWindow,
+    SetBkColor, SetBkMode, SetTextColor, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::SetWindowTheme;
@@ -19,6 +20,7 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::settings::{self, DockMode, Settings, TaskbarMode};
+use crate::theme::ThemePreset;
 use crate::{apps, autostart, config, error_log, taskbar};
 
 /// Posted to the dock when mode/fullscreen settings change (cheap re-rest).
@@ -32,15 +34,22 @@ const ID_TB_HIDDEN: usize = 103;
 const ID_DOCK_ALWAYS: usize = 111;
 const ID_DOCK_AUTOHIDE: usize = 112;
 const ID_FULLSCREEN: usize = 121;
+const ID_MAXIMIZED: usize = 122;
 const ID_PIN_LIST: usize = 131;
 const ID_PIN_ADD: usize = 132;
 const ID_PIN_REMOVE: usize = 133;
 const ID_AUTOSTART: usize = 141;
 const ID_DRAWER_ENABLED: usize = 142;
 const ID_HIDE_DESKTOP_ICONS: usize = 143;
+const ID_THEME: usize = 144;
 const ID_CLOSE: usize = 151;
 
 const BST_CHECKED: usize = 1;
+const FD_CBS_DROPDOWNLIST: u32 = 0x0003;
+const FD_CB_GETCURSEL: u32 = 0x0147;
+const FD_CB_ADDSTRING: u32 = 0x0143;
+const FD_CB_SETCURSEL: u32 = 0x014E;
+const FD_CBN_SELCHANGE: usize = 1;
 
 static SETTINGS_HWND: AtomicIsize = AtomicIsize::new(0);
 
@@ -50,11 +59,15 @@ struct SettingsState {
     tb_radios: [HWND; 3],
     dock_radios: [HWND; 2],
     fullscreen: HWND,
+    maximized: HWND,
+    theme_combo: HWND,
     autostart: HWND,
     drawer_enabled: HWND,
     hide_desktop: HWND,
     pin_list: HWND,
-    pin_paths: Vec<String>,
+    /// Config item index for each listbox row, so "remove" targets the exact `[[item]]`
+    /// (works for `app=` rows that have no path to match by string).
+    pin_specs: Vec<usize>,
     font: HFONT,
     bg: HBRUSH,
 }
@@ -132,23 +145,28 @@ unsafe extern "system" fn theme_child(hwnd: HWND, _: LPARAM) -> BOOL {
 
 unsafe fn refresh_pins(state: &mut SettingsState) {
     SendMessageW(state.pin_list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
-    state.pin_paths.clear();
+    state.pin_specs.clear();
     let specs = config::load()
         .ok()
         .flatten()
         .map(|cfg| cfg.items)
         .unwrap_or_default();
-    for item in apps::from_config(&specs) {
-        if let Some(path) = item.path {
-            let label = wide(&item.label);
-            SendMessageW(
-                state.pin_list,
-                LB_ADDSTRING,
-                WPARAM(0),
-                LPARAM(label.as_ptr() as isize),
-            );
-            state.pin_paths.push(path);
-        }
+    for (index, spec) in specs.iter().enumerate() {
+        // List only rows that actually launch something (matches what the dock shows), and
+        // keep each row's config index so removal targets the exact entry — including an
+        // `app="chrome.exe"` row whose resolved path wouldn't match by string.
+        let Some(path) = apps::resolve_launch_path(spec) else {
+            continue;
+        };
+        let label = spec.label.clone().unwrap_or_else(|| pin_label(&path));
+        let wlabel = wide(&label);
+        SendMessageW(
+            state.pin_list,
+            LB_ADDSTRING,
+            WPARAM(0),
+            LPARAM(wlabel.as_ptr() as isize),
+        );
+        state.pin_specs.push(index);
     }
 }
 
@@ -162,6 +180,27 @@ fn pin_label(path: &str) -> String {
 
 unsafe fn notify(state: &SettingsState, message: u32) {
     let _ = PostMessageW(state.dock_hwnd, message, WPARAM(0), LPARAM(0));
+}
+
+/// Work area (left, top, width, height) of the monitor the dock is on, for centring.
+unsafe fn monitor_work_area(dock_hwnd: HWND) -> (i32, i32, i32, i32) {
+    let monitor = MonitorFromWindow(dock_hwnd, MONITOR_DEFAULTTONEAREST);
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if GetMonitorInfoW(monitor, &mut info).as_bool() {
+        let w = info.rcWork.right - info.rcWork.left;
+        let h = info.rcWork.bottom - info.rcWork.top;
+        (info.rcWork.left, info.rcWork.top, w, h)
+    } else {
+        (
+            0,
+            0,
+            GetSystemMetrics(SM_CXSCREEN),
+            GetSystemMetrics(SM_CYSCREEN),
+        )
+    }
 }
 
 /// Open (or focus, if already open) the settings window.
@@ -197,13 +236,16 @@ pub unsafe fn open(dock_hwnd: HWND) {
         left: 0,
         top: 0,
         right: (420.0 * scale) as i32,
-        bottom: (612.0 * scale) as i32,
+        bottom: (708.0 * scale) as i32,
     };
     let _ = AdjustWindowRectEx(&mut rect, style, false, WINDOW_EX_STYLE(0));
     let win_w = rect.right - rect.left;
     let win_h = rect.bottom - rect.top;
-    let x = (GetSystemMetrics(SM_CXSCREEN) - win_w) / 2;
-    let y = (GetSystemMetrics(SM_CYSCREEN) - win_h) / 2;
+    // Centre on the dock's monitor (work area), not always the primary screen, so the
+    // settings window opens where the dock — and the user — actually are.
+    let (area_x, area_y, area_w, area_h) = monitor_work_area(dock_hwnd);
+    let x = area_x + (area_w - win_w) / 2;
+    let y = area_y + (area_h - win_h) / 2;
 
     let Ok(hwnd) = CreateWindowExW(
         WS_EX_DLGMODALFRAME,
@@ -281,7 +323,7 @@ pub unsafe fn open(dock_hwnd: HWND) {
         ),
     ];
 
-    mk("Dock 显示", group, 0, (12, 130, 396, 116));
+    mk("Dock 显示", group, 0, (12, 130, 396, 144));
     let dock_radios = [
         mk("常驻屏幕底部", radio, ID_DOCK_ALWAYS, (26, 154, 366, 24)),
         mk(
@@ -297,8 +339,36 @@ pub unsafe fn open(dock_hwnd: HWND) {
         ID_FULLSCREEN,
         (26, 210, 366, 24),
     );
+    let maximized = mk(
+        "出现最大化窗口时收起到边缘",
+        check,
+        ID_MAXIMIZED,
+        (26, 238, 366, 24),
+    );
 
-    mk("常驻应用（Dock 左侧固定项）", group, 0, (12, 254, 396, 150));
+    mk("外观", group, 0, (12, 282, 396, 56));
+    let theme_combo = control(
+        hwnd,
+        instance,
+        w!("COMBOBOX"),
+        "",
+        FD_CBS_DROPDOWNLIST | WS_TABSTOP.0 | WS_VSCROLL.0,
+        ID_THEME,
+        (26, 306, 180, 160),
+        scale,
+        font,
+    );
+    for preset in ThemePreset::ALL {
+        let label = wide(preset.label());
+        SendMessageW(
+            theme_combo,
+            FD_CB_ADDSTRING,
+            WPARAM(0),
+            LPARAM(label.as_ptr() as isize),
+        );
+    }
+
+    mk("常驻应用（Dock 左侧固定项）", group, 0, (12, 350, 396, 150));
     let pin_list = control(
         hwnd,
         instance,
@@ -306,31 +376,31 @@ pub unsafe fn open(dock_hwnd: HWND) {
         "",
         LBS_NOTIFY as u32 | WS_VSCROLL.0 | WS_BORDER.0,
         ID_PIN_LIST,
-        (26, 278, 288, 116),
+        (26, 374, 288, 116),
         scale,
         font,
     );
-    mk("添加…", push, ID_PIN_ADD, (322, 278, 74, 26));
-    mk("移除", push, ID_PIN_REMOVE, (322, 310, 74, 26));
+    mk("添加…", push, ID_PIN_ADD, (322, 374, 74, 26));
+    mk("移除", push, ID_PIN_REMOVE, (322, 406, 74, 26));
 
-    mk("程序抽屉 / 桌面", group, 0, (12, 410, 396, 88));
+    mk("程序抽屉 / 桌面", group, 0, (12, 506, 396, 88));
     let drawer_cb = mk(
         "启用程序抽屉（Dock 上的应用网格按钮）",
         check,
         ID_DRAWER_ENABLED,
-        (26, 434, 366, 24),
+        (26, 530, 366, 24),
     );
     let hide_desktop_cb = mk(
         "隐藏桌面图标（退出时自动恢复）",
         check,
         ID_HIDE_DESKTOP_ICONS,
-        (26, 462, 366, 24),
+        (26, 558, 366, 24),
     );
 
-    mk("启动", group, 0, (12, 506, 396, 50));
-    let autostart_cb = mk("开机自启", check, ID_AUTOSTART, (26, 528, 366, 24));
+    mk("启动", group, 0, (12, 602, 396, 50));
+    let autostart_cb = mk("开机自启", check, ID_AUTOSTART, (26, 624, 366, 24));
 
-    mk("关闭", push, ID_CLOSE, (332, 564, 76, 28));
+    mk("关闭", push, ID_CLOSE, (332, 660, 76, 28));
 
     let _ = EnumChildWindows(hwnd, Some(theme_child), LPARAM(0));
 
@@ -351,6 +421,12 @@ pub unsafe fn open(dock_hwnd: HWND) {
         },
     );
     set_checked(fullscreen, current.hide_on_fullscreen);
+    set_checked(maximized, current.hide_on_maximized);
+    let theme_index = ThemePreset::ALL
+        .iter()
+        .position(|preset| *preset == current.theme)
+        .unwrap_or(0);
+    SendMessageW(theme_combo, FD_CB_SETCURSEL, WPARAM(theme_index), LPARAM(0));
     set_checked(autostart_cb, autostart::is_enabled());
     set_checked(drawer_cb, current.drawer_enabled);
     set_checked(hide_desktop_cb, current.hide_desktop_icons);
@@ -361,11 +437,13 @@ pub unsafe fn open(dock_hwnd: HWND) {
         tb_radios,
         dock_radios,
         fullscreen,
+        maximized,
+        theme_combo,
         autostart: autostart_cb,
         drawer_enabled: drawer_cb,
         hide_desktop: hide_desktop_cb,
         pin_list,
-        pin_paths: Vec::new(),
+        pin_specs: Vec::new(),
         font,
         bg,
     }));
@@ -407,7 +485,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_CTLCOLORSTATIC | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN => dark_ctl_color(ptr, wparam),
             WM_COMMAND if !ptr.is_null() => {
                 let state = &mut *ptr;
-                let id = (wparam.0 & 0xFFFF) as usize;
+                let id = wparam.0 & 0xFFFF;
+                let code = (wparam.0 >> 16) & 0xFFFF;
                 match id {
                     ID_TB_SHOW | ID_TB_AUTOHIDE | ID_TB_HIDDEN => {
                         let (mode, index) = match id {
@@ -434,6 +513,21 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         state.settings.hide_on_fullscreen = checked(state.fullscreen);
                         persist_and_notify(state);
                     }
+                    ID_MAXIMIZED => {
+                        state.settings.hide_on_maximized = checked(state.maximized);
+                        persist_and_notify(state);
+                    }
+                    ID_THEME if code == FD_CBN_SELCHANGE => {
+                        let sel =
+                            SendMessageW(state.theme_combo, FD_CB_GETCURSEL, WPARAM(0), LPARAM(0))
+                                .0;
+                        if sel >= 0 {
+                            if let Some(theme) = ThemePreset::ALL.get(sel as usize) {
+                                state.settings.theme = *theme;
+                                persist_and_notify(state);
+                            }
+                        }
+                    }
                     ID_PIN_ADD => match crate::pick_content(hwnd, false) {
                         Ok(Some(path)) => match config::add_item(&pin_label(&path), &path) {
                             Ok(_) => {
@@ -449,8 +543,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         let sel =
                             SendMessageW(state.pin_list, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
                         if sel >= 0 {
-                            if let Some(path) = state.pin_paths.get(sel as usize).cloned() {
-                                match config::remove_item(&path) {
+                            if let Some(&index) = state.pin_specs.get(sel as usize) {
+                                match config::remove_item_at_index(index) {
                                     Ok(_) => {
                                         refresh_pins(state);
                                         notify(state, WM_PINS_CHANGED);
@@ -473,10 +567,13 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         notify(state, WM_PINS_CHANGED);
                     }
                     ID_HIDE_DESKTOP_ICONS => {
-                        // Apply live; persisted so it re-applies next launch and restores on exit.
+                        // Apply live, then persist AND notify the dock: it must re-read so its
+                        // in-memory `hide_desktop_icons` is current — otherwise the exit cleanup
+                        // (which restores icons only if the dock thinks it hid them) leaves the
+                        // user with a blank desktop after FeatherDock quits.
                         state.settings.hide_desktop_icons = checked(state.hide_desktop);
-                        let _ = settings::save(&state.settings);
                         crate::desktop_icons::set_hidden(state.settings.hide_desktop_icons);
+                        persist_and_notify(state);
                     }
                     ID_CLOSE => {
                         let _ = DestroyWindow(hwnd);

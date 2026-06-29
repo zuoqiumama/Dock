@@ -206,7 +206,7 @@ pub unsafe fn prompt(parent: HWND, title: &str, initial: &str) -> Option<String>
             PostQuitMessage(msg.wParam.0 as i32);
             break;
         }
-        if IsDialogMessageW(hwnd, &mut msg).as_bool() {
+        if IsDialogMessageW(hwnd, &msg).as_bool() {
             continue;
         }
         let _ = TranslateMessage(&msg);
@@ -251,7 +251,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT((*ptr).bg.0 as isize)
             }
             WM_COMMAND if !ptr.is_null() => {
-                let id = (wparam.0 & 0xFFFF) as usize;
+                let id = wparam.0 & 0xFFFF;
                 match id {
                     IDOK => {
                         let text = read_edit((*ptr).edit);

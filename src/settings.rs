@@ -8,6 +8,8 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+use crate::theme::ThemePreset;
+
 /// How the dock occupies the bottom of the screen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DockMode {
@@ -79,6 +81,9 @@ pub struct Settings {
     /// Hide the Windows desktop icons (the SysListView32 toggle Explorer's right-click
     /// "Show desktop icons" flips). Reversible, non-destructive; restored on exit.
     pub hide_desktop_icons: bool,
+    /// Visual preset for the dock pill and subtle cues. Kept intentionally small:
+    /// presets change paint constants without starting a skin/plugin system.
+    pub theme: ThemePreset,
 }
 
 impl Default for Settings {
@@ -90,6 +95,7 @@ impl Default for Settings {
             taskbar_mode: TaskbarMode::Show,
             drawer_enabled: true,
             hide_desktop_icons: false,
+            theme: ThemePreset::Glass,
         }
     }
 }
@@ -103,6 +109,7 @@ const HEADER: &str = "\
 # taskbar_mode = \"show\" | \"autohide\" | \"hidden\"
 # drawer_enabled = true | false  (show the app-drawer button on the dock)
 # hide_desktop_icons = true | false  (hide the Windows desktop icons while running)
+# theme = \"glass\" | \"compact\" | \"solid\" | \"macos\" | \"contrast\"
 ";
 
 fn settings_path() -> PathBuf {
@@ -120,59 +127,66 @@ pub fn load() -> Settings {
         return settings;
     };
     for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = value.trim().trim_matches('"');
-        match key.trim() {
-            "dock_mode" => {
-                if let Some(mode) = DockMode::parse(value) {
-                    settings.dock_mode = mode;
-                }
-            }
-            "hide_on_fullscreen" => {
-                settings.hide_on_fullscreen = value.eq_ignore_ascii_case("true");
-            }
-            "hide_on_maximized" => {
-                settings.hide_on_maximized = value.eq_ignore_ascii_case("true");
-            }
-            "taskbar_mode" => {
-                if let Some(mode) = TaskbarMode::parse(value) {
-                    settings.taskbar_mode = mode;
-                }
-            }
-            "drawer_enabled" => {
-                settings.drawer_enabled = value.eq_ignore_ascii_case("true");
-            }
-            "hide_desktop_icons" => {
-                settings.hide_desktop_icons = value.eq_ignore_ascii_case("true");
-            }
-            _ => {}
-        }
+        parse_line_into(&mut settings, line);
     }
     settings
+}
+
+fn parse_line_into(settings: &mut Settings, line: &str) {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return;
+    }
+    let Some((key, value)) = line.split_once('=') else {
+        return;
+    };
+    let value = value.trim().trim_matches('"');
+    match key.trim() {
+        "dock_mode" => {
+            if let Some(mode) = DockMode::parse(value) {
+                settings.dock_mode = mode;
+            }
+        }
+        "hide_on_fullscreen" => {
+            settings.hide_on_fullscreen = value.eq_ignore_ascii_case("true");
+        }
+        "hide_on_maximized" => {
+            settings.hide_on_maximized = value.eq_ignore_ascii_case("true");
+        }
+        "taskbar_mode" => {
+            if let Some(mode) = TaskbarMode::parse(value) {
+                settings.taskbar_mode = mode;
+            }
+        }
+        "drawer_enabled" => {
+            settings.drawer_enabled = value.eq_ignore_ascii_case("true");
+        }
+        "hide_desktop_icons" => {
+            settings.hide_desktop_icons = value.eq_ignore_ascii_case("true");
+        }
+        "theme" => {
+            if let Some(theme) = ThemePreset::parse(value) {
+                settings.theme = theme;
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Persist the current settings (creating the folder/file as needed).
 pub fn save(settings: &Settings) -> io::Result<()> {
     let path = settings_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let body = format!(
-        "{HEADER}\ndock_mode = \"{}\"\nhide_on_fullscreen = {}\nhide_on_maximized = {}\ntaskbar_mode = \"{}\"\ndrawer_enabled = {}\nhide_desktop_icons = {}\n",
+        "{HEADER}\ndock_mode = \"{}\"\nhide_on_fullscreen = {}\nhide_on_maximized = {}\ntaskbar_mode = \"{}\"\ndrawer_enabled = {}\nhide_desktop_icons = {}\ntheme = \"{}\"\n",
         settings.dock_mode.as_str(),
         settings.hide_on_fullscreen,
         settings.hide_on_maximized,
         settings.taskbar_mode.as_str(),
         settings.drawer_enabled,
-        settings.hide_desktop_icons
+        settings.hide_desktop_icons,
+        settings.theme.as_str()
     );
-    fs::write(&path, body)
+    crate::atomic::write(&path, body.as_bytes())
 }
 
 #[cfg(test)]
@@ -185,9 +199,21 @@ mod tests {
         assert!(matches!(Settings::default().dock_mode, DockMode::Always));
         assert!(Settings::default().hide_on_fullscreen);
         assert!(Settings::default().hide_on_maximized);
+        assert_eq!(Settings::default().theme, crate::theme::ThemePreset::Glass);
 
         assert_eq!(DockMode::parse("autohide"), Some(DockMode::AutoHide));
         assert_eq!(DockMode::parse("ALWAYS"), Some(DockMode::Always));
         assert_eq!(DockMode::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn parses_theme_preset_without_disturbing_other_settings() {
+        let mut settings = Settings::default();
+        for line in "theme = \"compact\"\nhide_on_fullscreen = false".lines() {
+            parse_line_into(&mut settings, line);
+        }
+
+        assert_eq!(settings.theme, crate::theme::ThemePreset::Compact);
+        assert!(!settings.hide_on_fullscreen);
     }
 }

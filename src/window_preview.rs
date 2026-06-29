@@ -23,6 +23,13 @@ use crate::dock::RunningWindowRef;
 use crate::windows_list;
 
 const MAX_COLUMNS: usize = 4;
+/// Cap on how many live DWM thumbnails we register at once. An app with dozens of windows
+/// would otherwise spin up a giant panel and that many `DwmRegisterThumbnail`s on a single
+/// hover — heavy on DWM/GDI. Beyond this we show the first N and a "+M more" footer; the
+/// extra windows are still reachable (they slide into view as visible ones are closed, or
+/// via the system switcher). 12 = three full rows of four.
+const MAX_THUMBS: usize = 12;
+const FOOTER_H: i32 = 22; // overflow "+N more windows" strip, only when capped
 const THUMB_W: i32 = 220;
 const THUMB_H: i32 = 124;
 const HEADER_H: i32 = 24; // top strip per card: title (left) + close button (right)
@@ -30,6 +37,11 @@ const CLOSE_D: i32 = 16; // diameter of the red close button
 const PAD: i32 = 10;
 const GAP: i32 = 10;
 const WM_MOUSELEAVE: u32 = 0x02A3;
+
+/// Posted to the owner dock when the preview is dismissed by the user (cursor left it, or
+/// a window was activated). Lets an auto-hide dock retract: its own WM_MOUSELEAVE already
+/// fired when the cursor crossed onto the preview, so without this it would stay revealed.
+pub const WM_PREVIEW_CLOSED: u32 = WM_APP + 0x24;
 
 static PREVIEW_HWND: AtomicIsize = AtomicIsize::new(0);
 static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
@@ -45,6 +57,7 @@ struct PreviewLayout {
 }
 
 struct PreviewState {
+    owner: HWND, // the dock that summoned us, notified on user dismissal
     key: String,
     windows: Vec<RunningWindowRef>,
     layout: PreviewLayout,
@@ -73,7 +86,9 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-fn preview_layout(count: usize, dpi: f32) -> PreviewLayout {
+/// Lay out `count` thumbnail cells (already capped to `MAX_THUMBS` by the caller). When
+/// `overflow` > 0 the panel is made one strip taller for the "+N more" footer.
+fn preview_layout(count: usize, overflow: usize, dpi: f32) -> PreviewLayout {
     let count = count.max(1);
     let columns = count.min(MAX_COLUMNS);
     let rows = count.div_ceil(columns);
@@ -84,7 +99,10 @@ fn preview_layout(count: usize, dpi: f32) -> PreviewLayout {
     let gap = scaled(GAP, dpi);
     let width = pad * 2 + columns as i32 * thumb_w + (columns.saturating_sub(1) as i32) * gap;
     let cell_h = header_h + thumb_h;
-    let height = pad * 2 + rows as i32 * cell_h + (rows.saturating_sub(1) as i32) * gap;
+    let mut height = pad * 2 + rows as i32 * cell_h + (rows.saturating_sub(1) as i32) * gap;
+    if overflow > 0 {
+        height += scaled(FOOTER_H, dpi);
+    }
     let mut items = Vec::with_capacity(count);
     for i in 0..count {
         let col = i % columns;
@@ -233,7 +251,11 @@ pub unsafe fn show(
     let Some(instance) = register_class() else {
         return;
     };
-    let layout = preview_layout(windows.len(), dpi);
+    // Cap the live thumbnails; the full window set is still kept in state so the rest slide
+    // into view as visible ones are closed.
+    let shown = windows.len().min(MAX_THUMBS);
+    let overflow = windows.len() - shown;
+    let layout = preview_layout(shown, overflow, dpi);
     let (x, y) = preview_origin(anchor_x, anchor_y, &layout);
     let Ok(hwnd) = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -270,6 +292,7 @@ pub unsafe fn show(
         PCWSTR(face.as_ptr()),
     );
     let state_ptr = Box::into_raw(Box::new(PreviewState {
+        owner,
         key: group_key.to_string(),
         windows: windows.to_vec(),
         layout,
@@ -303,6 +326,15 @@ pub unsafe fn hide() {
     }
 }
 
+/// Tell the owner dock the preview was dismissed by the user, so an auto-hide dock can
+/// retract. Programmatic `hide()` (dock leave, reload) deliberately does NOT call this —
+/// only the user-driven mouse-leave / activate paths in the wndproc do.
+unsafe fn notify_owner_closed(owner: HWND) {
+    if !owner.is_invalid() {
+        let _ = PostMessageW(owner, WM_PREVIEW_CLOSED, WPARAM(0), LPARAM(0));
+    }
+}
+
 pub unsafe fn contains_cursor() -> bool {
     let raw = PREVIEW_HWND.load(Ordering::Relaxed);
     if raw == 0 {
@@ -320,7 +352,9 @@ pub unsafe fn contains_cursor() -> bool {
 }
 
 unsafe fn register_thumbnails(hwnd: HWND, state: &mut PreviewState) {
-    for (index, window) in state.windows.iter().enumerate() {
+    // Only the visible (capped) cells get a live thumbnail.
+    for index in 0..state.layout.items.len() {
+        let window = &state.windows[index];
         let source = HWND(window.hwnd as *mut c_void);
         if !IsWindow(source).as_bool() {
             continue;
@@ -382,7 +416,8 @@ unsafe fn paint(hwnd: HWND, state: &PreviewState) {
     SetTextColor(hdc, rgb(238, 238, 242));
     SetBkMode(hdc, TRANSPARENT);
     let dpi = state.dpi;
-    for (index, window) in state.windows.iter().enumerate() {
+    for index in 0..state.layout.items.len() {
+        let window = &state.windows[index];
         let card = card_rect(&state.layout, index, dpi);
         FillRect(
             hdc,
@@ -407,6 +442,24 @@ unsafe fn paint(hwnd: HWND, state: &PreviewState) {
             close_rect(&state.layout, index, dpi),
             state.hovered_close == Some(index),
             dpi,
+        );
+    }
+    // Overflow footer: how many windows we didn't give a card to.
+    let overflow = state.windows.len().saturating_sub(state.layout.items.len());
+    if overflow > 0 {
+        let mut footer = RECT {
+            left: scaled(PAD + 2, dpi),
+            top: state.layout.height - scaled(FOOTER_H, dpi),
+            right: state.layout.width - scaled(PAD + 2, dpi),
+            bottom: state.layout.height - scaled(2, dpi),
+        };
+        SetTextColor(hdc, rgb(170, 174, 182));
+        let mut text = wide(&format!("还有 {overflow} 个窗口…"));
+        DrawTextW(
+            hdc,
+            &mut text,
+            &mut footer,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
     }
     let _ = SelectObject(hdc, old);
@@ -452,14 +505,14 @@ fn in_rect(rc: &RECT, x: i32, y: i32) -> bool {
 }
 
 fn hit_test(state: &PreviewState, x: i32, y: i32) -> Option<usize> {
-    (0..state.windows.len())
+    (0..state.layout.items.len())
         .find(|&index| in_rect(&card_rect(&state.layout, index, state.dpi), x, y))
 }
 
 /// Which window's close button (if any) the point is over. Checked before `hit_test`
 /// so a click on the × closes that window instead of activating it.
 fn close_hit_test(state: &PreviewState, x: i32, y: i32) -> Option<usize> {
-    (0..state.windows.len())
+    (0..state.layout.items.len())
         .find(|&index| in_rect(&close_rect(&state.layout, index, state.dpi), x, y))
 }
 
@@ -497,7 +550,10 @@ unsafe fn remove_window(hwnd: HWND, state: &mut PreviewState, index: usize) {
         hide(); // destroys the window; `state` is freed in WM_DESTROY — don't touch it after
         return;
     }
-    let layout = preview_layout(state.windows.len(), state.dpi);
+    // A hidden overflow window (if any) promotes into the freed cell.
+    let shown = state.windows.len().min(MAX_THUMBS);
+    let overflow = state.windows.len() - shown;
+    let layout = preview_layout(shown, overflow, state.dpi);
     let (x, y) = preview_origin(state.anchor_x, state.anchor_y, &layout);
     let _ = SetWindowPos(
         hwnd,
@@ -551,6 +607,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_MOUSELEAVE => {
+                if let Some(state) = state(hwnd) {
+                    notify_owner_closed(state.owner);
+                }
                 hide();
                 LRESULT(0)
             }
@@ -573,6 +632,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                             windows_list::activate(window.hwnd);
                         }
                     }
+                    notify_owner_closed(state.owner);
                 }
                 hide();
                 LRESULT(0)
@@ -592,12 +652,21 @@ mod tests {
 
     #[test]
     fn preview_layout_wraps_after_four_windows() {
-        let layout = preview_layout(5, 1.0);
+        let layout = preview_layout(5, 0, 1.0);
 
         assert_eq!(layout.columns, 4);
         assert_eq!(layout.rows, 2);
         assert_eq!(layout.items.len(), 5);
         assert!(layout.width > layout.items[3].right);
         assert!(layout.items[4].top > layout.items[0].top);
+    }
+
+    #[test]
+    fn preview_layout_adds_a_footer_strip_only_when_capped() {
+        let no_overflow = preview_layout(MAX_THUMBS, 0, 1.0);
+        let with_overflow = preview_layout(MAX_THUMBS, 3, 1.0);
+        // Same grid, but the overflow variant is exactly one footer strip taller.
+        assert_eq!(with_overflow.items.len(), no_overflow.items.len());
+        assert_eq!(with_overflow.height - no_overflow.height, FOOTER_H);
     }
 }

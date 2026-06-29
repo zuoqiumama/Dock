@@ -25,7 +25,7 @@ use windows::Win32::System::Threading::{
     PROCESS_SYNCHRONIZE,
 };
 
-use crate::taskbar;
+use crate::{desktop_icons, taskbar};
 
 const WATCHDOG_FLAG: &str = "--watchdog";
 /// Don't pop a console window for the helper process.
@@ -35,6 +35,8 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 pub struct WatchdogArgs {
     parent_pid: u32,
     original_autohide: bool,
+    restore_taskbar: bool,
+    restore_desktop_icons: bool,
 }
 
 /// If this process was launched as the watchdog, return its parsed arguments. Checked at
@@ -51,21 +53,31 @@ fn parse_from(mut args: impl Iterator<Item = String>) -> Option<WatchdogArgs> {
     }
     let parent_pid = args.next()?.parse().ok()?;
     let original_autohide = args.next().as_deref() == Some("1");
+    let restore_taskbar = args.next().as_deref() == Some("1");
+    let restore_desktop_icons = args.next().as_deref() == Some("1");
     Some(WatchdogArgs {
         parent_pid,
         original_autohide,
+        restore_taskbar,
+        restore_desktop_icons,
     })
 }
 
 /// Launch a sibling watchdog (a second copy of our own exe in `--watchdog` mode).
 /// Returns the child so the dock can `kill()` it on a clean exit. `None` if it could not
 /// be started — the on-disk guard flag still covers us at next launch.
-pub fn spawn(original_autohide: bool) -> Option<Child> {
+pub fn spawn(
+    original_autohide: bool,
+    restore_taskbar: bool,
+    restore_desktop_icons: bool,
+) -> Option<Child> {
     let exe = std::env::current_exe().ok()?;
     Command::new(exe)
         .arg(WATCHDOG_FLAG)
         .arg(std::process::id().to_string())
         .arg(if original_autohide { "1" } else { "0" })
+        .arg(if restore_taskbar { "1" } else { "0" })
+        .arg(if restore_desktop_icons { "1" } else { "0" })
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
         .ok()
@@ -88,9 +100,16 @@ pub fn run(args: WatchdogArgs) {
                 let _ = CloseHandle(parent);
             }
         }
-        // The dock is gone (or never existed): make sure the user has a taskbar again.
-        taskbar::restore_to(args.original_autohide);
-        taskbar::clear_guard();
+        // The dock is gone (or never existed): undo only the system state this watchdog
+        // was armed to protect. This keeps a desktop-icon-only helper from rewriting a
+        // taskbar preference the user changed while FeatherDock was running.
+        if args.restore_taskbar {
+            taskbar::restore_to(args.original_autohide);
+            taskbar::clear_guard();
+        }
+        if args.restore_desktop_icons {
+            desktop_icons::set_hidden(false);
+        }
     }
 }
 
@@ -108,24 +127,44 @@ mod tests {
 
     #[test]
     fn parses_watchdog_invocation() {
-        let parsed = parse_from(args(&["--watchdog", "4321", "1"])).unwrap();
+        let parsed = parse_from(args(&["--watchdog", "4321", "1", "1", "0"])).unwrap();
         assert_eq!(parsed.parent_pid, 4321);
         assert!(parsed.original_autohide);
+        assert!(parsed.restore_taskbar);
+        assert!(!parsed.restore_desktop_icons);
     }
 
     #[test]
     fn original_autohide_is_false_unless_explicitly_one() {
         assert!(
-            !parse_from(args(&["--watchdog", "10", "0"]))
+            !parse_from(args(&["--watchdog", "10", "0", "0", "0"]))
                 .unwrap()
                 .original_autohide
         );
-        // Missing / malformed flag defaults to "not auto-hide" rather than failing.
+        // Missing / malformed flags default to no restore rather than failing.
         assert!(
             !parse_from(args(&["--watchdog", "10"]))
                 .unwrap()
                 .original_autohide
         );
+        assert!(
+            !parse_from(args(&["--watchdog", "10"]))
+                .unwrap()
+                .restore_taskbar
+        );
+        assert!(
+            !parse_from(args(&["--watchdog", "10"]))
+                .unwrap()
+                .restore_desktop_icons
+        );
+    }
+
+    #[test]
+    fn parses_independent_restore_scopes() {
+        let parsed = parse_from(args(&["--watchdog", "42", "0", "0", "1"])).unwrap();
+        assert!(!parsed.original_autohide);
+        assert!(!parsed.restore_taskbar);
+        assert!(parsed.restore_desktop_icons);
     }
 
     #[test]

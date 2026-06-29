@@ -109,7 +109,7 @@ pub unsafe fn scan() -> Vec<DesktopEntry> {
         }
     }
     ILFree(Some(desktop_abs));
-    out.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+    out.sort_by_key(|a| a.label.to_lowercase());
     out
 }
 
@@ -118,7 +118,7 @@ fn is_drawer_program(entry: &DesktopEntry) -> bool {
 }
 
 fn sort_entries(entries: &mut [DesktopEntry]) {
-    entries.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+    entries.sort_by_key(|a| a.label.to_lowercase());
 }
 
 unsafe fn append_required_virtual_entries(entries: &mut Vec<DesktopEntry>) {
@@ -227,10 +227,6 @@ fn load_cache(now: SystemTime, current_signature: &str) -> Option<Vec<DesktopEnt
 
 fn save_cache(now: SystemTime, signature: &str, entries: &[DesktopEntry]) -> std::io::Result<()> {
     let path = cache_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-
     let mut body = String::new();
     body.push_str("# FeatherDock drawer scan cache\n");
     body.push_str(&format!("written\t{}\n", secs_since_epoch(now)));
@@ -247,7 +243,7 @@ fn save_cache(now: SystemTime, signature: &str, entries: &[DesktopEntry]) -> std
             kind_code(entry.kind)
         ));
     }
-    fs::write(path, body)
+    crate::atomic::write(&path, body.as_bytes())
 }
 
 fn cache_is_fresh(
@@ -262,24 +258,25 @@ fn cache_is_fresh(
             .is_ok_and(|age| age <= Duration::from_secs(CACHE_TTL_SECS))
 }
 
+/// A cheap change signal for the desktop folders, computed on every drawer open to
+/// validate the cache. We deliberately stamp ONLY each desktop directory's own
+/// modified-time + size — NOT every entry inside it. NTFS bumps a directory's
+/// modified-time when an item is added, removed, or renamed within it, so this still
+/// catches the changes a user actually makes to their desktop, while avoiding a
+/// per-entry `fs::metadata` storm. That per-entry walk was the expensive part: on a
+/// OneDrive desktop full of cloud-placeholder files, each stat can hydrate/block, so a
+/// hot cache hit could still stall the drawer open. (Trade-off: an in-place content edit
+/// of an existing shortcut won't bump the dir time and is only picked up when the TTL
+/// lapses — acceptable, since that doesn't change how the entry looks in the drawer.)
 fn desktop_signature() -> String {
-    let mut chunks = Vec::new();
-    for dir in desktop_dirs() {
-        let dir_key = dir.to_string_lossy().to_ascii_lowercase();
-        chunks.push(format!("dir:{dir_key}:{}", metadata_stamp(&dir)));
-        let Ok(read_dir) = fs::read_dir(&dir) else {
-            continue;
-        };
-        let mut entries = Vec::new();
-        for entry in read_dir.flatten() {
-            let path = entry.path();
-            let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            entries.push(format!("{}:{}", name, metadata_stamp(&path)));
-        }
-        entries.sort();
-        chunks.extend(entries);
-    }
-    chunks.join("|")
+    desktop_dirs()
+        .iter()
+        .map(|dir| {
+            let dir_key = dir.to_string_lossy().to_ascii_lowercase();
+            format!("dir:{dir_key}:{}", metadata_stamp(dir))
+        })
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 fn desktop_dirs() -> Vec<PathBuf> {
@@ -406,17 +403,11 @@ unsafe fn name_of(pidl: *const ITEMIDLIST, sigdn: SIGDN) -> Option<String> {
 }
 
 /// The filesystem path of a shell item, or None for a virtual (non-file) item.
+/// Uses the shell-allocated `SIGDN_FILESYSPATH` name rather than `SHGetPathFromIDListW`,
+/// whose caller-supplied buffer is capped at `MAX_PATH` (260) and would truncate — or
+/// fail — on long paths. Virtual (non-filesystem) items return `None` here, as before.
 unsafe fn path_of(pidl: *const ITEMIDLIST) -> Option<String> {
-    let mut buf = [0u16; 260];
-    if !SHGetPathFromIDListW(pidl, &mut buf).as_bool() {
-        return None;
-    }
-    let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
-    if len == 0 {
-        None
-    } else {
-        Some(String::from_utf16_lossy(&buf[..len]))
-    }
+    name_of(pidl, SIGDN_FILESYSPATH).filter(|path| !path.is_empty())
 }
 
 /// Launch a desktop item: a filesystem item via the shell's "open" (like the rest of

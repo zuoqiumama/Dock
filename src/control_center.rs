@@ -61,6 +61,14 @@ struct Panel {
     status_left: IDWriteTextFormat,
     status_right: IDWriteTextFormat,
     audio: Option<AudioControl>,
+    // Snapshot of the system state, sampled once at open (and, for volume, on
+    // interaction). The open animation re-renders every 16ms; reading the audio endpoint /
+    // power API on each of those frames risks janking the fade if a call briefly blocks, so
+    // render() draws from this snapshot and never queries the system itself.
+    vol_level: f32,
+    vol_muted: bool,
+    battery: sysctl::Battery,
+    clock: (String, String),
     dpi: f32,
     width: f32,
     height: f32,
@@ -109,7 +117,8 @@ fn layout(width: f32, height: f32, dpi: f32) -> Layout {
     let mid = s(VOL_TOP) + s(VOL_H) / 2.0;
     let bh = s(2.5);
     let vol_bar = rect(bar_left, mid - bh, cr, mid + bh);
-    let bw = (cr - cl - 2.0 * s(BTN_GAP)) / 3.0;
+    let count = quick_button_count();
+    let bw = (cr - cl - count.saturating_sub(1) as f32 * s(BTN_GAP)) / count as f32;
     let buttons = [0usize, 1, 2].map(|i| {
         let left = cl + i as f32 * (bw + s(BTN_GAP));
         rect(left, s(BTN_TOP), left + bw, s(BTN_TOP) + s(BTN_H))
@@ -236,12 +245,8 @@ unsafe fn render(panel: &Panel) {
         rgba(1.0, 1.0, 1.0, 0.12 * a),
     );
 
-    // --- volume row ---
-    let (level, muted) = panel
-        .audio
-        .as_ref()
-        .map(|audio| (audio.level(), audio.muted()))
-        .unwrap_or((0.0, false));
+    // --- volume row (from the snapshot; never queries the audio endpoint here) ---
+    let (level, muted) = (panel.vol_level, panel.vol_muted);
     let speaker = if muted || level <= 0.0001 {
         "\u{1F507}" // 🔇 muted
     } else {
@@ -323,8 +328,8 @@ unsafe fn render(panel: &Panel) {
         );
     }
 
-    // --- status line: battery (left) + clock (right) ---
-    let battery = sysctl::battery();
+    // --- status line: battery (left) + clock (right), from the open-time snapshot ---
+    let battery = panel.battery;
     if battery.present {
         let text = if battery.charging {
             format!("充电中 {}%", battery.percent)
@@ -341,7 +346,7 @@ unsafe fn render(panel: &Panel) {
             false,
         );
     }
-    let (hm, md) = sysctl::clock();
+    let (hm, md) = &panel.clock;
     draw_text(
         dc,
         &panel.brush,
@@ -366,8 +371,12 @@ unsafe fn handle_press(hwnd: HWND, panel: &mut Panel, x: f32, y: f32) {
     let lay = layout(panel.width, panel.height, panel.dpi);
     // Tap the speaker to toggle mute.
     if in_rect(&lay.vol_glyph, x, y) {
-        if let Some(audio) = &panel.audio {
-            audio.set_muted(!audio.muted());
+        if let Some(muted) = panel.audio.as_ref().map(|audio| {
+            let muted = !audio.muted();
+            audio.set_muted(muted);
+            muted
+        }) {
+            panel.vol_muted = muted;
         }
         render(panel);
         return;
@@ -381,12 +390,13 @@ unsafe fn handle_press(hwnd: HWND, panel: &mut Panel, x: f32, y: f32) {
     }
 }
 
-unsafe fn apply_slider(panel: &Panel, lay: &Layout, x: f32) {
+unsafe fn apply_slider(panel: &mut Panel, lay: &Layout, x: f32) {
+    let bar = lay.vol_bar;
+    let level = ((x - bar.left) / (bar.right - bar.left)).clamp(0.0, 1.0);
     if let Some(audio) = &panel.audio {
-        let bar = lay.vol_bar;
-        let level = ((x - bar.left) / (bar.right - bar.left)).clamp(0.0, 1.0);
         audio.set_level(level);
     }
+    panel.vol_level = level; // keep the render snapshot in sync with the drag
 }
 
 unsafe fn handle_release(hwnd: HWND, panel: &mut Panel, x: f32, y: f32) {
@@ -411,6 +421,10 @@ fn run_button(index: usize) {
         1 => sysctl::open_uri("ms-settings:bluetooth"),
         _ => sysctl::switch_input_method(),
     }
+}
+
+fn quick_button_count() -> usize {
+    BUTTON_LABELS.len()
 }
 
 unsafe fn handle_move(panel: &mut Panel, x: f32, y: f32) {
@@ -513,6 +527,11 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
         }
     };
 
+    let audio = AudioControl::open();
+    let (vol_level, vol_muted) = audio
+        .as_ref()
+        .map(|a| (a.level(), a.muted()))
+        .unwrap_or((0.0, false));
     let panel = Box::into_raw(Box::new(Panel {
         glass,
         brush,
@@ -520,7 +539,11 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
         label,
         status_left,
         status_right,
-        audio: AudioControl::open(),
+        audio,
+        vol_level,
+        vol_muted,
+        battery: sysctl::battery(),
+        clock: sysctl::clock(),
         dpi,
         width: width as f32,
         height: height as f32,
@@ -651,5 +674,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn control_center_keeps_only_clear_system_quick_actions() {
+        assert_eq!(quick_button_count(), 3);
+        assert_eq!(BUTTON_LABELS, ["网络", "蓝牙", "输入法"]);
+        assert!(!BUTTON_LABELS.contains(&"托盘"));
     }
 }

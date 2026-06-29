@@ -10,7 +10,10 @@
 //! an item, or when its toggle button is hit again. Long desktops scroll with the wheel.
 
 use core::ffi::c_void;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::time::Instant;
 
@@ -36,7 +39,7 @@ use crate::content::{classify_path, fallback_visual};
 use crate::desktop_scan::{self, Pidl};
 use crate::drawer_layout::{self, Layout, Section, SectionKind};
 use crate::glass::Glass;
-use crate::icons::IconLoader;
+use crate::icons::{self, IconLoader, OwnedIcon};
 
 /// Cursor travel (device px) before a press turns into a drag rather than a click.
 const DRAG_THRESHOLD: f32 = 6.0;
@@ -102,12 +105,18 @@ const ID_CTX_CATEGORY_BASE: usize = 3200;
 static PANEL_HWND: AtomicIsize = AtomicIsize::new(0);
 static LAST_CLOSED_TICK: AtomicU32 = AtomicU32::new(0);
 
+thread_local! {
+    static PRELOADED_ICONS: RefCell<HashMap<String, Rc<OwnedIcon>>> =
+        RefCell::new(HashMap::new());
+}
+
 struct Entry {
     label: String,
     key: String,          // stable id for category assignment
     path: Option<String>, // filesystem path, when it is one
     pidl: Option<Pidl>,   // absolute PIDL, for virtual items (此电脑 / 回收站 / …)
     icon: Option<ID2D1Bitmap1>,
+    preloaded_icon: Option<Rc<OwnedIcon>>,
     glyph: &'static str,    // fallback glyph if the icon can't be extracted
     color: (f32, f32, f32), // fallback tile color
 }
@@ -336,9 +345,9 @@ fn header_action_rects(header: D2D_RECT_F, dpi: f32) -> (D2D_RECT_F, D2D_RECT_F)
 }
 
 /// Build the drawer's entries from the cached desktop-program scan, attaching a fallback
-/// glyph/color to each (the real icon is loaded later, once the GPU surface exists).
+/// glyph/color for entries whose real icon cannot be extracted.
 unsafe fn build_entries(categories: &Categories) -> Vec<Entry> {
-    desktop_scan::scan_programs_cached()
+    let mut entries: Vec<Entry> = desktop_scan::scan_programs_cached()
         .into_iter()
         .filter(|d| !categories.is_hidden(&d.key))
         .map(|d| {
@@ -349,11 +358,55 @@ unsafe fn build_entries(categories: &Categories) -> Vec<Entry> {
                 path: d.path,
                 pidl: d.pidl,
                 icon: None,
+                preloaded_icon: None,
                 glyph,
                 color,
             }
         })
-        .collect()
+        .collect();
+    attach_preloaded_icons(&mut entries);
+    entries
+}
+
+fn attach_preloaded_icons(entries: &mut [Entry]) {
+    PRELOADED_ICONS.with(|cache| {
+        let cache = cache.borrow();
+        for entry in entries {
+            entry.preloaded_icon = cache.get(&entry.key).cloned();
+        }
+    });
+}
+
+unsafe fn preload_missing_icons(entries: &mut [Entry]) {
+    PRELOADED_ICONS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        for entry in entries {
+            if let Some(icon) = cache.get(&entry.key).cloned() {
+                entry.preloaded_icon = Some(icon);
+                continue;
+            }
+
+            let icon = match &entry.path {
+                Some(path) => icons::source_icon(path, 256),
+                None => entry
+                    .pidl
+                    .as_ref()
+                    .and_then(|pidl| icons::source_icon_pidl(pidl.as_ptr())),
+            };
+            if let Some(icon) = icon {
+                let icon = Rc::new(icon);
+                cache.insert(entry.key.clone(), icon.clone());
+                entry.preloaded_icon = Some(icon);
+            }
+        }
+    });
+}
+
+/// Warm the drawer's shell scan + icon handles during dock startup, before the user opens it.
+pub unsafe fn warm_cache() {
+    let categories = categories::load();
+    let mut entries = build_entries(&categories);
+    preload_missing_icons(&mut entries);
 }
 
 unsafe fn load_entry_icons(dc: &ID2D1DeviceContext, dpi: f32, entries: &mut [Entry]) {
@@ -362,6 +415,12 @@ unsafe fn load_entry_icons(dc: &ID2D1DeviceContext, dpi: f32, entries: &mut [Ent
     };
     let icon_px = ((ICON * 2.0 * dpi).round() as u32).clamp(48, 256);
     for entry in entries {
+        if let Some(icon) = &entry.preloaded_icon {
+            entry.icon = loader.load_hicon(dc, icon.raw());
+            if entry.icon.is_some() {
+                continue;
+            }
+        }
         entry.icon = match &entry.path {
             Some(path) => {
                 let kind = classify_path(Path::new(path));
@@ -380,6 +439,9 @@ unsafe fn reload_entries(panel: &mut Drawer, refresh_scan: bool) {
         desktop_scan::invalidate_cache();
     }
     panel.entries = build_entries(&panel.categories);
+    if refresh_scan {
+        preload_missing_icons(&mut panel.entries);
+    }
     let dc = panel.glass.dc().clone();
     load_entry_icons(&dc, panel.dpi, &mut panel.entries);
     panel.hovered = -1;
@@ -1306,8 +1368,9 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
         }
     };
 
-    // Extract each visible program's icon into a GPU bitmap. Cache keeps the expensive
-    // desktop scan out of repeated opens; D2D bitmaps stay per-window and are rebuilt here.
+    // Icons are loaded before the first visible frame. Startup warm_cache() usually
+    // makes this a cheap HICON-to-D2D conversion; if the cache was cold, we still prefer
+    // a short open delay over showing placeholder icons that visibly swap in.
     load_entry_icons(glass.dc(), dpi, &mut entries);
 
     let panel = Box::into_raw(Box::new(Drawer {

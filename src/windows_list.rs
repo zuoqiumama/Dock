@@ -6,7 +6,9 @@
 //! it re-enumerates + re-renders a single frame.
 
 use core::ffi::c_void;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicIsize, Ordering};
+use std::time::{Duration, Instant};
 
 use windows::core::PWSTR;
 use windows::Win32::Foundation::*;
@@ -24,12 +26,20 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+#[link(name = "user32")]
+extern "system" {
+    fn SwitchToThisWindow(hwnd: HWND, fAltTab: BOOL);
+}
+
 /// Posted to the dock window whenever the set of open windows may have changed.
 pub const WM_WINDOWS_CHANGED: u32 = WM_APP + 0x21;
 
 const VK_LWIN: VIRTUAL_KEY = VIRTUAL_KEY(0x5B);
 const OBJID_WINDOW: i32 = 0;
 const GCLP_HICON: i32 = -14;
+const SC_MINIMIZE_COMMAND: usize = 0xF020;
+const ACTIVATE_WAIT: Duration = Duration::from_millis(350);
+const ACTIVATE_POLL: Duration = Duration::from_millis(25);
 
 /// Target dock window the hook callback posts to (set in `install_hooks`).
 static DOCK_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -53,28 +63,58 @@ fn hwnd_from(raw: isize) -> HWND {
     HWND(raw as *mut c_void)
 }
 
+/// Per-enumeration scratch: the windows we collect, plus a PID→exe-path memo so a
+/// multi-window app (a browser with a dozen tabs-as-windows) costs one `OpenProcess` +
+/// path query per process instead of one per window. The memo is scoped to a single
+/// `enumerate_sorted` call and thrown away after — never persisted, so a PID reused by a
+/// different process after this call can't return a stale path.
+struct EnumCtx {
+    list: Vec<RunningWindow>,
+    exe_by_pid: HashMap<u32, Option<String>>,
+}
+
 /// Enumerate open windows, sorted by handle for a stable left-to-right order
 /// (so icons don't reshuffle every time focus changes).
 pub unsafe fn enumerate_sorted() -> Vec<RunningWindow> {
-    let mut list: Vec<RunningWindow> = Vec::new();
-    let _ = EnumWindows(Some(enum_proc), LPARAM(&mut list as *mut _ as isize));
-    list.sort_by_key(|w| w.hwnd);
-    list
+    let mut ctx = EnumCtx {
+        list: Vec::new(),
+        exe_by_pid: HashMap::new(),
+    };
+    let _ = EnumWindows(Some(enum_proc), LPARAM(&mut ctx as *mut _ as isize));
+    ctx.list.sort_by_key(|w| w.hwnd);
+    ctx.list
 }
 
 unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
-    let list = &mut *(lparam.0 as *mut Vec<RunningWindow>);
+    let ctx = &mut *(lparam.0 as *mut EnumCtx);
     if is_alt_tab_window(hwnd) {
         let title = window_title(hwnd);
         if !title.is_empty() {
-            list.push(RunningWindow {
+            let exe_path = exe_path_for_window_cached(hwnd, &mut ctx.exe_by_pid);
+            ctx.list.push(RunningWindow {
                 hwnd: hwnd.0 as isize,
                 title,
-                exe_path: process_exe_path(hwnd),
+                exe_path,
             });
         }
     }
     BOOL(1)
+}
+
+/// Resolve a window's process image path, memoized by PID for this enumeration.
+unsafe fn exe_path_for_window_cached(
+    hwnd: HWND,
+    cache: &mut HashMap<u32, Option<String>>,
+) -> Option<String> {
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    if pid == 0 {
+        return None;
+    }
+    cache
+        .entry(pid)
+        .or_insert_with(|| process_exe_path_by_pid(pid))
+        .clone()
 }
 
 pub fn group_by_application(running: &[RunningWindow]) -> Vec<RunningGroup> {
@@ -175,6 +215,11 @@ unsafe fn is_alt_tab_window(hwnd: HWND) -> bool {
     !is_cloaked(hwnd)
 }
 
+pub unsafe fn is_running_window(raw: isize) -> bool {
+    let hwnd = hwnd_from(raw);
+    IsWindow(hwnd).as_bool() && is_alt_tab_window(hwnd)
+}
+
 unsafe fn is_cloaked(hwnd: HWND) -> bool {
     let mut cloaked: u32 = 0;
     let ok = DwmGetWindowAttribute(
@@ -248,21 +293,39 @@ pub unsafe fn process_exe_path(hwnd: HWND) -> Option<String> {
     if pid == 0 {
         return None;
     }
+    process_exe_path_by_pid(pid)
+}
+
+unsafe fn process_exe_path_by_pid(pid: u32) -> Option<String> {
     let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
-    let mut buf = vec![0u16; 512];
-    let mut len = buf.len() as u32;
-    let result = QueryFullProcessImageNameW(
-        process,
-        PROCESS_NAME_WIN32,
-        PWSTR(buf.as_mut_ptr()),
-        &mut len,
-    );
+    let path = query_full_process_path(process);
     let _ = CloseHandle(process);
-    result.ok()?;
-    if len == 0 {
-        return None;
+    path
+}
+
+/// Read a process image path, growing the buffer until it fits. A fixed 512-unit buffer
+/// would truncate (or fail) on long paths — Windows allows paths up to ~32767 UTF-16
+/// units. We start at 512 (covers virtually every real path in one call) and double on
+/// `ERROR_INSUFFICIENT_BUFFER`, giving up at the long-path ceiling.
+unsafe fn query_full_process_path(process: HANDLE) -> Option<String> {
+    let mut cap = 512usize;
+    loop {
+        let mut buf = vec![0u16; cap];
+        let mut len = buf.len() as u32;
+        let result = QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        );
+        if result.is_ok() {
+            return (len != 0).then(|| String::from_utf16_lossy(&buf[..len as usize]));
+        }
+        if GetLastError() != ERROR_INSUFFICIENT_BUFFER || cap >= 32_768 {
+            return None;
+        }
+        cap *= 2;
     }
-    Some(String::from_utf16_lossy(&buf[..len as usize]))
 }
 
 pub unsafe fn process_exe_path_for_window(raw: isize) -> Option<String> {
@@ -364,31 +427,86 @@ pub unsafe fn toggle_maximize(raw: isize) {
 /// Bring a window to the foreground, or minimize it if it's already in front
 /// (click-to-toggle, like the taskbar). Uses AttachThreadInput to defeat the
 /// foreground-lock that would otherwise just flash the taskbar button.
-pub unsafe fn activate(raw: isize) {
+pub unsafe fn activate(raw: isize) -> bool {
     let hwnd = hwnd_from(raw);
+    if !IsWindow(hwnd).as_bool() {
+        return false;
+    }
     if IsIconic(hwnd).as_bool() {
-        let _ = ShowWindow(hwnd, SW_RESTORE);
-        force_foreground(hwnd);
-        return;
+        return force_foreground(hwnd, true);
     }
     if GetForegroundWindow() == hwnd {
-        let _ = ShowWindow(hwnd, SW_MINIMIZE);
-        return;
+        minimize_foreground(hwnd);
+        return true;
     }
-    force_foreground(hwnd);
+    force_foreground(hwnd, false)
 }
 
-unsafe fn force_foreground(hwnd: HWND) {
+unsafe fn minimize_foreground(hwnd: HWND) {
+    let _ = ShowWindow(hwnd, SW_MINIMIZE);
+    if needs_syscommand_minimize_fallback(IsIconic(hwnd).as_bool()) {
+        let _ = PostMessageW(hwnd, WM_SYSCOMMAND, WPARAM(SC_MINIMIZE_COMMAND), LPARAM(0));
+        let _ = wait_until(ACTIVATE_WAIT, || {
+            !IsWindow(hwnd).as_bool() || IsIconic(hwnd).as_bool()
+        });
+    }
+}
+
+fn needs_syscommand_minimize_fallback(iconic_after_show_window: bool) -> bool {
+    !iconic_after_show_window
+}
+
+unsafe fn force_foreground(hwnd: HWND, restore: bool) -> bool {
     let foreground = GetForegroundWindow();
     let our_thread = GetCurrentThreadId();
-    let target_thread = GetWindowThreadProcessId(foreground, None);
-    let attached = foreground != hwnd
-        && target_thread != 0
+    let foreground_thread = GetWindowThreadProcessId(foreground, None);
+    let target_thread = GetWindowThreadProcessId(hwnd, None);
+    let attached_foreground = foreground != hwnd
+        && foreground_thread != 0
+        && foreground_thread != our_thread
+        && AttachThreadInput(our_thread, foreground_thread, BOOL(1)).as_bool();
+    let attached_target = target_thread != 0
+        && target_thread != our_thread
         && AttachThreadInput(our_thread, target_thread, BOOL(1)).as_bool();
+    let _ = ShowWindow(hwnd, if restore { SW_RESTORE } else { SW_SHOW });
     let _ = BringWindowToTop(hwnd);
     let _ = SetForegroundWindow(hwnd);
-    if attached {
+    if GetForegroundWindow() != hwnd {
+        let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        let _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+        let _ = SetForegroundWindow(hwnd);
+    }
+    if restore && IsIconic(hwnd).as_bool() {
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+        let _ = SetForegroundWindow(hwnd);
+    }
+    if restore && IsIconic(hwnd).as_bool() {
+        // WeGame's CEF top-level window can remain iconic after the usual
+        // restore APIs; this is the same fallback path shell taskbar switches use.
+        SwitchToThisWindow(hwnd, BOOL(1));
+    }
+    if attached_target {
         let _ = AttachThreadInput(our_thread, target_thread, BOOL(0));
+    }
+    if attached_foreground {
+        let _ = AttachThreadInput(our_thread, foreground_thread, BOOL(0));
+    }
+    wait_until(ACTIVATE_WAIT, || {
+        GetForegroundWindow() == hwnd && !IsIconic(hwnd).as_bool()
+    })
+}
+
+fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if predicate() {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        std::thread::sleep(ACTIVATE_POLL.min(deadline.saturating_duration_since(now)));
     }
 }
 
@@ -413,16 +531,17 @@ pub unsafe fn open_start_menu() {
 /// thread. SKIPOWNPROCESS keeps our own window's events from looping back.
 pub unsafe fn install_hooks(dock: HWND) -> Vec<HWINEVENTHOOK> {
     DOCK_HWND.store(dock.0 as isize, Ordering::Relaxed);
-    // Window lifecycle + foreground, plus a foreground-ONLY location change. We still do
-    // NOT hook NAMECHANGE (title churn we don't display) nor unfiltered LOCATIONCHANGE
-    // (window drags fire continuously). LOCATIONCHANGE is admitted only for the current
+    // Window lifecycle + foreground, top-level name changes that can affect launcher
+    // matching, plus a foreground-ONLY location change. We still do not hook unfiltered
+    // LOCATIONCHANGE (window drags fire continuously). LOCATIONCHANGE is admitted only for the current
     // foreground window — so a browser/game toggling fullscreen (F11) while already in
     // front, which fires no foreground event, is still caught — and the callback rejects
     // everything else, so a static idle screen produces no events and 0% CPU.
-    const RANGES: [(u32, u32); 4] = [
+    const RANGES: [(u32, u32); 5] = [
         (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
         (EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE),
         (EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED),
+        (EVENT_OBJECT_NAMECHANGE, EVENT_OBJECT_NAMECHANGE),
         (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
     ];
     RANGES
@@ -474,6 +593,12 @@ unsafe extern "system" fn win_event_proc(
         | EVENT_OBJECT_HIDE
         | EVENT_OBJECT_CLOAKED
         | EVENT_OBJECT_UNCLOAKED => 0usize,
+        EVENT_OBJECT_NAMECHANGE => {
+            if !IsWindowVisible(hwnd).as_bool() || GetWindowTextLengthW(hwnd) == 0 {
+                return;
+            }
+            0usize
+        }
         EVENT_OBJECT_LOCATIONCHANGE => {
             // A top-level move/resize only matters for fullscreen detection, and only for
             // the window actually in front (a browser/game toggling F11 while already
@@ -557,5 +682,21 @@ mod tests {
 
         assert_eq!(groups.len(), 2);
         assert_ne!(groups[0].key, groups[1].key);
+    }
+
+    #[test]
+    fn wait_until_returns_immediately_when_condition_is_met() {
+        assert!(wait_until(Duration::from_secs(1), || true));
+    }
+
+    #[test]
+    fn wait_until_returns_false_after_timeout() {
+        assert!(!wait_until(Duration::ZERO, || false));
+    }
+
+    #[test]
+    fn foreground_minimize_falls_back_when_showwindow_does_not_iconify() {
+        assert!(needs_syscommand_minimize_fallback(false));
+        assert!(!needs_syscommand_minimize_fallback(true));
     }
 }

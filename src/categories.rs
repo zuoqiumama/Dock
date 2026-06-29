@@ -112,9 +112,6 @@ pub fn load() -> Categories {
 /// Persist the categories (creating the folder/file as needed).
 pub fn save(categories: &Categories) -> io::Result<()> {
     let path = config_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let mut body = String::from(HEADER);
     for key in &categories.hidden {
         body.push_str(&format!("hidden = \"{}\"\n", quote(key)));
@@ -126,7 +123,7 @@ pub fn save(categories: &Categories) -> io::Result<()> {
             body.push_str(&format!("item = \"{}\"\n", quote(key)));
         }
     }
-    fs::write(&path, body)
+    crate::atomic::write(&path, body.as_bytes())
 }
 
 fn quote(value: &str) -> String {

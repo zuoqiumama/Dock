@@ -8,8 +8,10 @@ use std::time::{Duration, Instant};
 
 mod app_icon;
 mod apps;
+mod atomic;
 mod autostart;
 mod categories;
+mod command_palette;
 mod config;
 mod content;
 mod control_center;
@@ -20,6 +22,7 @@ mod drawer;
 mod drawer_input;
 mod drawer_layout;
 mod error_log;
+mod folder_stack;
 mod glass;
 mod graphics;
 mod icons;
@@ -29,6 +32,7 @@ mod settings_window;
 mod single_instance;
 mod sysctl;
 mod taskbar;
+mod theme;
 mod tray;
 mod watchdog;
 mod window_preview;
@@ -38,10 +42,11 @@ use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::{
     CreateRoundRectRgn, DeleteObject, GetMonitorInfoW, MonitorFromWindow, SetWindowRgn, HGDIOBJ,
-    HRGN, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    HRGN, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::Com::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -67,6 +72,11 @@ const TIMER_WINDOWS_MS: u32 = 180;
 const TIMER_TASKBAR_REHIDE: usize = 2;
 const TIMER_TASKBAR_REHIDE_MS: u32 = 400;
 const TASKBAR_INVOCATION_GRACE: Duration = Duration::from_secs(8);
+const QUIT_WAIT_MS: u32 = 5_000;
+const ID_SEARCH_HOTKEY: i32 = 3001;
+const QUIT_FLAG: &str = "--quit";
+const RESTORE_SYSTEM_FLAG: &str = "--restore-system";
+const WM_SHOW_EXISTING: u32 = 0x8033;
 
 // Right-click context-menu command ids (kept clear of the tray ids in tray.rs).
 const ID_WIN_CLOSE: usize = 2001;
@@ -77,13 +87,25 @@ const ID_PIN_OPEN: usize = 2101;
 const ID_PIN_LOCATION: usize = 2102;
 const ID_PIN_REMOVE: usize = 2103;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WatchdogPlan {
+    restore_taskbar: bool,
+    restore_desktop_icons: bool,
+}
+
+impl WatchdogPlan {
+    fn needed(self) -> bool {
+        self.restore_taskbar || self.restore_desktop_icons
+    }
+}
+
 struct App {
     _instance: single_instance::SingleInstance,
     gpu: Gpu,
     dock: Dock,
     tray: Tray,
     hooks: Vec<HWINEVENTHOOK>,    // WinEvent hooks tracking open windows
-    running_sig: Vec<isize>,      // last seen open-window handles (change detection)
+    running_sig: Vec<RunningSig>, // last seen open-window identity (change detection)
     settings: settings::Settings, // persisted dock mode + fullscreen behavior
     fullscreen_active: bool,      // a fullscreen (borderless) app is in front on our monitor
     maximized_active: bool,       // a maximized (captioned) window is in front on our monitor
@@ -97,7 +119,8 @@ struct App {
     pending_relayout: bool,     // shrink the window to fit once exit animations settle
     pending_rebuild: bool, // a window-set/display change deferred while a fullscreen app owned the screen
     taskbar_invoked_at: Option<Instant>,
-    watchdog: Option<std::process::Child>, // sibling that restores the taskbar if we crash
+    watchdog: Option<std::process::Child>, // sibling that restores system state if we crash
+    watchdog_plan: Option<WatchdogPlan>,
 }
 
 /// True while a fullscreen app (game / video) is in front and we're set to yield to it.
@@ -177,13 +200,10 @@ fn compose_items(
     let mut pinned = pinned_items()?;
     let mut unpinned: Vec<windows_list::RunningGroup> = Vec::new();
     for group in windows_list::group_by_application(running) {
-        match pinned.iter_mut().find(|item| {
-            item.windows.is_empty()
-                && item
-                    .path
-                    .as_deref()
-                    .is_some_and(|path| apps::exe_matches(path, &group.key))
-        }) {
+        match pinned
+            .iter_mut()
+            .find(|item| pinned_matches_group(item, &group))
+        {
             Some(item) => apps::attach_running(item, &group),
             None => unpinned.push(group),
         }
@@ -205,11 +225,39 @@ fn compose_items(
     Ok(items)
 }
 
+fn pinned_matches_group(item: &dock::DockItem, group: &windows_list::RunningGroup) -> bool {
+    item.windows.is_empty()
+        && pinned_identity_matches_group(&item.label, item.path.as_deref(), group)
+}
+
+fn pinned_identity_matches_group(
+    label: &str,
+    path: Option<&str>,
+    group: &windows_list::RunningGroup,
+) -> bool {
+    path.is_some_and(|path| apps::exe_matches(path, &group.key))
+        || apps::title_matches_label(label, group)
+}
+
 /// Signature of the open-window set (handles only — we don't display titles, so a
 /// title change must NOT trigger a reload), used to skip needless rebuilds when a
 /// WinEvent fires but the set we show is unchanged (focus switches, renames).
-fn running_sig(running: &[windows_list::RunningWindow]) -> Vec<isize> {
-    running.iter().map(|window| window.hwnd).collect()
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunningSig {
+    hwnd: isize,
+    title: String,
+    exe_path: Option<String>,
+}
+
+fn running_sig(running: &[windows_list::RunningWindow]) -> Vec<RunningSig> {
+    running
+        .iter()
+        .map(|window| RunningSig {
+            hwnd: window.hwnd,
+            title: window.title.clone(),
+            exe_path: window.exe_path.clone(),
+        })
+        .collect()
 }
 
 unsafe fn monitor_layout(
@@ -218,6 +266,34 @@ unsafe fn monitor_layout(
 ) -> Result<(f32, i32, i32, u32, u32)> {
     let dpi = (GetDpiForWindow(hwnd).max(96) as f32) / 96.0;
     let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+    monitor_geometry(monitor, dpi, items)
+}
+
+/// Initial placement, computed before the dock window exists. Targets the PRIMARY
+/// monitor — the dock is a system-taskbar replacement and the taskbar lives on primary,
+/// so this is the deliberate, predictable home — using that monitor's own effective DPI
+/// and bounds rather than the system DPI + `SM_CXSCREEN`. Going through the same monitor
+/// model as `monitor_layout` means the first frame is sized correctly and doesn't jump on
+/// the first relayout (the multi-monitor / mixed-DPI gap).
+unsafe fn primary_monitor_layout(items: &[dock::DockItem]) -> Result<(f32, i32, i32, u32, u32)> {
+    let monitor = MonitorFromWindow(HWND::default(), MONITOR_DEFAULTTOPRIMARY);
+    let mut dpi_x = 96u32;
+    let mut dpi_y = 96u32;
+    let dpi = if GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y).is_ok() {
+        (dpi_x.max(96) as f32) / 96.0
+    } else {
+        (GetDpiForSystem().max(96) as f32) / 96.0
+    };
+    monitor_geometry(monitor, dpi, items)
+}
+
+/// Bottom-centre the dock on `monitor` at `dpi`. Anchored to the monitor's true bottom
+/// edge (not the work area) so the auto-hide reveal trigger sits at the very edge.
+unsafe fn monitor_geometry(
+    monitor: windows::Win32::Graphics::Gdi::HMONITOR,
+    dpi: f32,
+    items: &[dock::DockItem],
+) -> Result<(f32, i32, i32, u32, u32)> {
     let mut info = MONITORINFO {
         cbSize: std::mem::size_of::<MONITORINFO>() as u32,
         ..Default::default()
@@ -452,11 +528,85 @@ fn main() {
         watchdog::run(args);
         return;
     }
+    if handle_control_args() {
+        return;
+    }
     if let Err(error) = run() {
         unsafe {
             show_error(HWND::default(), "FeatherDock 启动失败", error);
         }
     }
+}
+
+fn handle_control_args() -> bool {
+    match std::env::args().nth(1).as_deref() {
+        Some(QUIT_FLAG) => {
+            unsafe { request_graceful_quit() };
+            true
+        }
+        Some(RESTORE_SYSTEM_FLAG) => {
+            unsafe { restore_stranded_system_state() };
+            true
+        }
+        _ => false,
+    }
+}
+
+unsafe fn dock_window() -> HWND {
+    FindWindowW(w!("FeatherDockWindow"), PCWSTR::null()).unwrap_or_default()
+}
+
+unsafe fn reveal_existing_instance() {
+    let hwnd = dock_window();
+    if hwnd.is_invalid() {
+        restore_stranded_system_state();
+        let text: Vec<u16> = "FeatherDock is already running, but its dock window could not be found.\n\nThe taskbar and desktop icons were restored. End the remaining FeatherDock.exe process in Task Manager, then start FeatherDock again."
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let _ = MessageBoxW(
+            HWND::default(),
+            PCWSTR(text.as_ptr()),
+            w!("FeatherDock"),
+            MB_OK | MB_ICONWARNING,
+        );
+        return;
+    }
+    let _ = PostMessageW(hwnd, WM_SHOW_EXISTING, WPARAM(0), LPARAM(0));
+}
+
+unsafe fn request_graceful_quit() {
+    let hwnd = dock_window();
+    if hwnd.is_invalid() {
+        restore_stranded_system_state();
+        return;
+    }
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    let process = if pid == 0 {
+        None
+    } else {
+        OpenProcess(PROCESS_SYNCHRONIZE, BOOL(0), pid).ok()
+    };
+    let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+    if let Some(process) = process {
+        if !process.is_invalid() {
+            WaitForSingleObject(process, QUIT_WAIT_MS);
+            let _ = CloseHandle(process);
+            return;
+        }
+    }
+    for _ in 0..50 {
+        if !IsWindow(hwnd).as_bool() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+unsafe fn restore_stranded_system_state() {
+    taskbar::recover_if_stranded();
+    desktop_icons::set_hidden(false);
 }
 
 /// Install a panic hook that restores the taskbar before the default hook runs (and, in
@@ -470,18 +620,53 @@ fn install_taskbar_panic_guard() {
     }));
 }
 
-/// Ensure the abnormal-exit watchdog is running whenever the taskbar is in a modified
-/// mode. Idempotent: spawns at most one watchdog for the dock's lifetime (a death while
-/// in `Show` mode needs no restore, so we don't bother in that case).
-unsafe fn ensure_watchdog(app: &mut App) {
-    if app.watchdog.is_none() && app.settings.taskbar_mode != settings::TaskbarMode::Show {
-        app.watchdog = watchdog::spawn(taskbar::original_autohide());
+fn desired_watchdog_plan(app: &App) -> Option<WatchdogPlan> {
+    let plan = WatchdogPlan {
+        restore_taskbar: app.settings.taskbar_mode != settings::TaskbarMode::Show,
+        restore_desktop_icons: app.settings.hide_desktop_icons,
+    };
+    plan.needed().then_some(plan)
+}
+
+/// Keep the abnormal-exit watchdog aligned with the system state FeatherDock currently
+/// owns. Rebuild it when settings change so a stale helper never misses a new side effect
+/// such as desktop-icon hiding, and stop it once there is nothing left to recover.
+unsafe fn reconcile_watchdog(app: &mut App) {
+    let desired = desired_watchdog_plan(app);
+    if app.watchdog_plan == desired {
+        if let Some(child) = app.watchdog.as_mut() {
+            if child.try_wait().ok().flatten().is_none() {
+                return;
+            }
+        }
+        app.watchdog = None;
+        app.watchdog_plan = None;
     }
+    stop_watchdog(app);
+    if let Some(plan) = desired {
+        app.watchdog = watchdog::spawn(
+            taskbar::original_autohide(),
+            plan.restore_taskbar,
+            plan.restore_desktop_icons,
+        );
+        if app.watchdog.is_some() {
+            app.watchdog_plan = Some(plan);
+        }
+    }
+}
+
+unsafe fn stop_watchdog(app: &mut App) {
+    if let Some(mut watchdog) = app.watchdog.take() {
+        let _ = watchdog.kill();
+        let _ = watchdog.wait();
+    }
+    app.watchdog_plan = None;
 }
 
 fn run() -> Result<()> {
     unsafe {
         let Some(instance) = single_instance::SingleInstance::acquire()? else {
+            reveal_existing_instance();
             return Ok(());
         };
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -506,17 +691,13 @@ fn run() -> Result<()> {
             return Err(Error::from_win32());
         }
 
-        let dpi = GetDpiForSystem() as f32 / 96.0;
         let running = windows_list::enumerate_sorted();
         let dock_settings = settings::load();
         let items = compose_items(&running, dock_settings.drawer_enabled)?;
-        let (win_w, win_h) = dock::window_size(&items, dpi);
-        // Anchor the window's bottom to the true screen bottom so the auto-hide
-        // reveal trigger sits at the very edge (slam the mouse down to summon it).
-        let screen_w = GetSystemMetrics(SM_CXSCREEN);
-        let screen_h = GetSystemMetrics(SM_CYSCREEN);
-        let x = (screen_w - win_w as i32) / 2;
-        let y = screen_h - win_h as i32;
+        // Anchor to the primary monitor's bottom-centre using that monitor's own DPI and
+        // bounds (see `primary_monitor_layout`) so the auto-hide reveal trigger sits at the
+        // very edge and the first frame is already sized for the right monitor.
+        let (dpi, x, y, win_w, win_h) = primary_monitor_layout(&items)?;
 
         let hwnd = CreateWindowExW(
             WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -534,7 +715,7 @@ fn run() -> Result<()> {
         )?;
 
         let mut gpu = Gpu::new(hwnd, win_w, win_h, dpi)?;
-        let dock = Dock::new(items, dpi, win_w as f32, win_h as f32);
+        let dock = Dock::new(items, dpi, win_w as f32, win_h as f32, dock_settings.theme);
         gpu.load_icons(&dock.items, dpi);
         let tray = Tray::new(hwnd);
         // Track open windows event-driven (no polling) so the right zone stays live.
@@ -573,14 +754,15 @@ fn run() -> Result<()> {
             pending_rebuild: false,
             taskbar_invoked_at: None,
             watchdog: None,
+            watchdog_plan: None,
         }));
         // Ease toward the resting state: resident at the bottom by default, or
         // hidden if in auto-hide mode / a fullscreen app is already in front.
         (*app_ptr).dock.reveal_target = resting_target(&*app_ptr);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, app_ptr as isize);
-        // Arm the external safety net if we modified the taskbar: a sibling process that
+        // Arm the external safety net if we modified system state: a sibling process that
         // restores it should we die abnormally (Task-Manager kill, crash, panic).
-        ensure_watchdog(&mut *app_ptr);
+        reconcile_watchdog(&mut *app_ptr);
         // If we start hidden, grow any pre-maximized windows into the freed work area
         // (taskbar::apply already made the bar transparent + auto-hide above).
         if (*app_ptr).settings.taskbar_mode == settings::TaskbarMode::Hidden {
@@ -591,6 +773,12 @@ fn run() -> Result<()> {
             desktop_icons::set_hidden(true);
         }
         DragAcceptFiles(hwnd, BOOL(1)); // files, folders, shortcuts, and applications
+        let _ = RegisterHotKey(
+            hwnd,
+            ID_SEARCH_HOTKEY,
+            MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
+            VK_SPACE.0 as u32,
+        );
 
         (*app_ptr).gpu.render(&(*app_ptr).dock)?;
         // Don't flash the dock on screen if a fullscreen app is already in front
@@ -599,6 +787,9 @@ fn run() -> Result<()> {
             (*app_ptr).window_hidden = true;
         } else {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+        if (*app_ptr).settings.drawer_enabled {
+            drawer::warm_cache();
         }
 
         // Event-driven loop: block in GetMessage when idle (0% CPU); when
@@ -693,10 +884,7 @@ unsafe fn cleanup(app_ptr: *mut App) {
     if !app_ptr.is_null() {
         // Stop the watchdog first (while it's still blocked on us) so it can't also fire
         // a redundant restore, then put the taskbar back ourselves. Never strand the user.
-        if let Some(mut watchdog) = (*app_ptr).watchdog.take() {
-            let _ = watchdog.kill();
-            let _ = watchdog.wait();
-        }
+        stop_watchdog(&mut *app_ptr);
         taskbar::restore();
         // Never leave the user with a blank desktop: put the icons back if we hid them.
         if (*app_ptr).settings.hide_desktop_icons {
@@ -863,7 +1051,15 @@ unsafe fn show_pinned_menu(owner: HWND, app: &mut App, path: &str, windows: &[is
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     let Ok(menu) = CreatePopupMenu() else { return };
-    append_item(menu, ID_PIN_OPEN, "打开");
+    append_item(
+        menu,
+        ID_PIN_OPEN,
+        if windows.is_empty() {
+            "打开"
+        } else {
+            "打开新实例"
+        },
+    );
     append_item(menu, ID_PIN_LOCATION, "打开文件所在位置");
     if !windows.is_empty() {
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
@@ -1025,10 +1221,7 @@ unsafe fn show_running_preview(hwnd: HWND, app: &App, index: usize) {
         window_preview::hide();
         return;
     }
-    let key = item
-        .group_key
-        .as_deref()
-        .unwrap_or_else(|| item.label.as_str());
+    let key = item.group_key.as_deref().unwrap_or(item.label.as_str());
     window_preview::show(
         hwnd,
         key,
@@ -1037,6 +1230,162 @@ unsafe fn show_running_preview(hwnd: HWND, app: &App, index: usize) {
         wr.top + frame.pill.1 as i32,
         app.dock.dpi,
     );
+}
+
+#[cfg(test)]
+fn activation_target(item: &dock::DockItem) -> Option<isize> {
+    activation_order_with_foreground(item, None)
+        .into_iter()
+        .next()
+}
+
+#[cfg(test)]
+fn activation_order_with_foreground(
+    item: &dock::DockItem,
+    foreground: Option<isize>,
+) -> Vec<isize> {
+    activation_order_with_foreground_owned(item, foreground, false)
+}
+
+fn activation_order_with_foreground_owned(
+    item: &dock::DockItem,
+    foreground: Option<isize>,
+    foreground_owned_by_item: bool,
+) -> Vec<isize> {
+    let label = item.label.trim();
+    let mut order = Vec::new();
+    let mut push = |raw: isize| {
+        if !order.contains(&raw) {
+            order.push(raw);
+        }
+    };
+
+    if let Some(raw) = foreground {
+        if foreground_owned_by_item
+            || item.hwnd == Some(raw)
+            || item.windows.iter().any(|window| window.hwnd == raw)
+        {
+            push(raw);
+        }
+    }
+    for window in &item.windows {
+        if title_equals_label(&window.title, label) {
+            push(window.hwnd);
+        }
+    }
+    for window in &item.windows {
+        if title_starts_with_label(&window.title, label) {
+            push(window.hwnd);
+        }
+    }
+    if let Some(primary) = item.hwnd {
+        push(primary);
+    }
+    for window in &item.windows {
+        push(window.hwnd);
+    }
+
+    order
+}
+
+fn title_equals_label(title: &str, label: &str) -> bool {
+    !label.is_empty() && title.trim().eq_ignore_ascii_case(label)
+}
+
+fn title_starts_with_label(title: &str, label: &str) -> bool {
+    !label.is_empty()
+        && title
+            .trim()
+            .to_ascii_lowercase()
+            .starts_with(&format!("{} ", label.to_ascii_lowercase()))
+}
+
+unsafe fn activate_item_windows(item: &dock::DockItem) -> bool {
+    let foreground = GetForegroundWindow();
+    let foreground = (!foreground.is_invalid()).then_some(foreground.0 as isize);
+    let foreground_owned =
+        foreground.is_some_and(|raw| foreground_window_belongs_to_item(item, raw));
+    for raw in activation_order_with_foreground_owned(item, foreground, foreground_owned) {
+        if windows_list::activate(raw) {
+            return true;
+        }
+    }
+    false
+}
+
+unsafe fn foreground_window_belongs_to_item(item: &dock::DockItem, raw: isize) -> bool {
+    if item.hwnd == Some(raw) || item.windows.iter().any(|window| window.hwnd == raw) {
+        return true;
+    }
+    if !windows_list::is_running_window(raw) {
+        return false;
+    }
+    let Some(exe_path) = windows_list::process_exe_path_for_window(raw) else {
+        return false;
+    };
+    if item
+        .group_key
+        .as_deref()
+        .is_some_and(|key| apps::exe_matches(&exe_path, key))
+    {
+        return true;
+    }
+    item.kind == content::ContentKind::Application
+        && item
+            .path
+            .as_deref()
+            .is_some_and(|path| apps::exe_matches(path, &exe_path))
+}
+
+unsafe fn activate_live_pinned_window(owner: HWND, app: &mut App, index: usize) -> bool {
+    let label = app.dock.items[index].label.clone();
+    let path = app.dock.items[index].path.clone();
+    let running = windows_list::enumerate_sorted();
+    let sig = running_sig(&running);
+    let Some(group) = windows_list::group_by_application(&running)
+        .into_iter()
+        .find(|group| pinned_identity_matches_group(&label, path.as_deref(), group))
+    else {
+        return false;
+    };
+
+    app.running_sig = sig;
+    apps::attach_running(&mut app.dock.items[index], &group);
+    if activate_item_windows(&app.dock.items[index]) {
+        window_preview::hide();
+    } else {
+        show_running_preview(owner, app, index);
+    }
+    app.dock.bump(index);
+    app.animating = true;
+    true
+}
+
+unsafe fn activate_live_running_window(owner: HWND, app: &mut App, index: usize) -> bool {
+    let label = app.dock.items[index].label.clone();
+    let group_key = app.dock.items[index].group_key.clone();
+    let running = windows_list::enumerate_sorted();
+    let sig = running_sig(&running);
+    let Some(group) = windows_list::group_by_application(&running)
+        .into_iter()
+        .find(|group| {
+            group_key.as_deref() == Some(group.key.as_str())
+                || apps::title_matches_label(&label, group)
+        })
+    else {
+        return false;
+    };
+
+    app.running_sig = sig;
+    app.dock.items[index] = apps::running_item(&group);
+    if activate_item_windows(&app.dock.items[index]) {
+        window_preview::hide();
+    } else {
+        show_running_preview(owner, app, index);
+    }
+    app.dock.bump(index);
+    app.animating = true;
+    true
 }
 
 unsafe fn update_running_preview(hwnd: HWND, app: &App, x: f32, y: f32) {
@@ -1154,6 +1503,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     let role = app.dock.items[i].role;
                     let item_hwnd = app.dock.items[i].hwnd;
                     let path = app.dock.items[i].path.clone();
+                    let kind = app.dock.items[i].kind;
                     match role {
                         dock::ItemRole::Start => {
                             if taskbar::reveal_for_start_invocation(app.settings.taskbar_mode) {
@@ -1177,34 +1527,43 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                             app.animating = true;
                         }
                         dock::ItemRole::Running => {
-                            if app.dock.items[i].windows.len() > 1 {
-                                show_running_preview(hwnd, app, i);
+                            if activate_item_windows(&app.dock.items[i]) {
+                                window_preview::hide();
+                                app.dock.bump(i);
+                                app.animating = true;
+                            } else if activate_live_running_window(hwnd, app, i) {
                             } else if let Some(raw) = item_hwnd {
+                                window_preview::hide();
                                 windows_list::activate(raw);
                                 app.dock.bump(i);
                                 app.animating = true;
+                            } else {
+                                show_running_preview(hwnd, app, i);
                             }
                         }
                         dock::ItemRole::Pinned => {
                             // A pinned app that's running activates its window(s) instead
                             // of launching a duplicate (macOS-style). Right-click → 打开
                             // still launches a fresh instance.
-                            let windows = app.dock.items[i].windows.len();
-                            if windows > 1 {
-                                show_running_preview(hwnd, app, i);
-                            } else if windows == 1 {
-                                if let Some(raw) = item_hwnd {
-                                    windows_list::activate(raw);
+                            if activate_item_windows(&app.dock.items[i]) {
+                                window_preview::hide();
+                                app.dock.bump(i);
+                                app.animating = true;
+                            } else if activate_live_pinned_window(hwnd, app, i) {
+                            } else if let Some(path) = path {
+                                if kind == content::ContentKind::Folder {
+                                    let (acx, atop) = anchor_above(hwnd, app, i);
+                                    folder_stack::show(hwnd, &path, acx, atop);
                                     app.dock.bump(i);
                                     app.animating = true;
-                                }
-                            } else if let Some(path) = path {
-                                match open_content(&path) {
-                                    Ok(()) => {
-                                        app.dock.bump(i);
-                                        app.animating = true;
+                                } else {
+                                    match open_content(&path) {
+                                        Ok(()) => {
+                                            app.dock.bump(i);
+                                            app.animating = true;
+                                        }
+                                        Err(error) => show_error(hwnd, "打开内容失败", error),
                                     }
-                                    Err(error) => show_error(hwnd, "打开内容失败", error),
                                 }
                             }
                         }
@@ -1258,6 +1617,22 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if evt == WM_RBUTTONUP || evt == WM_LBUTTONUP {
                     run_tray_menu(hwnd, app);
                 }
+                LRESULT(0)
+            }
+            WM_HOTKEY if wparam.0 == ID_SEARCH_HOTKEY as usize => {
+                command_palette::toggle(hwnd);
+                LRESULT(0)
+            }
+            WM_SHOW_EXISTING => {
+                if app.window_hidden {
+                    set_window_hidden(hwnd, app, false);
+                }
+                if let Err(error) = set_expanded(hwnd, app, true) {
+                    show_error(hwnd, "Show existing FeatherDock failed", error);
+                }
+                app.dock.reveal_target = 1.0;
+                app.animating = true;
+                raise_dock_topmost(hwnd);
                 LRESULT(0)
             }
             WM_DROPFILES => {
@@ -1374,6 +1749,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 // state. If it switched us to hidden, defeat the auto-hide entry slide
                 // and grow maximized windows into the freed work area.
                 app.settings = settings::load();
+                app.dock.theme = app.settings.theme;
                 if app.settings.taskbar_mode == settings::TaskbarMode::Hidden
                     && app.taskbar_invoked_at.is_none()
                 {
@@ -1382,8 +1758,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 // Re-assert the desktop-icon visibility to match the (possibly toggled)
                 // setting — idempotent, in case the settings window didn't apply it.
                 desktop_icons::set_hidden(app.settings.hide_desktop_icons);
-                // Switching into a taskbar-modifying mode at runtime arms the watchdog.
-                ensure_watchdog(app);
+                // Settings can change which system effects need abnormal-exit recovery.
+                reconcile_watchdog(app);
                 let target = if app.dock.cursor_x.is_some() {
                     1.0
                 } else {
@@ -1393,8 +1769,24 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 app.animating = true;
                 LRESULT(0)
             }
+            window_preview::WM_PREVIEW_CLOSED => {
+                // The hover preview was dismissed by the user. The dock's own WM_MOUSELEAVE
+                // already fired (and kept it revealed) when the cursor crossed onto the
+                // preview; now that the preview is gone and the cursor isn't back on the
+                // dock, ease to the resting state so an auto-hide dock actually retracts.
+                if app.dock.cursor_x.is_none() {
+                    app.dock.reveal_target = resting_target(app);
+                    app.animating = true;
+                }
+                LRESULT(0)
+            }
             settings_window::WM_PINS_CHANGED => {
-                // Pinned apps changed in the settings window — rebuild the dock.
+                // Pinned apps (or the drawer-button toggle) changed in the settings window.
+                // Re-read settings FIRST so `compose_items` sees the current
+                // `drawer_enabled` (this path doesn't go through WM_SETTINGS_CHANGED), then
+                // rebuild the dock.
+                app.settings = settings::load();
+                app.dock.theme = app.settings.theme;
                 if let Err(error) = reload_app(hwnd, app) {
                     show_error(hwnd, "刷新常驻应用失败", error);
                 }
@@ -1428,10 +1820,172 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_DESTROY => {
+                let _ = UnregisterHotKey(hwnd, ID_SEARCH_HOTKEY);
                 PostQuitMessage(0);
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn running_ref(hwnd: isize, title: &str) -> dock::RunningWindowRef {
+        dock::RunningWindowRef {
+            hwnd,
+            title: title.to_string(),
+        }
+    }
+
+    fn item_with_windows(label: &str, windows: Vec<dock::RunningWindowRef>) -> dock::DockItem {
+        dock::DockItem {
+            label: label.to_string(),
+            glyph: "",
+            color: (0.0, 0.0, 0.0),
+            path: None,
+            icon: None,
+            kind: content::ContentKind::Application,
+            role: dock::ItemRole::Running,
+            hwnd: windows.first().map(|window| window.hwnd),
+            group_key: None,
+            windows,
+        }
+    }
+
+    fn pinned_item(label: &str, path: &str) -> dock::DockItem {
+        dock::DockItem {
+            label: label.to_string(),
+            glyph: "",
+            color: (0.0, 0.0, 0.0),
+            path: Some(path.to_string()),
+            icon: None,
+            kind: content::ContentKind::Application,
+            role: dock::ItemRole::Pinned,
+            hwnd: None,
+            group_key: None,
+            windows: Vec::new(),
+        }
+    }
+
+    fn running_group(
+        key: &str,
+        label: &str,
+        windows: Vec<windows_list::RunningWindow>,
+    ) -> windows_list::RunningGroup {
+        windows_list::RunningGroup {
+            key: key.to_string(),
+            label: label.to_string(),
+            icon_path: Some(key.to_string()),
+            windows,
+        }
+    }
+
+    fn running_window(hwnd: isize, title: &str, exe_path: &str) -> windows_list::RunningWindow {
+        windows_list::RunningWindow {
+            hwnd,
+            title: title.to_string(),
+            exe_path: Some(exe_path.to_string()),
+        }
+    }
+
+    #[test]
+    fn running_signature_changes_when_window_title_changes() {
+        let before = vec![running_window(
+            42,
+            "Loading",
+            r"C:\Program Files\WeGame\browser.exe",
+        )];
+        let after = vec![running_window(
+            42,
+            "WeGame",
+            r"C:\Program Files\WeGame\browser.exe",
+        )];
+
+        assert_ne!(running_sig(&before), running_sig(&after));
+    }
+
+    #[test]
+    fn pinned_launcher_matches_helper_window_by_exact_title() {
+        let item = pinned_item("WeGame", r"C:\Program Files\WeGame\wegame.exe");
+        let group = running_group(
+            r"c:\program files\wegame\browser.exe",
+            "Browser",
+            vec![running_window(
+                42,
+                "WeGame",
+                r"C:\Program Files\WeGame\browser.exe",
+            )],
+        );
+
+        assert!(pinned_matches_group(&item, &group));
+    }
+
+    #[test]
+    fn pinned_identity_match_ignores_stale_cached_windows() {
+        let group = running_group(
+            r"c:\program files\wegame\browser.exe",
+            "Browser",
+            vec![running_window(
+                42,
+                "WeGame",
+                r"C:\Program Files\WeGame\browser.exe",
+            )],
+        );
+
+        assert!(pinned_identity_matches_group(
+            "WeGame",
+            Some(r"C:\Program Files\WeGame\wegame.exe"),
+            &group
+        ));
+    }
+
+    #[test]
+    fn activation_prefers_the_window_whose_title_matches_the_app_label() {
+        let item = item_with_windows(
+            "WeGame",
+            vec![
+                running_ref(10, "WeGame Helper"),
+                running_ref(20, "WeGame"),
+                running_ref(30, "Settings"),
+            ],
+        );
+
+        assert_eq!(activation_target(&item), Some(20));
+    }
+
+    #[test]
+    fn activation_falls_back_to_the_primary_running_window() {
+        let item = item_with_windows(
+            "Explorer",
+            vec![running_ref(10, "Downloads"), running_ref(20, "Desktop")],
+        );
+
+        assert_eq!(activation_target(&item), Some(10));
+    }
+
+    #[test]
+    fn activation_prefers_foreground_window_in_same_running_group() {
+        let item = item_with_windows(
+            "Browser",
+            vec![running_ref(10, "Docs"), running_ref(20, "Mail")],
+        );
+
+        assert_eq!(activation_order_with_foreground(&item, Some(20))[0], 20);
+    }
+
+    #[test]
+    fn activation_prefers_live_foreground_window_owned_by_same_app() {
+        let item = item_with_windows(
+            "Explorer",
+            vec![running_ref(10, "Downloads"), running_ref(20, "Desktop")],
+        );
+
+        assert_eq!(
+            activation_order_with_foreground_owned(&item, Some(99), true)[0],
+            99
+        );
     }
 }

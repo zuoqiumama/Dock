@@ -4,6 +4,7 @@
 use std::time::Instant;
 
 use crate::content::ContentKind;
+use crate::theme::ThemePreset;
 
 // All sizes are LOGICAL pixels @96dpi; multiply by `dpi` for device pixels.
 pub const BASE_ICON: f32 = 50.0;
@@ -154,6 +155,7 @@ pub struct Dock {
     pub cursor_x: Option<f32>,
     pub reveal: f32,        // 0 = fully hidden (slid down), 1 = fully shown
     pub reveal_target: f32, // where reveal is easing toward
+    pub theme: ThemePreset,
     pub dpi: f32,
     pub win_w: f32,
     pub win_h: f32,
@@ -177,7 +179,7 @@ pub fn window_size(items: &[DockItem], dpi: f32) -> (u32, u32) {
 }
 
 impl Dock {
-    pub fn new(items: Vec<DockItem>, dpi: f32, win_w: f32, win_h: f32) -> Dock {
+    pub fn new(items: Vec<DockItem>, dpi: f32, win_w: f32, win_h: f32, theme: ThemePreset) -> Dock {
         let n = items.len();
         Dock {
             items,
@@ -188,6 +190,7 @@ impl Dock {
             // fullscreen state (always-resident vs. auto-hide vs. fullscreen retract).
             reveal: 1.0,
             reveal_target: 1.0,
+            theme,
             dpi,
             win_w,
             win_h,
@@ -274,12 +277,12 @@ impl Dock {
             widths.iter().sum::<f32>() + (1..n).map(|i| gap * self.slots[i].presence).sum::<f32>();
         let mut x = (self.win_w - row) / 2.0;
         let mut centers = Vec::with_capacity(n);
-        for i in 0..n {
+        for (i, &w) in widths.iter().enumerate() {
             if i > 0 {
                 x += gap * self.slots[i].presence;
             }
-            centers.push(x + widths[i] / 2.0);
-            x += widths[i];
+            centers.push(x + w / 2.0);
+            x += w;
         }
         centers
     }
@@ -309,6 +312,9 @@ impl Dock {
         let alpha = 1.0 - (-dt / EASE_TAU).exp(); // frame-rate independent
         let rc = self.rest_centers();
         let mut moving = false;
+        // Range loop: the body mutates `self.slots[i]` while also calling `self.target`
+        // (an `&self` method), so an iterator over `slots` can't co-exist with it.
+        #[allow(clippy::needless_range_loop)]
         for i in 0..self.items.len() {
             // Dividers never magnify; everything else follows the cursor bell.
             let tg = if self.items[i].role == ItemRole::Divider {
@@ -373,11 +379,10 @@ impl Dock {
         let shown_baseline = self.win_h - (PILL_PAD_Y + SHOWN_GAP) * self.dpi;
         let baseline = shown_baseline + (1.0 - self.reveal) * self.hide_slide();
         let mut icons = Vec::with_capacity(n);
-        for i in 0..n {
+        for (i, &w) in widths.iter().enumerate() {
             if i > 0 {
                 x += gap * self.slots[i].presence;
             }
-            let w = widths[i];
             // single smooth hop: 0 at phase 1 -> peak at 0.5 -> 0 at phase 0
             let bounce_y = (self.slots[i].bounce * std::f32::consts::PI).sin() * BOUNCE_AMP * base;
             icons.push(IconFrame {
@@ -549,7 +554,7 @@ mod tests {
     use super::*;
 
     fn dock() -> Dock {
-        Dock::new(Vec::new(), 1.0, 400.0, 140.0)
+        Dock::new(Vec::new(), 1.0, 400.0, 140.0, ThemePreset::Glass)
     }
 
     fn item(role: ItemRole, hwnd: Option<isize>, path: Option<&str>) -> DockItem {
@@ -590,7 +595,7 @@ mod tests {
 
     fn seeded(items: Vec<DockItem>) -> Dock {
         // Start with the items already present (presence == 1), like a fresh launch.
-        Dock::new(items, 1.0, 1200.0, 140.0)
+        Dock::new(items, 1.0, 1200.0, 140.0, ThemePreset::Glass)
     }
 
     #[test]

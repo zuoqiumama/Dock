@@ -82,7 +82,6 @@ pub struct Battery {
 
 const BATTERY_FLAG_NO_BATTERY: u8 = 128;
 const AC_LINE_ONLINE: u8 = 1;
-
 pub fn battery() -> Battery {
     unsafe {
         let mut status = SYSTEM_POWER_STATUS::default();

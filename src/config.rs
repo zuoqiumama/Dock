@@ -1,16 +1,11 @@
 //! Tiny zero-dependency config: a list of `[[item]]` tables. Not full TOML — just
 //! the subset we need (item tables with quoted-string values + comments).
 
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
-use std::os::windows::ffi::OsStrExt;
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
-use windows::core::PCWSTR;
-use windows::Win32::Storage::FileSystem::{
-    MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-};
-
+use crate::atomic;
 use crate::dock::DockItem;
 
 #[derive(Default)]
@@ -90,7 +85,7 @@ fn add_item_at(path: &Path, label: &str, item_path_value: &Path) -> io::Result<b
         quote(label),
         quote(&item_path_value.to_string_lossy())
     ));
-    atomic_write(path, content.as_bytes())?;
+    atomic::write(path, content.as_bytes())?;
     Ok(true)
 }
 
@@ -99,55 +94,8 @@ fn migrate_legacy(legacy: &Path, target: &Path) -> io::Result<bool> {
         return Ok(false);
     }
     let bytes = fs::read(legacy)?;
-    atomic_write(target, &bytes)?;
+    atomic::write(target, &bytes)?;
     Ok(true)
-}
-
-fn wide_path(path: &Path) -> Vec<u16> {
-    path.as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect()
-}
-
-fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "config has no parent"))?;
-    fs::create_dir_all(parent)?;
-
-    let temp = parent.join(format!(
-        ".featherdock-{}-{}.tmp",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    ));
-    let mut file = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(&temp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-
-    let from = wide_path(&temp);
-    let to = wide_path(path);
-    let result = unsafe {
-        MoveFileExW(
-            PCWSTR(from.as_ptr()),
-            PCWSTR(to.as_ptr()),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if let Err(error) = result {
-        let _ = fs::remove_file(&temp);
-        return Err(io::Error::new(io::ErrorKind::Other, error.to_string()));
-    }
-    let _ = File::open(parent).and_then(|dir| dir.sync_all());
-    Ok(())
 }
 
 /// Read the config if it exists. `None` means "no config — use built-in defaults".
@@ -172,7 +120,7 @@ pub fn write_default(items: &[DockItem]) -> io::Result<()> {
         s.push_str(&format!("label = \"{}\"\n", quote(&it.label)));
         s.push_str(&format!("path = \"{}\"\n", quote(path)));
     }
-    atomic_write(&config_path(), s.as_bytes())
+    atomic::write(&config_path(), s.as_bytes())
 }
 
 /// Remove the item whose launch path matches `item_path_value` (case-insensitive),
@@ -197,26 +145,63 @@ fn remove_item_at(path: &Path, item_path_value: &str) -> io::Result<bool> {
             removed = true;
             continue;
         }
-        kept.push_str("\n[[item]]\n");
-        if let Some(label) = &spec.label {
-            kept.push_str(&format!("label = \"{}\"\n", quote(label)));
-        }
-        if let Some(value) = &spec.path {
-            kept.push_str(&format!("path = \"{}\"\n", quote(value)));
-        } else if let Some(value) = &spec.exe {
-            kept.push_str(&format!("exe = \"{}\"\n", quote(value)));
-        }
-        if let Some(value) = &spec.app {
-            kept.push_str(&format!("app = \"{}\"\n", quote(value)));
-        }
-        if let Some(value) = &spec.icon {
-            kept.push_str(&format!("icon = \"{}\"\n", quote(value)));
-        }
+        write_spec(&mut kept, spec);
     }
     if removed {
-        atomic_write(path, kept.as_bytes())?;
+        atomic::write(path, kept.as_bytes())?;
     }
     Ok(removed)
+}
+
+/// Remove the `index`-th `[[item]]` (0-based, in file order), rewriting the config
+/// without it. Removing by position — rather than by launch path — is what lets the
+/// settings UI delete an entry written as `app = "chrome.exe"`, whose stored spec carries
+/// no `path`/`exe` for a path match to hit. Out-of-range index is a no-op.
+pub fn remove_item_at_index(index: usize) -> io::Result<bool> {
+    remove_item_at_index_in(&config_path(), index)
+}
+
+fn remove_item_at_index_in(path: &Path, index: usize) -> io::Result<bool> {
+    let content = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let config = parse(&content);
+    if index >= config.items.len() {
+        return Ok(false);
+    }
+    let mut kept = String::from(HEADER);
+    for spec in config
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != index)
+        .map(|(_, spec)| spec)
+    {
+        write_spec(&mut kept, spec);
+    }
+    atomic::write(path, kept.as_bytes())?;
+    Ok(true)
+}
+
+/// Serialize one `[[item]]` table the way the rewrite paths expect.
+fn write_spec(out: &mut String, spec: &ItemSpec) {
+    out.push_str("\n[[item]]\n");
+    if let Some(label) = &spec.label {
+        out.push_str(&format!("label = \"{}\"\n", quote(label)));
+    }
+    if let Some(value) = &spec.path {
+        out.push_str(&format!("path = \"{}\"\n", quote(value)));
+    } else if let Some(value) = &spec.exe {
+        out.push_str(&format!("exe = \"{}\"\n", quote(value)));
+    }
+    if let Some(value) = &spec.app {
+        out.push_str(&format!("app = \"{}\"\n", quote(value)));
+    }
+    if let Some(value) = &spec.icon {
+        out.push_str(&format!("icon = \"{}\"\n", quote(value)));
+    }
 }
 
 /// Append a new `[[item]]` to the config file (creating it with a header if needed).
@@ -425,6 +410,32 @@ path = "C:\\Tools\\app.exe"
         );
         // Removing something absent is a no-op.
         assert!(!remove_item_at(&config, &a.to_string_lossy()).unwrap());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn remove_item_at_index_drops_app_entry_with_no_path() {
+        let dir = temp_dir("remove-index");
+        fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("featherdock.toml");
+        // The first item is `app = "chrome.exe"` form (no path/exe) — the case that the
+        // path-matching remove_item could never delete.
+        fs::write(
+            &config,
+            "[[item]]\nlabel = \"Chrome\"\napp = \"chrome.exe\"\n\n[[item]]\nlabel = \"B\"\npath = \"C:\\\\B.exe\"\n",
+        )
+        .unwrap();
+        assert_eq!(parse(&fs::read_to_string(&config).unwrap()).items.len(), 2);
+
+        assert!(remove_item_at_index_in(&config, 0).unwrap());
+        let remaining = parse(&fs::read_to_string(&config).unwrap());
+        assert_eq!(remaining.items.len(), 1);
+        assert_eq!(remaining.items[0].label.as_deref(), Some("B"));
+        assert_eq!(remaining.items[0].path.as_deref(), Some(r"C:\B.exe"));
+
+        // Out-of-range index is a no-op.
+        assert!(!remove_item_at_index_in(&config, 5).unwrap());
+        assert_eq!(parse(&fs::read_to_string(&config).unwrap()).items.len(), 1);
         fs::remove_dir_all(&dir).unwrap();
     }
 

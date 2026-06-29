@@ -123,6 +123,19 @@ pub fn exe_matches(pinned_path: &str, group_key: &str) -> bool {
     }
 }
 
+/// Some launchers expose their real UI from a helper process whose executable does not
+/// match the pinned launcher path. If the top-level window title is exactly the pinned
+/// app label, merge that helper window into the pinned icon instead of treating it as an
+/// unrelated running app.
+pub fn title_matches_label(label: &str, group: &crate::windows_list::RunningGroup) -> bool {
+    let label = label.trim();
+    !label.is_empty()
+        && group
+            .windows
+            .iter()
+            .any(|window| window.title.trim().eq_ignore_ascii_case(label))
+}
+
 /// Merge a running app's open windows into its pinned dock icon, so the pinned slot
 /// shows a running indicator and (on click) activates the window instead of launching
 /// a duplicate — the macOS behaviour. The icon/path stay the pinned item's own.
@@ -206,17 +219,24 @@ fn item(
     }
 }
 
+/// Resolve a config item's launch path the same way the dock does: an explicit `path`,
+/// then legacy `exe`, then an `app` name looked up via Windows "App Paths". `None` means
+/// the entry launches nothing (e.g. icon-only). Shared with the settings UI so a row's
+/// identity matches whether it was written as `path` or `app`.
+pub fn resolve_launch_path(spec: &crate::config::ItemSpec) -> Option<String> {
+    spec.path
+        .clone()
+        .or_else(|| spec.exe.clone())
+        .or_else(|| spec.app.as_deref().and_then(|a| unsafe { reg_app_path(a) }))
+}
+
 /// Build the dock from a user config: each item resolves `exe` directly or `app`
 /// via "App Paths". Empty/unresolvable entries are skipped.
 pub fn from_config(specs: &[crate::config::ItemSpec]) -> Vec<DockItem> {
     specs
         .iter()
         .filter_map(|s| {
-            let path = s
-                .path
-                .clone()
-                .or_else(|| s.exe.clone())
-                .or_else(|| s.app.as_deref().and_then(|a| unsafe { reg_app_path(a) }));
+            let path = resolve_launch_path(s);
             if path.is_none() && s.icon.is_none() {
                 return None; // nothing to show or launch
             }
@@ -244,26 +264,6 @@ pub fn from_config(specs: &[crate::config::ItemSpec]) -> Vec<DockItem> {
             })
         })
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::ItemSpec;
-
-    #[test]
-    fn builds_image_item_from_path_field() {
-        let specs = vec![ItemSpec {
-            label: Some("Photo".to_string()),
-            path: Some(r"C:\Pictures\photo.png".to_string()),
-            ..Default::default()
-        }];
-
-        let items = from_config(&specs);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].path.as_deref(), Some(r"C:\Pictures\photo.png"));
-        assert_eq!(items[0].kind, ContentKind::Image);
-    }
 }
 
 fn label_from(exe: Option<&str>) -> String {
@@ -319,7 +319,7 @@ fn find_claude() -> Option<String> {
                     .metadata()
                     .and_then(|m| m.modified())
                     .unwrap_or(std::time::UNIX_EPOCH);
-                if best.as_ref().map_or(true, |(bt, _)| mt > *bt) {
+                if best.as_ref().is_none_or(|(bt, _)| mt > *bt) {
                     best = Some((mt, exe.to_string_lossy().into_owned()));
                 }
             }
@@ -372,4 +372,42 @@ unsafe fn reg_default_sz(hive: HKEY, subkey: &str) -> Option<String> {
     }
     let s: Vec<u16> = buf.into_iter().take_while(|&c| c != 0).collect();
     Some(String::from_utf16_lossy(&s))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ItemSpec;
+
+    #[test]
+    fn builds_image_item_from_path_field() {
+        let specs = vec![ItemSpec {
+            label: Some("Photo".to_string()),
+            path: Some(r"C:\Pictures\photo.png".to_string()),
+            ..Default::default()
+        }];
+
+        let items = from_config(&specs);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].path.as_deref(), Some(r"C:\Pictures\photo.png"));
+        assert_eq!(items[0].kind, ContentKind::Image);
+    }
+
+    #[test]
+    fn launcher_helper_window_can_match_pinned_label_by_title() {
+        let group = crate::windows_list::RunningGroup {
+            key: r"c:\program files\wegame\browser.exe".to_string(),
+            label: "Browser".to_string(),
+            icon_path: Some(r"C:\Program Files\WeGame\browser.exe".to_string()),
+            windows: vec![crate::windows_list::RunningWindow {
+                hwnd: 42,
+                title: "WeGame".to_string(),
+                exe_path: Some(r"C:\Program Files\WeGame\browser.exe".to_string()),
+            }],
+        };
+
+        assert!(title_matches_label("WeGame", &group));
+        assert!(!title_matches_label("Game", &group));
+        assert!(!title_matches_label("", &group));
+    }
 }

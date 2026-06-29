@@ -22,7 +22,7 @@
 
 FeatherDock 是一个 Windows 上的 Dock，用 Rust 直接写在系统原生图形栈上（DirectComposition + Direct2D + D3D11），不用 Electron 或 WebView，也没有常驻的后台扫描进程。可执行文件六百多 KB，放着不动的时候几乎不占 CPU。
 
-常用的功能都在：图标悬停放大，正在运行的窗口按程序归组、图标下标一个小圆点，悬停能看实时缩略图。另外有一个把桌面程序分类整理的程序抽屉，和一个管音量、网络、时间的控制中心。
+常用的功能都在：图标悬停放大，正在运行的窗口按程序归组、图标下标一个小圆点，悬停能看实时缩略图。文件夹固定项可按需展开成 Stack 菜单，`Ctrl+Alt+Space` 可打开轻量命令面板。另外有一个把桌面程序分类整理的程序抽屉，和一个管音量、网络、时间的控制中心。
 
 ## 截图
 
@@ -53,7 +53,11 @@ FeatherDock 是一个 Windows 上的 Dock，用 Rust 直接写在系统原生图
 - 系统入口：程序抽屉保留 `此电脑`、`回收站`、`控制面板`
 - 低资源策略：抽屉扫描结果写入缓存，按 TTL 和桌面签名失效；没有后台文件扫描器
 - 窗口体验：运行窗口按应用分组，悬停时按需创建 DWM 缩略图预览
-- 控制中心：从 Dock 打开任务栏模式、桌面图标、窗口预览等常用开关
+- 文件夹 Stack：点击固定到 Dock 的文件夹时按需读取目录，并显示轻量打开菜单
+- 命令面板：`Ctrl+Alt+Space` 搜索固定项、运行窗口和桌面程序
+- 控制中心：主音量滑块，一键跳到网络 / 蓝牙 / 输入法，外加电量与时钟
+- 主题预设：玻璃、紧凑、纯色、macOS、高对比五种预设，不引入重型皮肤系统
+- 设置窗口：系统任务栏模式、Dock 显示模式、主题预设、全屏 / 最大化时收起、开机自启、常驻应用管理
 - 桌面模式：可隐藏 Windows 桌面图标，把桌面程序交给抽屉管理
 - 单文件发布：`build.ps1` 产出仓库根目录的 `FeatherDock.exe`
 
@@ -76,8 +80,10 @@ Dock 常用交互：
 - 悬停图标会放大，点击固定项目会启动或激活它。
 - 点击运行窗口项目会激活对应窗口；同一应用的多个窗口会归为一组。
 - 悬停运行窗口可显示 DWM 缩略图预览。
+- 点击文件夹固定项会展开 Stack 菜单；菜单打开时才读取该目录。
+- 按 `Ctrl+Alt+Space` 打开命令面板，搜索固定项、运行窗口和桌面程序。
 - 左侧 Start 按钮打开 Windows 开始菜单，右侧 Control 按钮打开 FeatherDock 控制中心。
-- 托盘菜单和设置窗口可切换常驻 / 自动隐藏、任务栏显示策略、桌面图标隐藏和抽屉按钮。
+- Windows 右下角通知区域里的 FeatherDock 小图标右键菜单，以及设置窗口，都可切换常驻 / 自动隐藏、任务栏显示策略、主题预设、桌面图标隐藏和抽屉按钮。
 
 程序抽屉：
 
@@ -90,7 +96,7 @@ Dock 常用交互：
 添加 Dock 固定项：
 
 - 从 Explorer 拖入应用、快捷方式、文件、文件夹或图片。
-- 在托盘菜单中选择 `添加文件或应用...` 或 `添加文件夹...`。
+- 在 Windows 右下角 FeatherDock 小图标的右键菜单中选择 `添加文件或应用...` 或 `添加文件夹...`。
 - 从程序抽屉右键程序，选择 `固定到 Dock`。
 
 ## Configuration
@@ -136,6 +142,7 @@ Dock 行为设置：
 - `hide_on_maximized = true | false`
 - `drawer_enabled = true | false`
 - `hide_desktop_icons = true | false`
+- `theme = "glass" | "compact" | "solid" | "macos" | "contrast"`
 
 程序抽屉自定义：
 
@@ -144,6 +151,22 @@ Dock 行为设置：
 ```
 
 `drawer.toml` 保存用户分类和被移除的抽屉项目；移除只影响抽屉显示，不删除真实快捷方式或应用。
+
+## Run / Quit Safely
+
+正常退出请使用托盘菜单“退出 FeatherDock”，或从命令行请求主窗口优雅关闭：
+
+```powershell
+.\FeatherDock.exe --quit
+```
+
+如果曾经按进程名强制结束过 `FeatherDock.exe`，主进程和 watchdog 可能会被同时杀掉。此时可运行一次恢复命令，让 FeatherDock 根据 guard 文件恢复任务栏，并重新显示桌面图标：
+
+```powershell
+.\FeatherDock.exe --restore-system
+```
+
+不要用 `Stop-Process -Name FeatherDock` / `taskkill /IM FeatherDock.exe` 作为常规关闭方式；watchdog 是同一个 exe 的守护模式，按镜像名强杀会把守护进程一起结束。
 
 ## Build From Source
 
@@ -183,6 +206,9 @@ cargo build --release
 | `src/render.rs` | Direct2D 绘制圆角底座、图标、Start / Control / Drawer glyph |
 | `src/graphics.rs` | D3D11、DXGI、Direct2D、DirectComposition、图标 bitmap |
 | `src/apps.rs` | 内置按钮、默认应用、运行窗口和固定项合并 |
+| `src/command_palette.rs` | `Ctrl+Alt+Space` 命令面板和按需入口搜索 |
+| `src/folder_stack.rs` | 文件夹固定项的按需 Stack 菜单 |
+| `src/theme.rs` | 轻量主题预设和渲染颜色参数 |
 | `src/drawer.rs` | 程序抽屉窗口、开合动画、右键菜单、拖拽分类 |
 | `src/drawer_layout.rs` | 抽屉分类布局、命中测试和 drop target 计算 |
 | `src/drawer_input.rs` | 分类名称输入弹窗 |
@@ -195,7 +221,7 @@ cargo build --release
 | `src/window_preview.rs` | DWM 窗口缩略图预览 |
 | `src/windows_list.rs` | WinEvent 驱动的运行窗口分组 |
 | `src/desktop_icons.rs` | Windows 桌面图标显示/隐藏 |
-| `src/watchdog.rs` | 进程异常退出后的任务栏恢复守护 |
+| `src/watchdog.rs` | 进程异常退出后的任务栏和桌面图标恢复守护 |
 | `src/icons.rs` | WIC 图片缩略图、Shell 图标和 PIDL 图标提取 |
 | `assets/` | 应用图标和 Windows resource 资源 |
 | `docs/images/` | README 截图 |

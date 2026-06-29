@@ -8,9 +8,9 @@
 
         <repo-root>\FeatherDock.exe
 
-    Everything under target\ is disposable build cache. After a successful build
-    this script copies the fresh binary to the repo root and then DELETES every
-    other featherdock executable (the in-target release copy, the hashed
+    Everything under the Cargo target directory is disposable build cache. After
+    a successful build this script copies the fresh binary to the repo root and
+    then DELETES every other featherdock executable (the in-target release copy, the hashed
     deps\featherdock-<hash>.exe copies, any stale debug copy, and the legacy
     release\ folder). So you never again have to guess which .exe is current.
 
@@ -22,17 +22,24 @@
 .PARAMETER Run
     Launch FeatherDock.exe after a successful build.
 
+.PARAMETER Verify
+    Run the full pre-release gate BEFORE building: cargo fmt --check, clippy
+    (-D warnings), and the test suite. Any failure aborts before the release build.
+
 .EXAMPLE
     .\build.ps1
 .EXAMPLE
     .\build.ps1 -Run
 .EXAMPLE
     .\build.ps1 -Clean -Run
+.EXAMPLE
+    .\build.ps1 -Verify
 #>
 [CmdletBinding()]
 param(
     [switch]$Clean,
-    [switch]$Run
+    [switch]$Run,
+    [switch]$Verify
 )
 
 $ErrorActionPreference = 'Stop'
@@ -41,7 +48,15 @@ Set-Location -LiteralPath $root
 
 # The single canonical executable. This is the only exe you should ever launch.
 $FinalExe   = Join-Path $root 'FeatherDock.exe'
-$TargetDir  = Join-Path $root 'target'
+$TargetDir = if ($env:CARGO_TARGET_DIR) {
+    if ([System.IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) {
+        [System.IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
+    } else {
+        [System.IO.Path]::GetFullPath((Join-Path $root $env:CARGO_TARGET_DIR))
+    }
+} else {
+    Join-Path $root 'target'
+}
 $LegacyDir  = Join-Path $root 'release'
 
 function Remove-StrayExes {
@@ -63,9 +78,25 @@ if ($Clean) {
     if ($LASTEXITCODE -ne 0) { throw "cargo clean failed (exit $LASTEXITCODE)" }
 }
 
+if ($Verify) {
+    Write-Host '==> Verify: cargo fmt --check' -ForegroundColor Cyan
+    cargo fmt --all -- --check
+    if ($LASTEXITCODE -ne 0) { throw "cargo fmt --check failed (exit $LASTEXITCODE)" }
+
+    Write-Host '==> Verify: cargo clippy --all-targets -- -D warnings' -ForegroundColor Cyan
+    cargo clippy --all-targets -- -D warnings
+    if ($LASTEXITCODE -ne 0) { throw "cargo clippy failed (exit $LASTEXITCODE)" }
+
+    Write-Host '==> Verify: cargo test' -ForegroundColor Cyan
+    cargo test
+    if ($LASTEXITCODE -ne 0) { throw "cargo test failed (exit $LASTEXITCODE)" }
+
+    Write-Host '   Verify passed; proceeding to release build.' -ForegroundColor Green
+}
+
 # Keep local build paths out of the shipped binary. Dependency panic-location
 # strings would otherwise embed absolute paths like
-# C:\Users\<name>\.cargo\registry\... — leaking the Windows username into the
+# C:\Users\<name>\.cargo\registry\..., leaking the Windows username into the
 # distributed exe (`strip` removes symbols but not these rodata strings). We
 # remap the home and cargo-registry prefixes to neutral names. The prefixes are
 # read from the environment, so no username is ever hardcoded in this repo.
