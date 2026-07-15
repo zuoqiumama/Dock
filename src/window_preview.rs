@@ -4,15 +4,15 @@ use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::{
-    DwmQueryThumbnailSourceSize, DwmRegisterThumbnail, DwmUnregisterThumbnail,
-    DwmUpdateThumbnailProperties, DWM_THUMBNAIL_PROPERTIES, DWM_TNP_OPACITY,
-    DWM_TNP_RECTDESTINATION, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
+    DwmGetWindowAttribute, DwmQueryThumbnailSourceSize, DwmRegisterThumbnail,
+    DwmUnregisterThumbnail, DwmUpdateThumbnailProperties, DWMWA_CLOAKED, DWM_THUMBNAIL_PROPERTIES,
+    DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
 };
 use windows::Win32::Graphics::Gdi::{
     BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse,
     EndPaint, FillRect, GetMonitorInfoW, GetStockObject, InvalidateRect, LineTo, MonitorFromPoint,
-    MoveToEx, PtInRect, SelectObject, SetBkMode, SetTextColor, UpdateWindow, DT_END_ELLIPSIS,
-    DT_LEFT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO,
+    MoveToEx, PtInRect, SelectObject, SetBkMode, SetTextColor, UpdateWindow, DT_CENTER,
+    DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO,
     MONITOR_DEFAULTTONEAREST, NULL_PEN, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -62,6 +62,7 @@ struct PreviewState {
     windows: Vec<RunningWindowRef>,
     layout: PreviewLayout,
     thumbnails: Vec<isize>,
+    visuals: Vec<PreviewVisual>,
     font: HFONT,
     bg: HBRUSH,
     card: HBRUSH,
@@ -72,6 +73,25 @@ struct PreviewState {
     dpi: f32,
     anchor_x: i32, // dock-icon center the preview is anchored above (for in-place rebuild)
     anchor_y: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreviewVisual {
+    LiveThumbnail,
+    IconFallback,
+}
+
+const fn preview_visual(
+    is_window: bool,
+    is_visible: bool,
+    is_iconic: bool,
+    is_cloaked: bool,
+) -> PreviewVisual {
+    if is_window && is_visible && !is_iconic && !is_cloaked {
+        PreviewVisual::LiveThumbnail
+    } else {
+        PreviewVisual::IconFallback
+    }
 }
 
 fn scaled(value: i32, dpi: f32) -> i32 {
@@ -297,6 +317,7 @@ pub unsafe fn show(
         windows: windows.to_vec(),
         layout,
         thumbnails: Vec::new(),
+        visuals: Vec::new(),
         font,
         bg: CreateSolidBrush(rgb(24, 24, 28)),
         card: CreateSolidBrush(rgb(38, 38, 44)),
@@ -353,10 +374,17 @@ pub unsafe fn contains_cursor() -> bool {
 
 unsafe fn register_thumbnails(hwnd: HWND, state: &mut PreviewState) {
     // Only the visible (capped) cells get a live thumbnail.
+    state.visuals = vec![PreviewVisual::IconFallback; state.layout.items.len()];
     for index in 0..state.layout.items.len() {
         let window = &state.windows[index];
         let source = HWND(window.hwnd as *mut c_void);
-        if !IsWindow(source).as_bool() {
+        let is_window = IsWindow(source).as_bool();
+        let is_visible = is_window && IsWindowVisible(source).as_bool();
+        let is_iconic = is_window && IsIconic(source).as_bool();
+        let is_cloaked = is_window && window_is_cloaked(source);
+        if preview_visual(is_window, is_visible, is_iconic, is_cloaked)
+            != PreviewVisual::LiveThumbnail
+        {
             continue;
         }
         let Ok(thumbnail) = DwmRegisterThumbnail(hwnd, source) else {
@@ -377,10 +405,23 @@ unsafe fn register_thumbnails(hwnd: HWND, state: &mut PreviewState) {
         };
         if DwmUpdateThumbnailProperties(thumbnail, &props).is_ok() {
             state.thumbnails.push(thumbnail);
+            state.visuals[index] = PreviewVisual::LiveThumbnail;
         } else {
             let _ = DwmUnregisterThumbnail(thumbnail);
         }
     }
+}
+
+unsafe fn window_is_cloaked(hwnd: HWND) -> bool {
+    let mut cloaked = 0u32;
+    DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_CLOAKED,
+        (&mut cloaked as *mut u32).cast(),
+        std::mem::size_of_val(&cloaked) as u32,
+    )
+    .is_ok()
+        && cloaked != 0
 }
 
 fn fit_thumbnail_rect(bounds: RECT, source: SIZE) -> RECT {
@@ -443,6 +484,14 @@ unsafe fn paint(hwnd: HWND, state: &PreviewState) {
             state.hovered_close == Some(index),
             dpi,
         );
+        if state.visuals.get(index).copied() != Some(PreviewVisual::LiveThumbnail) {
+            draw_icon_fallback(
+                hdc,
+                state.layout.items[index],
+                HWND(window.hwnd as *mut c_void),
+                dpi,
+            );
+        }
     }
     // Overflow footer: how many windows we didn't give a card to.
     let overflow = state.windows.len().saturating_sub(state.layout.items.len());
@@ -464,6 +513,45 @@ unsafe fn paint(hwnd: HWND, state: &PreviewState) {
     }
     let _ = SelectObject(hdc, old);
     let _ = EndPaint(hwnd, &ps);
+}
+
+unsafe fn draw_icon_fallback(hdc: HDC, bounds: RECT, source: HWND, dpi: f32) {
+    let width = bounds.right - bounds.left;
+    let height = bounds.bottom - bounds.top;
+    let icon_size = scaled(56, dpi).min(width).min(height).max(16);
+    let icon_x = bounds.left + (width - icon_size) / 2;
+    let icon_y = bounds.top + (height - icon_size) / 2 - scaled(8, dpi);
+    if IsWindow(source).as_bool() {
+        if let Some(icon) = windows_list::window_icon(source) {
+            let _ = DrawIconEx(
+                hdc,
+                icon_x,
+                icon_y,
+                icon,
+                icon_size,
+                icon_size,
+                0,
+                HBRUSH::default(),
+                DI_NORMAL,
+            );
+        }
+    }
+
+    SetTextColor(hdc, rgb(166, 170, 180));
+    let mut label = wide("预览暂不可用");
+    let mut label_rect = RECT {
+        left: bounds.left + scaled(8, dpi),
+        top: icon_y + icon_size + scaled(4, dpi),
+        right: bounds.right - scaled(8, dpi),
+        bottom: bounds.bottom - scaled(4, dpi),
+    };
+    DrawTextW(
+        hdc,
+        &mut label,
+        &mut label_rect,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
+    );
+    SetTextColor(hdc, rgb(238, 238, 242));
 }
 
 /// Draw a filled red circle with a white "×" — the per-window close button.
@@ -668,5 +756,29 @@ mod tests {
         // Same grid, but the overflow variant is exactly one footer strip taller.
         assert_eq!(with_overflow.items.len(), no_overflow.items.len());
         assert_eq!(with_overflow.height - no_overflow.height, FOOTER_H);
+    }
+
+    #[test]
+    fn minimized_hidden_or_cloaked_windows_use_the_designed_fallback() {
+        assert_eq!(
+            preview_visual(true, true, false, false),
+            PreviewVisual::LiveThumbnail
+        );
+        assert_eq!(
+            preview_visual(true, true, true, false),
+            PreviewVisual::IconFallback
+        );
+        assert_eq!(
+            preview_visual(true, false, false, false),
+            PreviewVisual::IconFallback
+        );
+        assert_eq!(
+            preview_visual(true, true, false, true),
+            PreviewVisual::IconFallback
+        );
+        assert_eq!(
+            preview_visual(false, true, false, false),
+            PreviewVisual::IconFallback
+        );
     }
 }

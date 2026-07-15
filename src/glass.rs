@@ -14,6 +14,8 @@ use windows::Win32::Graphics::DirectComposition::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 
+const POPUP_PRESENT_SYNC_INTERVAL: u32 = 0;
+
 /// Owns the composition surface for one popup window. Draw between `begin()` and
 /// `present()`; both operate in device pixels (1 unit = 1px).
 pub struct Glass {
@@ -96,10 +98,13 @@ impl Glass {
         bind_target(&self.dc, &self.swapchain)
     }
 
-    /// Finish the frame: EndDraw + Present (vsync-paced).
+    /// Finish the frame without adding another vsync wait. Popup animations are paced by
+    /// the Dock's shared frame loop, whose swap chain is the single display-rate clock.
     pub unsafe fn present(&self) -> Result<()> {
         self.dc.EndDraw(None, None)?;
-        self.swapchain.Present(1, DXGI_PRESENT(0)).ok()?;
+        self.swapchain
+            .Present(POPUP_PRESENT_SYNC_INTERVAL, DXGI_PRESENT(0))
+            .ok()?;
         Ok(())
     }
 }
@@ -135,4 +140,14 @@ unsafe fn bind_target(dc: &ID2D1DeviceContext, swapchain: &IDXGISwapChain1) -> R
     let bitmap = dc.CreateBitmapFromDxgiSurface(&backbuffer, Some(&props))?;
     dc.SetTarget(&bitmap);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn popup_surfaces_do_not_add_a_second_vsync_wait() {
+        assert_eq!(POPUP_PRESENT_SYNC_INTERVAL, 0);
+    }
 }

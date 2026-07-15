@@ -45,8 +45,14 @@ use windows::Win32::Graphics::Gdi::{
     HRGN, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::Com::*;
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+use windows::Win32::System::Threading::{
+    GetCurrentProcessId, OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+    PROCESS_TERMINATE,
+};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -72,11 +78,29 @@ const TIMER_WINDOWS_MS: u32 = 180;
 const TIMER_TASKBAR_REHIDE: usize = 2;
 const TIMER_TASKBAR_REHIDE_MS: u32 = 400;
 const TASKBAR_INVOCATION_GRACE: Duration = Duration::from_secs(8);
+const ANIMATION_MESSAGE_BUDGET: usize = 4;
 const QUIT_WAIT_MS: u32 = 5_000;
 const ID_SEARCH_HOTKEY: i32 = 3001;
 const QUIT_FLAG: &str = "--quit";
 const RESTORE_SYSTEM_FLAG: &str = "--restore-system";
 const WM_SHOW_EXISTING: u32 = 0x8033;
+pub(crate) const WM_ANIMATION_WAKE: u32 = 0x8034;
+
+fn animation_message_batch_has_capacity(dispatched: usize) -> bool {
+    dispatched < ANIMATION_MESSAGE_BUDGET
+}
+
+fn animation_sources_active(dock: bool, drawer: bool, control: bool) -> bool {
+    dock || drawer || control
+}
+
+fn settled_region_should_stay_full(cursor_over_dock: bool) -> bool {
+    cursor_over_dock
+}
+
+fn dock_geometry_changed(current: (i32, i32, i32, i32), requested: (i32, i32, i32, i32)) -> bool {
+    current != requested
+}
 
 // Right-click context-menu command ids (kept clear of the tray ids in tray.rs).
 const ID_WIN_CLOSE: usize = 2001;
@@ -472,6 +496,8 @@ unsafe fn reload_with(
     let desired = compose_items(running, app.settings.drawer_enabled)?;
     let remap = app.dock.reconcile(desired);
     let (dpi, x, y, width, height) = monitor_layout(hwnd, &app.dock.items)?;
+    let requested_geometry = (x, y, width as i32, height as i32);
+    let needs_window_layout = !app.expanded || dock_geometry_changed(app.full, requested_geometry);
     app.gpu.resize(width, height)?;
     app.gpu.remap_icons(&remap, &app.dock.items);
     // Update geometry on the (preserved) dock; reveal stays put so a list change
@@ -480,12 +506,14 @@ unsafe fn reload_with(
     app.dock.win_w = width as f32;
     app.dock.win_h = height as f32;
     app.dock.reveal_target = resting_target(app);
-    app.full = (x, y, width as i32, height as i32);
+    app.full = requested_geometry;
     app.strip_h = ((6.0 * dpi).round() as i32).max(4);
     app.expanded = true;
     app.pending_relayout = true;
-    let z = dock_z_insert_after(app);
-    SetWindowPos(hwnd, z, x, y, width as i32, height as i32, SWP_NOACTIVATE)?;
+    if needs_window_layout {
+        let z = dock_z_insert_after(app);
+        SetWindowPos(hwnd, z, x, y, width as i32, height as i32, SWP_NOACTIVATE)?;
+    }
     app.gpu.render(&app.dock)?;
     app.animating = true;
     Ok(())
@@ -552,27 +580,104 @@ fn handle_control_args() -> bool {
     }
 }
 
+unsafe fn acquire_instance_or_recover_orphan() -> Result<Option<single_instance::SingleInstance>> {
+    if let Some(instance) = single_instance::SingleInstance::acquire()? {
+        return Ok(Some(instance));
+    }
+    if reveal_existing_instance() {
+        return Ok(None);
+    }
+
+    restore_stranded_system_state();
+    terminate_orphaned_instances();
+    for _ in 0..20 {
+        if let Some(instance) = single_instance::SingleInstance::acquire()? {
+            return Ok(Some(instance));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    show_orphan_recovery_failed();
+    Ok(None)
+}
+
 unsafe fn dock_window() -> HWND {
     FindWindowW(w!("FeatherDockWindow"), PCWSTR::null()).unwrap_or_default()
 }
 
-unsafe fn reveal_existing_instance() {
+unsafe fn reveal_existing_instance() -> bool {
     let hwnd = dock_window();
     if hwnd.is_invalid() {
-        restore_stranded_system_state();
-        let text: Vec<u16> = "FeatherDock is already running, but its dock window could not be found.\n\nThe taskbar and desktop icons were restored. End the remaining FeatherDock.exe process in Task Manager, then start FeatherDock again."
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let _ = MessageBoxW(
-            HWND::default(),
-            PCWSTR(text.as_ptr()),
-            w!("FeatherDock"),
-            MB_OK | MB_ICONWARNING,
-        );
-        return;
+        return false;
     }
     let _ = PostMessageW(hwnd, WM_SHOW_EXISTING, WPARAM(0), LPARAM(0));
+    true
+}
+
+unsafe fn show_orphan_recovery_failed() {
+    let text: Vec<u16> = "FeatherDock found a stale running instance without a dock window.\n\nThe taskbar and desktop icons were restored, but the stale process could not be cleared automatically. End the remaining FeatherDock.exe process in Task Manager, then start FeatherDock again."
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let _ = MessageBoxW(
+        HWND::default(),
+        PCWSTR(text.as_ptr()),
+        w!("FeatherDock"),
+        MB_OK | MB_ICONWARNING,
+    );
+}
+
+fn process_name_matches_current_exe(candidate_name: &str, current_exe: &std::path::Path) -> bool {
+    if candidate_name.is_empty() {
+        return false;
+    }
+    current_exe
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| candidate_name.eq_ignore_ascii_case(name))
+}
+
+fn process_entry_name(entry: &PROCESSENTRY32W) -> String {
+    let len = entry
+        .szExeFile
+        .iter()
+        .position(|ch| *ch == 0)
+        .unwrap_or(entry.szExeFile.len());
+    String::from_utf16_lossy(&entry.szExeFile[..len])
+}
+
+unsafe fn terminate_orphaned_instances() {
+    let Ok(current_exe) = std::env::current_exe() else {
+        return;
+    };
+    let current_pid = GetCurrentProcessId();
+    let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+        return;
+    };
+
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    if Process32FirstW(snapshot, &mut entry).is_ok() {
+        loop {
+            let pid = entry.th32ProcessID;
+            let name = process_entry_name(&entry);
+            if pid != current_pid && process_name_matches_current_exe(&name, &current_exe) {
+                if let Ok(process) =
+                    OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, BOOL(0), pid)
+                {
+                    let _ = TerminateProcess(process, 1);
+                    let _ = WaitForSingleObject(process, 2_000);
+                    let _ = CloseHandle(process);
+                }
+            }
+            if Process32NextW(snapshot, &mut entry).is_err() {
+                break;
+            }
+        }
+    }
+    let _ = CloseHandle(snapshot);
 }
 
 unsafe fn request_graceful_quit() {
@@ -605,7 +710,7 @@ unsafe fn request_graceful_quit() {
 }
 
 unsafe fn restore_stranded_system_state() {
-    taskbar::recover_if_stranded();
+    taskbar::restore_recorded_or_visible();
     desktop_icons::set_hidden(false);
 }
 
@@ -665,8 +770,7 @@ unsafe fn stop_watchdog(app: &mut App) {
 
 fn run() -> Result<()> {
     unsafe {
-        let Some(instance) = single_instance::SingleInstance::acquire()? else {
-            reveal_existing_instance();
+        let Some(instance) = acquire_instance_or_recover_orphan()? else {
             return Ok(());
         };
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -797,13 +901,17 @@ fn run() -> Result<()> {
         let mut msg = MSG::default();
         loop {
             if (*app_ptr).animating {
-                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                let mut dispatched = 0;
+                while animation_message_batch_has_capacity(dispatched)
+                    && PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool()
+                {
                     if msg.message == WM_QUIT {
                         cleanup(app_ptr);
                         return Ok(());
                     }
                     let _ = TranslateMessage(&msg);
                     DispatchMessageW(&msg);
+                    dispatched += 1;
                 }
                 if !(*app_ptr).animating {
                     continue;
@@ -824,6 +932,11 @@ fn run() -> Result<()> {
                 if !removed.is_empty() {
                     (*app_ptr).gpu.drop_icons(&removed);
                 }
+                // Popup surfaces submit without their own vsync wait. The Dock's swapchain
+                // is the one frame clock, so all three surfaces advance exactly once per
+                // display refresh instead of serially blocking the UI thread.
+                let drawer_moving = drawer::animate_frame();
+                let control_moving = control_center::animate_frame();
                 if let Err(render_error) = (*app_ptr).gpu.render(&(*app_ptr).dock) {
                     recover_gpu(hwnd, &mut *app_ptr).map_err(|recovery_error| {
                         Error::new(
@@ -834,10 +947,10 @@ fn run() -> Result<()> {
                         )
                     })?;
                 }
-                // Keep rendering every vsync while the cursor is over the dock so the
-                // bump tracks it at full refresh rate; stop only once it has left AND
-                // the icons eased back to rest — then idle returns to 0% CPU.
-                if !moving && (*app_ptr).dock.cursor_x.is_none() {
+                // Any future mouse move wakes the message loop and requests another
+                // frame. Once all easing settles, stop presenting duplicate frames even
+                // when the pointer is resting over the Dock.
+                if !animation_sources_active(moving, drawer_moving, control_moving) {
                     // Exit animations are done — reclaim the width we held for the
                     // collapsing slots, shrinking the window back to fit the row.
                     if (*app_ptr).pending_relayout {
@@ -860,9 +973,14 @@ fn run() -> Result<()> {
                         // head-room to clip, so the whole (tiny/absent) window takes input.
                         set_region_full(hwnd, &mut *app_ptr, true);
                     } else {
-                        // Resident at rest: clip the input region to the visible pill so
-                        // clicks above and beside it fall through to the app underneath.
-                        set_region_full(hwnd, &mut *app_ptr, false);
+                        // Keep the magnification envelope interactive while hovered even
+                        // though identical frames no longer need presenting. Once the
+                        // pointer leaves, clip back to the visible pill at rest.
+                        set_region_full(
+                            hwnd,
+                            &mut *app_ptr,
+                            settled_region_should_stay_full((*app_ptr).dock.cursor_x.is_some()),
+                        );
                     }
                     (*app_ptr).animating = false;
                 }
@@ -873,6 +991,9 @@ fn run() -> Result<()> {
                 }
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
+                if (*app_ptr).animating {
+                    (*app_ptr).dock.wake_animation_clock();
+                }
             }
         }
         cleanup(app_ptr);
@@ -906,6 +1027,31 @@ unsafe fn enter_hidden(_hwnd: HWND, _app: &mut App) {
 
 /// Open an application, shortcut, file, or folder with the Windows Shell.
 unsafe fn open_content(path: &str) -> Result<()> {
+    let launch_path = system_launcher_for_path(path).unwrap_or(path);
+    match open_content_raw(launch_path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Some(repaired) = config::repair_launch_path(path) {
+                open_content_raw(&repaired)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn system_launcher_for_path(path: &str) -> Option<&'static str> {
+    let normalized = path.replace('/', "\\").to_ascii_lowercase();
+    if normalized.contains("\\windowsapps\\openai.codex_")
+        && normalized.ends_with("\\app\\codex.exe")
+    {
+        Some("shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App")
+    } else {
+        None
+    }
+}
+
+unsafe fn open_content_raw(path: &str) -> Result<()> {
     let w: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
     let result = ShellExecuteW(
         HWND::default(),
@@ -1306,7 +1452,7 @@ unsafe fn activate_item_windows(item: &dock::DockItem) -> bool {
     let foreground_owned =
         foreground.is_some_and(|raw| foreground_window_belongs_to_item(item, raw));
     for raw in activation_order_with_foreground_owned(item, foreground, foreground_owned) {
-        if windows_list::activate(raw) {
+        if windows_list::activate_from_dock(raw) {
             return true;
         }
     }
@@ -1534,7 +1680,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                             } else if activate_live_running_window(hwnd, app, i) {
                             } else if let Some(raw) = item_hwnd {
                                 window_preview::hide();
-                                windows_list::activate(raw);
+                                windows_list::activate_from_dock(raw);
                                 app.dock.bump(i);
                                 app.animating = true;
                             } else {
@@ -1633,6 +1779,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 app.dock.reveal_target = 1.0;
                 app.animating = true;
                 raise_dock_topmost(hwnd);
+                LRESULT(0)
+            }
+            WM_ANIMATION_WAKE => {
+                app.animating = true;
                 LRESULT(0)
             }
             WM_DROPFILES => {
@@ -1819,6 +1969,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 LRESULT(0)
             }
+            WM_CLOSE => {
+                let _ = DestroyWindow(hwnd);
+                LRESULT(0)
+            }
             WM_DESTROY => {
                 let _ = UnregisterHotKey(hwnd, ID_SEARCH_HOTKEY);
                 PostQuitMessage(0);
@@ -1832,6 +1986,53 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn animation_message_batch_yields_before_input_can_starve_a_frame() {
+        assert_eq!(ANIMATION_MESSAGE_BUDGET, 4);
+        assert!(animation_message_batch_has_capacity(0));
+        assert!(animation_message_batch_has_capacity(
+            ANIMATION_MESSAGE_BUDGET - 1
+        ));
+        assert!(!animation_message_batch_has_capacity(
+            ANIMATION_MESSAGE_BUDGET
+        ));
+    }
+
+    #[test]
+    fn popup_animation_keeps_shared_frame_loop_alive() {
+        assert!(!animation_sources_active(false, false, false));
+        assert!(animation_sources_active(true, false, false));
+        assert!(animation_sources_active(false, true, false));
+        assert!(animation_sources_active(false, false, true));
+    }
+
+    #[test]
+    fn shared_frame_loop_samples_every_animation_source() {
+        let source = include_str!("main.rs");
+        let frame_loop = source
+            .split("if (*app_ptr).animating")
+            .nth(1)
+            .and_then(|tail| tail.split("} else {").next())
+            .expect("animation frame loop");
+
+        assert!(frame_loop.contains("drawer::animate_frame()"));
+        assert!(frame_loop.contains("control_center::animate_frame()"));
+    }
+
+    #[test]
+    fn settled_hover_keeps_the_magnified_icon_hit_region() {
+        assert!(settled_region_should_stay_full(true));
+        assert!(!settled_region_should_stay_full(false));
+    }
+
+    #[test]
+    fn unchanged_dock_geometry_does_not_restack_the_window() {
+        let current = (10, 20, 1280, 180);
+        assert!(!dock_geometry_changed(current, current));
+        assert!(dock_geometry_changed(current, (9, 20, 1280, 180)));
+        assert!(dock_geometry_changed(current, (10, 20, 1440, 180)));
+    }
 
     fn running_ref(hwnd: isize, title: &str) -> dock::RunningWindowRef {
         dock::RunningWindowRef {
@@ -1908,6 +2109,19 @@ mod tests {
     }
 
     #[test]
+    fn orphan_cleanup_matches_only_current_exe_name() {
+        let current = std::path::Path::new(r"F:\agentic\featherdock\FeatherDock.exe");
+
+        assert!(process_name_matches_current_exe("featherdock.exe", current));
+        assert!(process_name_matches_current_exe("FeatherDock.EXE", current));
+        assert!(!process_name_matches_current_exe(
+            "FeatherDockHelper.exe",
+            current
+        ));
+        assert!(!process_name_matches_current_exe("", current));
+    }
+
+    #[test]
     fn pinned_launcher_matches_helper_window_by_exact_title() {
         let item = pinned_item("WeGame", r"C:\Program Files\WeGame\wegame.exe");
         let group = running_group(
@@ -1921,6 +2135,22 @@ mod tests {
         );
 
         assert!(pinned_matches_group(&item, &group));
+    }
+
+    #[test]
+    fn codex_windowsapps_path_launches_through_system_app_entry() {
+        assert_eq!(
+            system_launcher_for_path(
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_26.623.13972.0_x64__2p2nqsd0c76g0\app\Codex.exe"
+            ),
+            Some(r"shell:AppsFolder\OpenAI.Codex_2p2nqsd0c76g0!App")
+        );
+        assert_eq!(
+            system_launcher_for_path(
+                r"C:\Program Files\WindowsApps\Other.App_1.0.0.0_x64__abc\app\Codex.exe"
+            ),
+            None
+        );
     }
 
     #[test]

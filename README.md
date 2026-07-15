@@ -22,7 +22,7 @@
 
 FeatherDock 是一个 Windows 上的 Dock，用 Rust 直接写在系统原生图形栈上（DirectComposition + Direct2D + D3D11），不用 Electron 或 WebView，也没有常驻的后台扫描进程。可执行文件六百多 KB，放着不动的时候几乎不占 CPU。
 
-常用的功能都在：图标悬停放大，正在运行的窗口按程序归组、图标下标一个小圆点，悬停能看实时缩略图。文件夹固定项可按需展开成 Stack 菜单，`Ctrl+Alt+Space` 可打开轻量命令面板。另外有一个把桌面程序分类整理的程序抽屉，和一个管音量、网络、时间的控制中心。
+常用的功能都在：图标悬停放大，正在运行的窗口按程序归组、图标下标一个小圆点，悬停能看实时缩略图。文件夹固定项可按需展开成 Stack 菜单，`Ctrl+Alt+Space` 可打开轻量命令面板。另外有一个把桌面程序分类整理的程序抽屉，和一个支持音频设备、网络、蓝牙、输入法、电量与时间的分页控制中心。
 
 ## 截图
 
@@ -55,7 +55,8 @@ FeatherDock 是一个 Windows 上的 Dock，用 Rust 直接写在系统原生图
 - 窗口体验：运行窗口按应用分组，悬停时按需创建 DWM 缩略图预览
 - 文件夹 Stack：点击固定到 Dock 的文件夹时按需读取目录，并显示轻量打开菜单
 - 命令面板：`Ctrl+Alt+Space` 搜索固定项、运行窗口和桌面程序
-- 控制中心：主音量滑块，一键跳到网络 / 蓝牙 / 输入法，外加电量与时钟
+- 控制中心：主音量滑块、输出/输入音频设备选择、Wi-Fi 刷新与连接、蓝牙设备状态、输入法切换，以及电量与时钟入口
+- 固定项自修复：WindowsApps 版本目录更新或唯一 exe 文件名变化后，启动时会在安全范围内修复失效路径
 - 主题预设：玻璃、紧凑、纯色、macOS、高对比五种预设，不引入重型皮肤系统
 - 设置窗口：系统任务栏模式、Dock 显示模式、主题预设、全屏 / 最大化时收起、开机自启、常驻应用管理
 - 桌面模式：可隐藏 Windows 桌面图标，把桌面程序交给抽屉管理
@@ -83,6 +84,8 @@ Dock 常用交互：
 - 点击文件夹固定项会展开 Stack 菜单；菜单打开时才读取该目录。
 - 按 `Ctrl+Alt+Space` 打开命令面板，搜索固定项、运行窗口和桌面程序。
 - 左侧 Start 按钮打开 Windows 开始菜单，右侧 Control 按钮打开 FeatherDock 控制中心。
+- 控制中心支持主页面与音频、网络、蓝牙、输入法、电量子页面；页面切换保留玻璃背景和短动画，网络状态刷新使用独立的短时刷新计时器。
+- 音频页可切换活动设备；网络页可刷新并连接 Wi-Fi；蓝牙页和输入法页提供设备/输入法状态与系统设置入口。
 - Windows 右下角通知区域里的 FeatherDock 小图标右键菜单，以及设置窗口，都可切换常驻 / 自动隐藏、任务栏显示策略、主题预设、桌面图标隐藏和抽屉按钮。
 
 程序抽屉：
@@ -152,6 +155,8 @@ Dock 行为设置：
 
 `drawer.toml` 保存用户分类和被移除的抽屉项目；移除只影响抽屉显示，不删除真实快捷方式或应用。
 
+固定项启动时会检查保存的路径。对于版本化 WindowsApps 路径或同目录下只有一个可执行文件的失效路径，FeatherDock 会尝试更新配置；无法安全判断时会保留原配置，避免误指向其它程序。
+
 ## Run / Quit Safely
 
 正常退出请使用托盘菜单“退出 FeatherDock”，或从命令行请求主窗口优雅关闭：
@@ -214,7 +219,8 @@ cargo build --release
 | `src/drawer_input.rs` | 分类名称输入弹窗 |
 | `src/desktop_scan.rs` | Shell 桌面枚举、系统入口、抽屉缓存和启动逻辑 |
 | `src/categories.rs` | 抽屉分类、隐藏项和 `drawer.toml` 持久化 |
-| `src/control_center.rs` | FeatherDock 控制中心 |
+| `src/control_center.rs` | 分页控制中心、音频/网络/蓝牙/输入法交互和页面动画 |
+| `src/sysctl.rs` | Windows 音频设备、Wi-Fi、蓝牙、输入法、电量和时间系统接口 |
 | `src/settings.rs` | `settings.toml` 设置模型 |
 | `src/settings_window.rs` | 原生设置窗口 |
 | `src/taskbar.rs` | Windows 任务栏 show / autohide / hidden 策略 |
@@ -231,13 +237,14 @@ cargo build --release
 
 Windows CI 会执行：
 
-- `cargo fmt --check`
+- `cargo fmt --all -- --check`
 - `cargo check --all-targets`
 - `cargo test`
+- `cargo clippy --all-targets -- -D warnings`
 - `cargo build --release`
 
-本地重新发布只需运行 `build.ps1`，它会执行 `cargo build --release` 并在仓库根目录
-生成唯一的 `FeatherDock.exe`（同时清理 `target\` 下所有中间 exe）。
+本地重新发布可运行 `build.ps1 -Verify`，它会先执行格式、测试和 Clippy 检查，再构建并在仓库根目录
+生成唯一的 `FeatherDock.exe`。`target\`、`.codex-target-*` 和其它 Cargo 输出都只是可删除的中间缓存，不是运行入口。
 
 ## License
 

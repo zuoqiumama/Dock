@@ -86,13 +86,6 @@ const ADD_H: f32 = 34.0; // the "new category" button row at the bottom
 /// Ignore a re-open landing right after a click-away close (avoids button-toggle flicker).
 const REOPEN_GUARD_MS: u32 = 220;
 
-/// Self-posted "render the next animation frame" message. Posting it (rather than ticking
-/// a 16ms `SetTimer`) lets the open/close animation render once per vsync — matching the
-/// dock's refresh-rate-smooth magnification on high-refresh panels — because `present(1)`
-/// blocks until vsync, then we re-post. When the animation settles we stop posting and the
-/// thread falls straight back to a blocking `GetMessage` (0% idle).
-const WM_ANIM: u32 = WM_APP + 0x30;
-
 const ID_CTX_OPEN: usize = 3101;
 const ID_CTX_PIN: usize = 3102;
 const ID_CTX_HIDE: usize = 3103;
@@ -146,7 +139,6 @@ struct Drawer {
     editing: bool, // a rename/new-category popup is open → don't dismiss on deactivate
     closing: bool,
     anim_start: Instant,
-    anim_pending: bool, // a WM_ANIM frame is already queued → don't post a second
 }
 
 fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
@@ -863,12 +855,9 @@ unsafe fn render(panel: &Drawer) {
     let _ = panel.glass.present();
 }
 
-/// Queue the next animation frame, unless one is already in flight (which would compound
-/// the self-post loop and double the render rate). Cleared as each WM_ANIM is handled.
-unsafe fn schedule_frame(hwnd: HWND, panel: &mut Drawer) {
-    if !panel.anim_pending {
-        panel.anim_pending = true;
-        let _ = PostMessageW(hwnd, WM_ANIM, WPARAM(0), LPARAM(0));
+unsafe fn wake_owner(panel: &Drawer) {
+    if !panel.owner.is_invalid() {
+        let _ = PostMessageW(panel.owner, crate::WM_ANIMATION_WAKE, WPARAM(0), LPARAM(0));
     }
 }
 
@@ -888,7 +877,7 @@ unsafe fn animate(hwnd: HWND, panel: &Drawer) -> bool {
         }
 }
 
-unsafe fn start_close(hwnd: HWND, panel: &mut Drawer) {
+unsafe fn start_close(_hwnd: HWND, panel: &mut Drawer) {
     if panel.closing {
         return;
     }
@@ -898,7 +887,23 @@ unsafe fn start_close(hwnd: HWND, panel: &mut Drawer) {
     let _ = ReleaseCapture();
     panel.anim_start = Instant::now();
     render(panel);
-    schedule_frame(hwnd, panel);
+    wake_owner(panel);
+}
+
+/// Render one drawer frame from the Dock's shared, vsync-paced animation loop.
+pub unsafe fn animate_frame() -> bool {
+    let raw = PANEL_HWND.load(Ordering::Relaxed);
+    if raw == 0 {
+        return false;
+    }
+
+    let hwnd = HWND(raw as *mut c_void);
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Drawer;
+    if ptr.is_null() {
+        return false;
+    }
+
+    animate(hwnd, &*ptr)
 }
 
 /// Press on a tile arms a potential drag (it becomes a plain click if it never moves
@@ -1398,7 +1403,6 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
         editing: false,
         closing: false,
         anim_start: Instant::now(),
-        anim_pending: false,
     }));
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, panel as isize);
     PANEL_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
@@ -1406,7 +1410,7 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
     render(&*panel);
     let _ = ShowWindow(hwnd, SW_SHOW);
     let _ = SetForegroundWindow(hwnd);
-    schedule_frame(hwnd, &mut *panel);
+    wake_owner(&*panel);
 }
 
 /// Build the brush + the text formats (drawer title, section header, centred small
@@ -1485,16 +1489,6 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
     unsafe {
         let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Drawer;
         match msg {
-            WM_ANIM if !ptr.is_null() => {
-                // Render this frame, then re-post for the next vsync while still animating.
-                // `animate` may DestroyWindow on the final close frame (freeing `ptr`), so
-                // clear the in-flight flag *before* calling it and never touch `ptr` after.
-                (*ptr).anim_pending = false;
-                if animate(hwnd, &*ptr) {
-                    schedule_frame(hwnd, &mut *ptr);
-                }
-                LRESULT(0)
-            }
             WM_LBUTTONDOWN if !ptr.is_null() => {
                 let x = (lparam.0 & 0xFFFF) as i16 as f32;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
@@ -1581,5 +1575,21 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn drawer_uses_shared_frame_loop_instead_of_self_posting() {
+        let source = include_str!("drawer.rs");
+        let production = source
+            .rsplit_once("#[cfg(test)]")
+            .map(|(production, _)| production)
+            .expect("drawer production source");
+
+        assert!(production.contains("pub unsafe fn animate_frame()"));
+        assert!(!production.contains("const WM_ANIM"));
+        assert!(!production.contains("schedule_frame("));
     }
 }

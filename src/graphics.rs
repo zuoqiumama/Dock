@@ -27,6 +27,11 @@ pub struct Gpu {
     brush: ID2D1SolidColorBrush,
     format: IDWriteTextFormat,
     icons: Vec<Option<ID2D1Bitmap1>>,
+    surface_size: (u32, u32),
+}
+
+fn surface_resize_needed(current: (u32, u32), requested: (u32, u32)) -> bool {
+    current != requested
 }
 
 impl Gpu {
@@ -109,6 +114,7 @@ impl Gpu {
             brush,
             format,
             icons: Vec::new(),
+            surface_size: (w, h),
         })
     }
 
@@ -217,6 +223,9 @@ impl Gpu {
     }
 
     pub unsafe fn resize(&mut self, width: u32, height: u32) -> Result<()> {
+        if !surface_resize_needed(self.surface_size, (width, height)) {
+            return Ok(());
+        }
         // Icons are device bitmaps independent of the swapchain backbuffer, so they
         // survive a resize — the reconcile/remap path keeps them aligned to `items`.
         self.dc.SetTarget(None::<&ID2D1Image>);
@@ -227,7 +236,9 @@ impl Gpu {
             DXGI_FORMAT_UNKNOWN,
             DXGI_SWAP_CHAIN_FLAG(0),
         )?;
-        bind_target(&self.dc, &self.swapchain)
+        bind_target(&self.dc, &self.swapchain)?;
+        self.surface_size = (width, height);
+        Ok(())
     }
 
     pub unsafe fn render(&self, dock: &Dock) -> Result<()> {
@@ -270,4 +281,16 @@ unsafe fn bind_target(dc: &ID2D1DeviceContext, swapchain: &IDXGISwapChain1) -> R
     let bitmap = dc.CreateBitmapFromDxgiSurface(&backbuffer, Some(&props))?;
     dc.SetTarget(&bitmap);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identical_surface_size_does_not_resize_swapchain() {
+        assert!(!surface_resize_needed((1280, 180), (1280, 180)));
+        assert!(surface_resize_needed((1280, 180), (1440, 180)));
+        assert!(surface_resize_needed((1280, 180), (1280, 200)));
+    }
 }

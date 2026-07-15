@@ -5,6 +5,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use windows::core::{PCWSTR, PWSTR};
+use windows::Win32::Foundation::{ERROR_NO_MORE_ITEMS, ERROR_SUCCESS};
+use windows::Win32::System::Registry::{
+    RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
+};
+
 use crate::atomic;
 use crate::dock::DockItem;
 
@@ -64,6 +70,237 @@ fn item_path(spec: &ItemSpec) -> Option<&str> {
     spec.path.as_deref().or(spec.exe.as_deref())
 }
 
+fn write_config(path: &Path, config: &Config) -> io::Result<()> {
+    let mut body = String::from(HEADER);
+    for spec in &config.items {
+        write_spec(&mut body, spec);
+    }
+    atomic::write(path, body.as_bytes())
+}
+
+fn replace_launch_path_at(path: &Path, old_path: &str, new_path: &str) -> io::Result<bool> {
+    let content = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let mut config = parse(&content);
+    let old_key = path_key(Path::new(old_path));
+    let mut changed = false;
+    for spec in &mut config.items {
+        for field in [&mut spec.path, &mut spec.exe] {
+            if field
+                .as_deref()
+                .is_some_and(|value| path_key(Path::new(value)) == old_key)
+            {
+                *field = Some(new_path.to_string());
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        write_config(path, &config)?;
+    }
+    Ok(changed)
+}
+
+/// If a launch path went stale after an app update or filename encoding glitch, find the
+/// current path and persist it for the next run. Returns `None` when no safe repair exists.
+pub fn repair_launch_path(path: &str) -> Option<String> {
+    let path_ref = Path::new(path);
+    if path_ref.exists() {
+        return None;
+    }
+    let repaired = repair_missing_path(path_ref)?;
+    let _ = replace_launch_path_at(&config_path(), path, &repaired);
+    Some(repaired)
+}
+
+fn repair_config_paths(config: &mut Config) -> bool {
+    let mut changed = false;
+    for spec in &mut config.items {
+        changed |= repair_spec_field(&mut spec.path);
+        changed |= repair_spec_field(&mut spec.exe);
+        changed |= repair_spec_field(&mut spec.icon);
+    }
+    changed
+}
+
+fn repair_spec_field(field: &mut Option<String>) -> bool {
+    let Some(value) = field.as_deref() else {
+        return false;
+    };
+    if Path::new(value).exists() {
+        return false;
+    }
+    let Some(repaired) = repair_missing_path(Path::new(value)) else {
+        return false;
+    };
+    *field = Some(repaired);
+    true
+}
+
+fn repair_missing_path(path: &Path) -> Option<String> {
+    repair_windowsapps_path(path)
+        .or_else(|| repair_sibling_exe_path(path))
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn repair_windowsapps_path(path: &Path) -> Option<PathBuf> {
+    windowsapps_repair_candidates(path, &registry_appx_package_names())
+        .into_iter()
+        .find(|candidate| candidate.exists())
+}
+
+#[derive(Clone)]
+struct AppxIdentity {
+    name: String,
+    version: String,
+    arch: String,
+    publisher: String,
+}
+
+fn appx_identity(package_dir: &str) -> Option<AppxIdentity> {
+    let (prefix, publisher) = package_dir.rsplit_once("__")?;
+    let mut parts = prefix.split('_');
+    Some(AppxIdentity {
+        name: parts.next()?.to_string(),
+        version: parts.next()?.to_string(),
+        arch: parts.next()?.to_string(),
+        publisher: publisher.to_string(),
+    })
+}
+
+fn version_key(version: &str) -> Vec<u64> {
+    version
+        .split('.')
+        .map(|part| part.parse::<u64>().unwrap_or(0))
+        .collect()
+}
+
+fn appx_identity_matches(old: &AppxIdentity, current: &AppxIdentity) -> bool {
+    old.name.eq_ignore_ascii_case(&current.name)
+        && old.arch.eq_ignore_ascii_case(&current.arch)
+        && old.publisher.eq_ignore_ascii_case(&current.publisher)
+}
+
+fn windowsapps_repair_candidates(path: &Path, package_dirs: &[String]) -> Vec<PathBuf> {
+    let path_text = path.to_string_lossy();
+    let lower = path_text.to_ascii_lowercase();
+    let marker = "\\windowsapps\\";
+    let Some(marker_start) = lower.find(marker) else {
+        return Vec::new();
+    };
+    let package_start = marker_start + marker.len();
+    let root = &path_text[..package_start];
+    let after_root = &path_text[package_start..];
+    let Some((old_package, rest)) = after_root.split_once('\\') else {
+        return Vec::new();
+    };
+    let Some(old_identity) = appx_identity(old_package) else {
+        return Vec::new();
+    };
+
+    let mut candidates: Vec<(Vec<u64>, PathBuf)> = package_dirs
+        .iter()
+        .filter_map(|package| {
+            let identity = appx_identity(package)?;
+            if !appx_identity_matches(&old_identity, &identity) {
+                return None;
+            }
+            let path = PathBuf::from(format!("{root}{package}\\{rest}"));
+            Some((version_key(&identity.version), path))
+        })
+        .collect();
+    candidates.sort_by(|a, b| b.0.cmp(&a.0));
+    candidates.into_iter().map(|(_, path)| path).collect()
+}
+
+fn repair_sibling_exe_path(path: &Path) -> Option<PathBuf> {
+    if !path
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+    {
+        return None;
+    }
+    let parent = path.parent()?;
+    if !parent.is_dir() {
+        return None;
+    }
+    let candidates: Vec<PathBuf> = fs::read_dir(parent)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|candidate| {
+            candidate.is_file()
+                && candidate
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+                && !looks_like_uninstaller(candidate)
+        })
+        .collect();
+    if candidates.len() == 1 {
+        candidates.into_iter().next()
+    } else {
+        None
+    }
+}
+
+fn looks_like_uninstaller(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_lowercase();
+    name.contains("uninstall") || name.contains("unins") || name.contains("\u{5378}\u{8f7d}")
+}
+
+fn registry_appx_package_names() -> Vec<String> {
+    unsafe {
+        let subkey = "Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\CurrentVersion\\AppModel\\Repository\\Packages";
+        let wide: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            PCWSTR(wide.as_ptr()),
+            0,
+            KEY_READ,
+            &mut key,
+        ) != ERROR_SUCCESS
+        {
+            return Vec::new();
+        }
+
+        let mut names = Vec::new();
+        let mut index = 0;
+        loop {
+            let mut buffer = vec![0u16; 512];
+            let mut len = buffer.len() as u32;
+            let status = RegEnumKeyExW(
+                key,
+                index,
+                PWSTR(buffer.as_mut_ptr()),
+                &mut len,
+                None,
+                PWSTR::null(),
+                None,
+                None,
+            );
+            if status == ERROR_NO_MORE_ITEMS {
+                break;
+            }
+            if status == ERROR_SUCCESS {
+                names.push(String::from_utf16_lossy(&buffer[..len as usize]));
+            }
+            index += 1;
+        }
+        let _ = RegCloseKey(key);
+        names
+    }
+}
+
 fn add_item_at(path: &Path, label: &str, item_path_value: &Path) -> io::Result<bool> {
     let mut content = fs::read_to_string(path).unwrap_or_else(|_| String::from(HEADER));
     let config = parse(&content);
@@ -102,8 +339,14 @@ fn migrate_legacy(legacy: &Path, target: &Path) -> io::Result<bool> {
 pub fn load() -> io::Result<Option<Config>> {
     let path = config_path();
     migrate_legacy(&legacy_config_path(), &path)?;
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(Some(parse(&text))),
+    match fs::read_to_string(&path) {
+        Ok(text) => {
+            let mut config = parse(&text);
+            if repair_config_paths(&mut config) {
+                let _ = write_config(&path, &config);
+            }
+            Ok(Some(config))
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
@@ -145,9 +388,14 @@ fn remove_item_at(path: &Path, item_path_value: &str) -> io::Result<bool> {
             removed = true;
             continue;
         }
-        write_spec(&mut kept, spec);
     }
     if removed {
+        for spec in &config.items {
+            let key = item_path(spec).map(|value| path_key(Path::new(value)));
+            if key.as_deref() != Some(target_key.as_str()) {
+                write_spec(&mut kept, spec);
+            }
+        }
         atomic::write(path, kept.as_bytes())?;
     }
     Ok(removed)
@@ -436,6 +684,44 @@ path = "C:\\Tools\\app.exe"
         // Out-of-range index is a no-op.
         assert!(!remove_item_at_index_in(&config, 5).unwrap());
         assert_eq!(parse(&fs::read_to_string(&config).unwrap()).items.len(), 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn windowsapps_repair_candidates_keep_subpath_on_newest_matching_package() {
+        let old = Path::new(
+            r"C:\Program Files\WindowsApps\OpenAI.Codex_26.623.9142.0_x64__2p2nqsd0c76g0\app\Codex.exe",
+        );
+        let packages = vec![
+            "OpenAI.Codex_26.623.9142.0_x64__2p2nqsd0c76g0".to_string(),
+            "OpenAI.Codex_26.623.13972.0_x64__2p2nqsd0c76g0".to_string(),
+            "OpenAI.Codex_26.623.15000.0_arm64__2p2nqsd0c76g0".to_string(),
+            "Other.App_99.0.0.0_x64__2p2nqsd0c76g0".to_string(),
+        ];
+
+        let candidates = windowsapps_repair_candidates(old, &packages);
+
+        assert_eq!(
+            candidates.first(),
+            Some(&PathBuf::from(
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_26.623.13972.0_x64__2p2nqsd0c76g0\app\Codex.exe"
+            ))
+        );
+        assert_eq!(candidates.len(), 2);
+    }
+
+    #[test]
+    fn sibling_exe_repair_ignores_uninstaller() {
+        let dir = temp_dir("sibling-exe");
+        fs::create_dir_all(&dir).unwrap();
+        let app = dir.join("Bilibili.exe");
+        let uninstaller = dir.join("\u{5378}\u{8f7d}Bilibili.exe");
+        fs::write(&app, b"app").unwrap();
+        fs::write(&uninstaller, b"uninstall").unwrap();
+
+        let repaired = repair_sibling_exe_path(&dir.join("garbled.exe"));
+
+        assert_eq!(repaired, Some(app));
         fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -127,6 +127,16 @@ pub unsafe fn recover_if_stranded() {
     }
 }
 
+/// Control-path recovery: make the taskbar usable even if the guard marker was already
+/// removed or never written. If we still have the original setting, honor it; otherwise
+/// prefer a visible taskbar over leaving the user stranded with an invisible shell bar.
+pub unsafe fn restore_recorded_or_visible() {
+    let original_autohide = guarded_original().unwrap_or(false);
+    restore_to(original_autohide);
+    clear_guard();
+    TASKBAR_TOUCHED.store(false, Ordering::Relaxed);
+}
+
 unsafe fn set_autohide(autohide: bool) {
     let tray = primary();
     if tray.is_invalid() {

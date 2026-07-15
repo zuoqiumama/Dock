@@ -8,7 +8,6 @@
 use core::ffi::c_void;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicIsize, Ordering};
-use std::time::{Duration, Instant};
 
 use windows::core::PWSTR;
 use windows::Win32::Foundation::*;
@@ -38,8 +37,6 @@ const VK_LWIN: VIRTUAL_KEY = VIRTUAL_KEY(0x5B);
 const OBJID_WINDOW: i32 = 0;
 const GCLP_HICON: i32 = -14;
 const SC_MINIMIZE_COMMAND: usize = 0xF020;
-const ACTIVATE_WAIT: Duration = Duration::from_millis(350);
-const ACTIVATE_POLL: Duration = Duration::from_millis(25);
 
 /// Target dock window the hook callback posts to (set in `install_hooks`).
 static DOCK_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -442,13 +439,17 @@ pub unsafe fn activate(raw: isize) -> bool {
     force_foreground(hwnd, false)
 }
 
+/// Dock-specific activation uses the native DWM minimize/restore path. Keeping foreign
+/// window motion inside the system compositor avoids full-window captures and guarantees
+/// this UI thread returns immediately to the Dock's high-refresh render loop.
+pub unsafe fn activate_from_dock(raw: isize) -> bool {
+    activate(raw)
+}
+
 unsafe fn minimize_foreground(hwnd: HWND) {
     let _ = ShowWindow(hwnd, SW_MINIMIZE);
     if needs_syscommand_minimize_fallback(IsIconic(hwnd).as_bool()) {
         let _ = PostMessageW(hwnd, WM_SYSCOMMAND, WPARAM(SC_MINIMIZE_COMMAND), LPARAM(0));
-        let _ = wait_until(ACTIVATE_WAIT, || {
-            !IsWindow(hwnd).as_bool() || IsIconic(hwnd).as_bool()
-        });
     }
 }
 
@@ -491,23 +492,9 @@ unsafe fn force_foreground(hwnd: HWND, restore: bool) -> bool {
     if attached_foreground {
         let _ = AttachThreadInput(our_thread, foreground_thread, BOOL(0));
     }
-    wait_until(ACTIVATE_WAIT, || {
-        GetForegroundWindow() == hwnd && !IsIconic(hwnd).as_bool()
-    })
-}
-
-fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if predicate() {
-            return true;
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return false;
-        }
-        std::thread::sleep(ACTIVATE_POLL.min(deadline.saturating_duration_since(now)));
-    }
+    // Foreground changes are asynchronous for windows owned by another process. The
+    // request was accepted; WinEvent notifications will report the resulting state.
+    IsWindow(hwnd).as_bool()
 }
 
 /// Open the Windows Start menu by synthesizing a tap of the Win key.
@@ -632,6 +619,31 @@ mod tests {
     }
 
     #[test]
+    fn dock_activation_never_polls_on_the_ui_thread() {
+        let source = include_str!("windows_list.rs");
+        let activation = source
+            .split("unsafe fn force_foreground")
+            .nth(1)
+            .and_then(|tail| tail.split("/// Open the Windows Start menu").next())
+            .expect("force_foreground body");
+
+        assert!(!activation.contains("wait_until"));
+        assert!(!activation.contains("thread::sleep"));
+    }
+
+    #[test]
+    fn dock_activation_uses_native_dwm_motion_without_snapshot_worker() {
+        let source = include_str!("windows_list.rs");
+        let activation = source
+            .split("pub unsafe fn activate_from_dock")
+            .nth(1)
+            .and_then(|tail| tail.split("unsafe fn minimize_foreground").next())
+            .expect("activate_from_dock body");
+
+        assert!(!activation.contains("window_transition::start"));
+    }
+
+    #[test]
     fn only_borderless_monitor_fillers_retract_the_dock() {
         // Borderless app filling the screen (game / video) -> fullscreen, retract.
         assert!(fullscreen_should_retract_dock(true, false));
@@ -682,16 +694,6 @@ mod tests {
 
         assert_eq!(groups.len(), 2);
         assert_ne!(groups[0].key, groups[1].key);
-    }
-
-    #[test]
-    fn wait_until_returns_immediately_when_condition_is_met() {
-        assert!(wait_until(Duration::from_secs(1), || true));
-    }
-
-    #[test]
-    fn wait_until_returns_false_after_timeout() {
-        assert!(!wait_until(Duration::ZERO, || false));
     }
 
     #[test]

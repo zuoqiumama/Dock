@@ -185,8 +185,8 @@ pub unsafe fn draw(
         alpha: theme.dot_alpha,
     };
     for ic in &frame.icons {
-        let item = &dock.items[ic.idx];
-        if item.windows.is_empty() || ic.presence <= 0.02 {
+        let indicator_presence = ic.running_presence * ic.presence;
+        if indicator_presence <= 0.02 {
             continue;
         }
         draw_running_dot(
@@ -195,7 +195,7 @@ pub unsafe fn draw(
             ic.cx,
             frame.baseline,
             base,
-            ic.presence,
+            indicator_presence,
             running_dot,
         );
     }

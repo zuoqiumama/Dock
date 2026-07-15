@@ -27,6 +27,19 @@ pub const ENTER_TAU: f32 = 0.17; // appear easing — slot opens + icon scales/f
 pub const EXIT_TAU: f32 = 0.13; // disappear easing — a touch quicker than the open
 pub const PRESENCE_GONE: f32 = 0.015; // below this, a fully-exited slot is dropped
 pub const ENTER_RISE: f32 = 0.16; // how far (fraction of icon) a new icon rises into place
+const RUNNING_TAU: f32 = 0.11;
+const MAX_FRAME_DT: f32 = 1.0 / 30.0;
+const IDLE_GAP: f32 = 0.10;
+
+fn animation_dt(elapsed: f32) -> f32 {
+    if elapsed >= IDLE_GAP {
+        // Never turn time spent blocked or idle into a visible animation jump. The next
+        // presented frame establishes the real monitor cadence again.
+        0.0
+    } else {
+        elapsed.min(MAX_FRAME_DT)
+    }
+}
 
 /// What a slot in the dock represents — drives layout, magnification, hit-testing
 /// and what a click does. The dock row is ordered: Start, pinned…, Divider,
@@ -114,23 +127,30 @@ struct Slot {
     bounce: f32,          // click-hop phase, 1.0 -> 0.0
     presence: f32,        // 0 = absent (collapsed), 1 = fully present
     presence_target: f32, // 1 while alive, 0 once removed (then eased out + dropped)
+    running_presence: f32,
+    running_target: f32,
 }
 
 impl Slot {
-    fn present() -> Slot {
+    fn present(running: bool) -> Slot {
+        let running = if running { 1.0 } else { 0.0 };
         Slot {
             scale: 1.0,
             bounce: 0.0,
             presence: 1.0,
             presence_target: 1.0,
+            running_presence: running,
+            running_target: running,
         }
     }
-    fn entering() -> Slot {
+    fn entering(running: bool) -> Slot {
         Slot {
             scale: 1.0,
             bounce: 0.0,
             presence: 0.0,
             presence_target: 1.0,
+            running_presence: 0.0,
+            running_target: if running { 1.0 } else { 0.0 },
         }
     }
 }
@@ -139,8 +159,9 @@ pub struct IconFrame {
     pub idx: usize,
     pub cx: f32,
     pub scale: f32,
-    pub bounce_y: f32, // upward offset from the click hop
-    pub presence: f32, // 0..1 appear/disappear factor (icon scale + opacity)
+    pub bounce_y: f32,         // upward offset from the click hop
+    pub presence: f32,         // 0..1 appear/disappear factor (icon scale + opacity)
+    pub running_presence: f32, // independently eases the running-state indicator
 }
 
 pub struct Frame {
@@ -160,6 +181,7 @@ pub struct Dock {
     pub win_w: f32,
     pub win_h: f32,
     last: Instant,
+    resume_pending: bool,
 }
 
 /// Window size (device px) needed to fit every slot at full magnification PLUS the
@@ -180,11 +202,14 @@ pub fn window_size(items: &[DockItem], dpi: f32) -> (u32, u32) {
 
 impl Dock {
     pub fn new(items: Vec<DockItem>, dpi: f32, win_w: f32, win_h: f32, theme: ThemePreset) -> Dock {
-        let n = items.len();
+        let slots = items
+            .iter()
+            .map(|item| Slot::present(!item.windows.is_empty()))
+            .collect();
         Dock {
             items,
             // Whatever is present at construction starts fully shown (no intro animation).
-            slots: vec![Slot::present(); n],
+            slots,
             cursor_x: None,
             // Start shown; main.rs decides the resting target from settings + the
             // fullscreen state (always-resident vs. auto-hide vs. fullscreen retract).
@@ -195,6 +220,7 @@ impl Dock {
             win_w,
             win_h,
             last: Instant::now(),
+            resume_pending: false,
         }
     }
 
@@ -261,6 +287,12 @@ impl Dock {
         }
     }
 
+    /// Reset the frame clock when the blocking message loop wakes an idle Dock.
+    pub fn wake_animation_clock(&mut self) {
+        self.last = Instant::now();
+        self.resume_pending = true;
+    }
+
     fn metrics(&self) -> (f32, f32) {
         (BASE_ICON * self.dpi, GAP * self.dpi)
     }
@@ -307,7 +339,11 @@ impl Dock {
     /// Advance the easing one frame. Returns true while still animating.
     pub fn tick(&mut self) -> bool {
         let now = Instant::now();
-        let dt = (now - self.last).as_secs_f32().min(0.05);
+        let dt = if std::mem::take(&mut self.resume_pending) {
+            0.0
+        } else {
+            animation_dt((now - self.last).as_secs_f32())
+        };
         self.last = now;
         let alpha = 1.0 - (-dt / EASE_TAU).exp(); // frame-rate independent
         let rc = self.rest_centers();
@@ -332,6 +368,13 @@ impl Dock {
             if self.slots[i].bounce > 0.0 {
                 self.slots[i].bounce = (self.slots[i].bounce - dt / BOUNCE_DUR).max(0.0);
                 moving = true;
+            }
+            let running_delta = self.slots[i].running_target - self.slots[i].running_presence;
+            if running_delta.abs() > 0.0005 {
+                self.slots[i].running_presence += running_delta * (1.0 - (-dt / RUNNING_TAU).exp());
+                moving = true;
+            } else {
+                self.slots[i].running_presence = self.slots[i].running_target;
             }
             // appear/disappear: open a bit slower than we close, both frame-rate independent.
             let pt = self.slots[i].presence_target;
@@ -391,6 +434,7 @@ impl Dock {
                 scale: self.slots[i].scale,
                 bounce_y,
                 presence: self.slots[i].presence,
+                running_presence: self.slots[i].running_presence,
             });
             x += w;
         }
@@ -440,10 +484,23 @@ impl Dock {
         let old_slots = std::mem::take(&mut self.slots);
         let (m, d) = (old_items.len(), desired.len());
 
-        let old_keys: std::collections::HashSet<ItemKey> =
-            old_items.iter().map(DockItem::key).collect();
-        let desired_keys: std::collections::HashSet<ItemKey> =
-            desired.iter().map(DockItem::key).collect();
+        let old_keys: Vec<ItemKey> = old_items.iter().map(DockItem::key).collect();
+        let desired_keys: Vec<ItemKey> = desired.iter().map(DockItem::key).collect();
+
+        let mut old_used = vec![false; m];
+        let mut match_for_desired = vec![None; d];
+        for (new_index, key) in desired_keys.iter().enumerate() {
+            if let Some(old_index) = old_keys
+                .iter()
+                .enumerate()
+                .find_map(|(old_index, old_key)| {
+                    (!old_used[old_index] && old_key == key).then_some(old_index)
+                })
+            {
+                old_used[old_index] = true;
+                match_for_desired[new_index] = Some(old_index);
+            }
+        }
 
         // Move-out buffers so we can take ownership of each side by index.
         let mut old_items: Vec<Option<DockItem>> = old_items.into_iter().map(Some).collect();
@@ -453,57 +510,54 @@ impl Dock {
         let mut slots = Vec::with_capacity(m + d);
         let mut remap = Vec::with_capacity(m + d);
 
-        // Two-pointer merge. Both lists list common keys in the same relative order
-        // (Start, pinned…, divider, running sorted by hwnd), so common keys line up.
-        let (mut i, mut j) = (0, 0);
-        while i < m || j < d {
-            let old_only = i < m && !desired_keys.contains(&old_items[i].as_ref().unwrap().key());
-            if old_only {
-                items.push(old_items[i].take().unwrap());
-                let mut s = old_slots[i];
-                s.presence_target = 0.0; // exiting: collapse, then get dropped
-                slots.push(s);
-                remap.push(Some(i));
-                i += 1;
-                continue;
+        // Do not use the old positional assumption:
+        // Old order was Start, pinned items, divider, then running groups by hwnd.
+        // Match by ItemKey so bitmap reuse stays aligned with click/preview targets.
+        let mut next_old_exit = 0;
+        for (new_index, old_match) in match_for_desired.into_iter().enumerate() {
+            if let Some(limit) = old_match {
+                while next_old_exit < limit {
+                    if !old_used[next_old_exit] {
+                        items.push(old_items[next_old_exit].take().unwrap());
+                        let mut s = old_slots[next_old_exit];
+                        s.presence_target = 0.0; // exiting: collapse, then get dropped
+                        s.running_target = 0.0;
+                        slots.push(s);
+                        remap.push(Some(next_old_exit));
+                    }
+                    next_old_exit += 1;
+                }
             }
-            let new_only = j < d && !old_keys.contains(&desired[j].as_ref().unwrap().key());
-            if new_only {
-                items.push(desired[j].take().unwrap());
-                slots.push(Slot::entering());
-                remap.push(None);
-                j += 1;
-                continue;
+
+            match old_match {
+                Some(old_index) => {
+                    let running = !desired[new_index].as_ref().unwrap().windows.is_empty();
+                    items.push(desired[new_index].take().unwrap());
+                    let mut s = old_slots[old_index];
+                    s.presence_target = 1.0; // revive if it had been mid-exit
+                    s.running_target = if running { 1.0 } else { 0.0 };
+                    slots.push(s);
+                    remap.push(Some(old_index));
+                }
+                None => {
+                    let running = !desired[new_index].as_ref().unwrap().windows.is_empty();
+                    items.push(desired[new_index].take().unwrap());
+                    slots.push(Slot::entering(running));
+                    remap.push(None);
+                }
             }
-            if i < m && j < d {
-                // Common slot: keep its animation + icon, but adopt the fresh data.
-                debug_assert_eq!(
-                    old_items[i].as_ref().unwrap().key(),
-                    desired[j].as_ref().unwrap().key()
-                );
-                items.push(desired[j].take().unwrap());
-                let mut s = old_slots[i];
-                s.presence_target = 1.0; // revive if it had been mid-exit
-                slots.push(s);
-                remap.push(Some(i));
-                i += 1;
-                j += 1;
-                continue;
-            }
-            // Unreachable in practice (one side drained); fall through defensively.
-            if i < m {
-                items.push(old_items[i].take().unwrap());
-                let mut s = old_slots[i];
+        }
+
+        while next_old_exit < m {
+            if !old_used[next_old_exit] {
+                items.push(old_items[next_old_exit].take().unwrap());
+                let mut s = old_slots[next_old_exit];
                 s.presence_target = 0.0;
+                s.running_target = 0.0;
                 slots.push(s);
-                remap.push(Some(i));
-                i += 1;
-            } else {
-                items.push(desired[j].take().unwrap());
-                slots.push(Slot::entering());
-                remap.push(None);
-                j += 1;
+                remap.push(Some(next_old_exit));
             }
+            next_old_exit += 1;
         }
 
         self.items = items;
@@ -552,6 +606,7 @@ impl Dock {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn dock() -> Dock {
         Dock::new(Vec::new(), 1.0, 400.0, 140.0, ThemePreset::Glass)
@@ -589,6 +644,26 @@ mod tests {
         item(ItemRole::Running, Some(hwnd), None)
     }
 
+    fn running_group(key: &str, hwnd: isize) -> DockItem {
+        let mut item = running(hwnd);
+        item.group_key = Some(key.to_string());
+        item
+    }
+
+    fn pinned(path: &str, hwnd: Option<isize>) -> DockItem {
+        let mut item = item(ItemRole::Pinned, None, Some(path));
+        item.hwnd = hwnd;
+        item.windows = hwnd
+            .map(|value| {
+                vec![RunningWindowRef {
+                    hwnd: value,
+                    title: "Pinned app".to_string(),
+                }]
+            })
+            .unwrap_or_default();
+        item
+    }
+
     fn keys(dock: &Dock) -> Vec<ItemKey> {
         dock.items.iter().map(DockItem::key).collect()
     }
@@ -605,6 +680,63 @@ mod tests {
         assert_eq!(dock.interactive_hit_zone(), dock.hit_zone(true));
         dock.reveal = 0.0;
         assert_eq!(dock.interactive_hit_zone(), dock.hit_zone(false));
+    }
+
+    #[test]
+    fn stale_idle_time_never_becomes_animation_motion() {
+        let mut dock = seeded(vec![start()]);
+        dock.bump(0);
+        dock.last = Instant::now() - Duration::from_secs(1);
+
+        assert!(dock.tick());
+        assert_eq!(dock.slots[0].bounce, 1.0);
+    }
+
+    #[test]
+    fn explicit_animation_wake_does_not_assume_60hz() {
+        let mut dock = seeded(vec![start()]);
+        dock.bump(0);
+        dock.last = Instant::now() - Duration::from_millis(80);
+
+        dock.wake_animation_clock();
+        assert!(dock.tick());
+
+        assert_eq!(dock.slots[0].bounce, 1.0);
+    }
+
+    #[test]
+    fn high_refresh_frame_after_wake_uses_measured_elapsed_time() {
+        let mut dock = seeded(vec![start()]);
+        dock.bump(0);
+        dock.wake_animation_clock();
+        assert!(dock.tick());
+
+        dock.last = Instant::now() - Duration::from_millis(7);
+        assert!(dock.tick());
+
+        assert!(
+            dock.slots[0].bounce > 0.98 && dock.slots[0].bounce < 1.0,
+            "144 Hz-sized frame should advance smoothly: {}",
+            dock.slots[0].bounce
+        );
+    }
+
+    #[test]
+    fn closing_a_pinned_app_fades_its_running_indicator() {
+        let path = r"C:\Apps\Pinned.exe";
+        let mut dock = seeded(vec![pinned(path, Some(42))]);
+
+        dock.reconcile(vec![pinned(path, None)]);
+        let before = dock.frame().icons[0].running_presence;
+        dock.last = Instant::now() - Duration::from_millis(16);
+        assert!(dock.tick());
+        let after = dock.frame().icons[0].running_presence;
+
+        assert_eq!(before, 1.0);
+        assert!(
+            after > 0.0 && after < before,
+            "indicator snapped to {after}"
+        );
     }
 
     #[test]
@@ -674,6 +806,34 @@ mod tests {
                 ItemKey::Running("hwnd:10".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn reordering_running_groups_reuses_icons_by_key() {
+        let mut dock = seeded(vec![
+            start(),
+            divider(),
+            running_group("explorer.exe", 10),
+            running_group("mihoyo.exe", 20),
+        ]);
+
+        let remap = dock.reconcile(vec![
+            start(),
+            divider(),
+            running_group("mihoyo.exe", 20),
+            running_group("explorer.exe", 10),
+        ]);
+
+        assert_eq!(
+            keys(&dock),
+            vec![
+                ItemKey::Start,
+                ItemKey::Divider,
+                ItemKey::Running("mihoyo.exe".to_string()),
+                ItemKey::Running("explorer.exe".to_string())
+            ]
+        );
+        assert_eq!(remap, vec![Some(0), Some(1), Some(3), Some(2)]);
     }
 
     #[test]
