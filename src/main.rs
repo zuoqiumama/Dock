@@ -19,6 +19,7 @@ mod desktop_icons;
 mod desktop_scan;
 mod dock;
 mod drawer;
+mod drawer_icons;
 mod drawer_input;
 mod drawer_layout;
 mod error_log;
@@ -554,6 +555,13 @@ fn main() {
     // dock dies abnormally. Handle it before any GUI / single-instance / COM setup.
     if let Some(args) = watchdog::parse_args() {
         watchdog::run(args);
+        return;
+    }
+    // Drawer-icon helper mode: a sibling copy that performs the drawer's shell icon
+    // extraction in isolation, so a third-party shell-extension crash can never take
+    // the dock down. Also handled before any GUI / single-instance setup.
+    if let Some((job, outdir)) = drawer_icons::parse_args() {
+        drawer_icons::run(&job, &outdir);
         return;
     }
     if handle_control_args() {

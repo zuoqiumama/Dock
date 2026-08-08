@@ -411,8 +411,10 @@ unsafe fn path_of(pidl: *const ITEMIDLIST) -> Option<String> {
 }
 
 /// Launch a desktop item: a filesystem item via the shell's "open" (like the rest of
-/// the dock), a virtual item by invoking its default verb through its PIDL.
-pub unsafe fn launch(path: Option<&str>, pidl: Option<*const ITEMIDLIST>) {
+/// the dock); the drawer's known virtual folders through `explorer.exe shell:…` URIs —
+/// which never activates the item's context-menu handlers in OUR process; and any
+/// other virtual item by invoking its default verb through its PIDL.
+pub unsafe fn launch(path: Option<&str>, pidl: Option<*const ITEMIDLIST>, key: Option<&str>) {
     if let Some(path) = path {
         let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
         let _ = ShellExecuteW(
@@ -420,6 +422,20 @@ pub unsafe fn launch(path: Option<&str>, pidl: Option<*const ITEMIDLIST>) {
             w!("open"),
             PCWSTR(wide.as_ptr()),
             PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    } else if let Some(uri) = key.and_then(known_virtual_shell_uri) {
+        let exe: Vec<u16> = "explorer.exe"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let arg: Vec<u16> = uri.encode_utf16().chain(std::iter::once(0)).collect();
+        let _ = ShellExecuteW(
+            HWND::default(),
+            w!("open"),
+            PCWSTR(exe.as_ptr()),
+            PCWSTR(arg.as_ptr()),
             PCWSTR::null(),
             SW_SHOWNORMAL,
         );
@@ -432,6 +448,19 @@ pub unsafe fn launch(path: Option<&str>, pidl: Option<*const ITEMIDLIST>) {
             ..Default::default()
         };
         let _ = ShellExecuteExW(&mut info);
+    }
+}
+
+/// The drawer's virtual desktop entries (此电脑 / 回收站 / 控制面板) map to `explorer.exe`
+/// `shell:` URIs. Explorer performs the actual opening, so the shell's per-item
+/// context-menu handlers — including buggy third-party ones — are never loaded into
+/// FeatherDock's process just to launch a folder.
+fn known_virtual_shell_uri(key: &str) -> Option<&'static str> {
+    match key {
+        "knownfolder:recycle-bin" => Some("shell:RecycleBinFolder"),
+        "knownfolder:computer" => Some("shell:MyComputerFolder"),
+        "knownfolder:control-panel" => Some("shell:ControlPanelFolder"),
+        _ => None,
     }
 }
 

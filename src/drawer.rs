@@ -12,8 +12,7 @@
 use core::ffi::c_void;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::path::Path;
-use std::rc::Rc;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 use std::time::Instant;
 
@@ -35,11 +34,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::categories::{self, Categories};
-use crate::content::{classify_path, fallback_visual};
+use crate::content::fallback_visual;
 use crate::desktop_scan::{self, Pidl};
 use crate::drawer_layout::{self, Layout, Section, SectionKind};
 use crate::glass::Glass;
-use crate::icons::{self, IconLoader, OwnedIcon};
 
 /// Cursor travel (device px) before a press turns into a drag rather than a click.
 const DRAG_THRESHOLD: f32 = 6.0;
@@ -99,8 +97,9 @@ static PANEL_HWND: AtomicIsize = AtomicIsize::new(0);
 static LAST_CLOSED_TICK: AtomicU32 = AtomicU32::new(0);
 
 thread_local! {
-    static PRELOADED_ICONS: RefCell<HashMap<String, Rc<OwnedIcon>>> =
-        RefCell::new(HashMap::new());
+    // Extracted icon PNGs, keyed by entry key. Filled by the helper-process
+    // extraction (`drawer_icons`); decoded into GPU bitmaps when the drawer opens.
+    static PRELOADED_ICONS: RefCell<HashMap<String, PathBuf>> = RefCell::new(HashMap::new());
 }
 
 struct Entry {
@@ -109,7 +108,7 @@ struct Entry {
     path: Option<String>, // filesystem path, when it is one
     pidl: Option<Pidl>,   // absolute PIDL, for virtual items (此电脑 / 回收站 / …)
     icon: Option<ID2D1Bitmap1>,
-    preloaded_icon: Option<Rc<OwnedIcon>>,
+    preloaded_icon: Option<PathBuf>,
     glyph: &'static str,    // fallback glyph if the icon can't be extracted
     color: (f32, f32, f32), // fallback tile color
 }
@@ -369,32 +368,46 @@ fn attach_preloaded_icons(entries: &mut [Entry]) {
     });
 }
 
+/// Batch-extract icons for every path entry that lacks a cached PNG — in a helper
+/// process, so a crashing third-party shell extension can never take the dock down.
+/// Virtual (PIDL) entries get no icon at all; the drawer falls back to a glyph tile.
 unsafe fn preload_missing_icons(entries: &mut [Entry]) {
+    let mut jobs: Vec<(usize, String)> = Vec::new();
     PRELOADED_ICONS.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        for entry in entries {
-            if let Some(icon) = cache.get(&entry.key).cloned() {
-                entry.preloaded_icon = Some(icon);
+        let cache = cache.borrow();
+        for (i, entry) in entries.iter().enumerate() {
+            if entry.preloaded_icon.is_some() {
                 continue;
             }
-
-            let icon = match &entry.path {
-                Some(path) => icons::source_icon(path, 256),
-                None => entry
-                    .pidl
-                    .as_ref()
-                    .and_then(|pidl| icons::source_icon_pidl(pidl.as_ptr())),
-            };
-            if let Some(icon) = icon {
-                let icon = Rc::new(icon);
-                cache.insert(entry.key.clone(), icon.clone());
-                entry.preloaded_icon = Some(icon);
+            if let Some(path) = entry.path.as_deref() {
+                if !cache.contains_key(&entry.key) {
+                    jobs.push((i, path.to_string()));
+                }
             }
+        }
+    });
+    if jobs.is_empty() {
+        return;
+    }
+    let pngs = crate::drawer_icons::extract(&jobs);
+    if pngs.is_empty() {
+        return;
+    }
+    PRELOADED_ICONS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        for (entry_idx, png) in pngs {
+            let Some(entry) = entries.get_mut(entry_idx) else {
+                continue;
+            };
+            cache.insert(entry.key.clone(), png.clone());
+            entry.preloaded_icon = Some(png);
         }
     });
 }
 
-/// Warm the drawer's shell scan + icon handles during dock startup, before the user opens it.
+/// Warm the drawer's shell scan + icon extraction during dock startup, before the
+/// user opens it. Icon extraction runs out-of-process (`drawer_icons`), so a shell
+/// extension fault here only costs the icons, never the dock.
 pub unsafe fn warm_cache() {
     let categories = categories::load();
     let mut entries = build_entries(&categories);
@@ -402,28 +415,27 @@ pub unsafe fn warm_cache() {
 }
 
 unsafe fn load_entry_icons(dc: &ID2D1DeviceContext, dpi: f32, entries: &mut [Entry]) {
-    let Ok(loader) = IconLoader::new() else {
-        return;
-    };
-    let icon_px = ((ICON * 2.0 * dpi).round() as u32).clamp(48, 256);
+    let _ = dpi;
+    // Cold cache (drawer enabled mid-session, or a helper crash left gaps): run one
+    // more out-of-process extraction so real icons still appear — never shell calls
+    // in-process.
+    if entries
+        .iter()
+        .any(|entry| entry.preloaded_icon.is_none() && entry.path.is_some())
+    {
+        preload_missing_icons(entries);
+    }
     for entry in entries {
-        if let Some(icon) = &entry.preloaded_icon {
-            entry.icon = loader.load_hicon(dc, icon.raw());
-            if entry.icon.is_some() {
+        if let Some(bmp) = &entry.preloaded_icon {
+            if let Some(icon) = unsafe { crate::drawer_icons::load_icon_bitmap(dc, bmp) } {
+                entry.icon = Some(icon);
                 continue;
             }
         }
-        entry.icon = match &entry.path {
-            Some(path) => {
-                let kind = classify_path(Path::new(path));
-                loader.load(dc, path, icon_px, kind)
-            }
-            None => entry
-                .pidl
-                .as_ref()
-                .and_then(|pidl| loader.load_pidl(dc, pidl.as_ptr())),
-        };
+        // No cached icon (extraction failed, timed out, or the helper crashed):
+        // the tile falls back to its glyph — the dock never queries the shell here.
     }
+    crate::drawer_icons::cleanup();
 }
 
 unsafe fn reload_entries(panel: &mut Drawer, refresh_scan: bool) {
@@ -1098,7 +1110,11 @@ unsafe fn show_entry_menu(hwnd: HWND, panel: &mut Drawer, entry: usize) {
     match cmd.0 as usize {
         ID_CTX_OPEN => {
             if let Some(item) = panel.entries.get(entry) {
-                desktop_scan::launch(item.path.as_deref(), item.pidl.as_ref().map(|p| p.as_ptr()));
+                desktop_scan::launch(
+                    item.path.as_deref(),
+                    item.pidl.as_ref().map(|p| p.as_ptr()),
+                    Some(&item.key),
+                );
                 start_close(hwnd, panel);
             }
         }
@@ -1250,6 +1266,7 @@ unsafe fn on_up(hwnd: HWND, panel: &mut Drawer, x: f32, y: f32) {
             desktop_scan::launch(
                 entry.path.as_deref(),
                 entry.pidl.as_ref().map(|p| p.as_ptr()),
+                Some(&entry.key),
             );
             start_close(hwnd, panel);
         }
