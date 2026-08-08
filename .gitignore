@@ -23,3 +23,6 @@ Cargo.lock.bak
 /_r2.txt
 /问题审查.md
 /规划.md
+
+# WorkBuddy agent memory (tool directory, not source).
+.workbuddy/
