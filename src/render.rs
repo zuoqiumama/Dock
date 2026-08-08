@@ -189,6 +189,7 @@ pub unsafe fn draw(
         if indicator_presence <= 0.02 {
             continue;
         }
+        let rise = (1.0 - ic.presence) * ENTER_RISE * base;
         draw_running_dot(
             dc,
             brush,
@@ -197,6 +198,8 @@ pub unsafe fn draw(
             base,
             indicator_presence,
             running_dot,
+            ic.bounce_y,
+            rise,
         );
     }
     dc.SetTransform(&IDENTITY);
@@ -326,6 +329,8 @@ unsafe fn draw_drawer(dc: &ID2D1DeviceContext, brush: &ID2D1SolidColorBrush, til
 }
 
 /// A small "running" dot centered under an icon, in the pill's bottom padding.
+/// The dot follows the icon's bounce and enter-rise offsets so it stays visually
+/// attached to the icon instead of being left behind during click/birth animations.
 unsafe fn draw_running_dot(
     dc: &ID2D1DeviceContext,
     brush: &ID2D1SolidColorBrush,
@@ -334,9 +339,12 @@ unsafe fn draw_running_dot(
     base: f32,
     presence: f32,
     style: RunningDotStyle,
+    bounce_y: f32,
+    rise: f32,
 ) {
     let radius = (base * 0.045).max(2.0);
-    let y = baseline + base * 0.09; // just below the icon, inside the pill padding
+    // Icon moves up by bounce_y and down by rise; the dot tracks it identically.
+    let y = baseline + base * 0.09 - bounce_y + rise;
     brush.SetColor(&color(
         style.rgb.0,
         style.rgb.1,

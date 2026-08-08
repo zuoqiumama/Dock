@@ -1735,6 +1735,11 @@ unsafe fn apply_slider(panel: &mut Panel, lay: &Layout, x: f32) {
     let level = ((x - bar.left) / (bar.right - bar.left)).clamp(0.0, 1.0);
     if let Some(audio) = &panel.audio {
         audio.set_level(level);
+        // set_level unmutes the system when level > 0; keep the UI snapshot in
+        // sync so the bar and icon reflect the real state after a mute toggle.
+        if level > 0.0 {
+            panel.vol_muted = false;
+        }
     }
     panel.vol_level = level; // keep the render snapshot in sync with the drag
 }
@@ -1743,6 +1748,9 @@ unsafe fn handle_release(hwnd: HWND, panel: &mut Panel, x: f32, y: f32) {
     if panel.dragging {
         panel.dragging = false;
         let _ = ReleaseCapture();
+        // Ensure the final slider position is painted after the drag ends.
+        apply_slider(panel, &layout(panel.width, panel.height, panel.dpi), x);
+        render(panel);
         return;
     }
     let action = action_at(panel, x, y);

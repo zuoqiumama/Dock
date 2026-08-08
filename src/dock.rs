@@ -399,7 +399,17 @@ impl Dock {
         moving
     }
 
-    /// Compute the current laid-out frame (dynamic widths, centered row).
+    /// Compute the current laid-out frame (dynamic widths, cursor-anchored).
+    ///
+    /// The icon closest to the cursor is pinned at its **resting** centre and
+    /// neighbours are pushed outward using magnified widths.  This prevents the
+    /// hovered (and therefore clicked) icon from drifting sideways when adjacent
+    /// icons also magnify — which made the click-bounce and panel-open animations
+    /// appear to originate from the wrong screen position.
+    ///
+    /// When the cursor is absent the layout falls back to a symmetric expand about
+    /// the row centre, which is mathematically identical to the old re-centre
+    /// algorithm at every scale value.
     pub fn frame(&self) -> Frame {
         let (base, gap) = self.metrics();
         let n = self.items.len();
@@ -410,33 +420,86 @@ impl Dock {
                 pill: (0.0, 0.0, 0.0, 0.0),
             };
         }
-        // Width AND the gap before each slot collapse with `presence`, so adding or
-        // removing an item slides its neighbours over smoothly instead of snapping.
+        // Magnified widths (with scale and presence) — used for spacing so that
+        // a magnified icon pushes its neighbours apart.
         let widths: Vec<f32> = (0..n)
             .map(|i| self.item_w(i) * self.slots[i].scale * self.slots[i].presence)
             .collect();
-        let total: f32 =
-            widths.iter().sum::<f32>() + (1..n).map(|i| gap * self.slots[i].presence).sum::<f32>();
-        let mut x = (self.win_w - total) / 2.0;
+        // Resting widths (scale = 1, with presence) — used to compute the resting
+        // centres that the cursor-anchored layout pivots on.
+        let rest_widths: Vec<f32> = (0..n)
+            .map(|i| self.item_w(i) * self.slots[i].presence)
+            .collect();
+        let rest_total: f32 = rest_widths.iter().sum::<f32>()
+            + (1..n).map(|i| gap * self.slots[i].presence).sum::<f32>();
+
+        // Resting centres: where each icon would sit at scale = 1.
+        let mut rest_cx = Vec::with_capacity(n);
+        {
+            let mut x = (self.win_w - rest_total) / 2.0;
+            for (i, &w) in rest_widths.iter().enumerate() {
+                if i > 0 {
+                    x += gap * self.slots[i].presence;
+                }
+                rest_cx.push(x + w / 2.0);
+                x += w;
+            }
+        }
+
+        // Anchor: the icon closest to the cursor.  When there is no cursor the
+        // centre icon is used, which reproduces the original symmetric re-centre.
+        let anchor_idx = match self.cursor_x {
+            Some(cx) => rest_cx
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    (*a - cx)
+                        .abs()
+                        .partial_cmp(&(*b - cx).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(i, _)| i)
+                .unwrap_or(n / 2),
+            None => n / 2,
+        };
+
+        // Pin the anchor at its resting centre, then lay out outward using the
+        // magnified widths.  Icons to the right extend left→right; icons to the
+        // left extend right→left.  Gap before slot `i` is `gap * presence[i]`,
+        // matching the original left-to-right sweep.
+        let mut centers = vec![0.0f32; n];
+        centers[anchor_idx] = rest_cx[anchor_idx];
+
+        // Right of anchor
+        let mut edge = centers[anchor_idx] + widths[anchor_idx] / 2.0;
+        for i in (anchor_idx + 1)..n {
+            edge += gap * self.slots[i].presence;
+            centers[i] = edge + widths[i] / 2.0;
+            edge += widths[i];
+        }
+        // Left of anchor
+        let mut edge = centers[anchor_idx] - widths[anchor_idx] / 2.0;
+        for i in (0..anchor_idx).rev() {
+            edge -= gap * self.slots[i + 1].presence;
+            centers[i] = edge - widths[i] / 2.0;
+            edge -= widths[i];
+        }
+
         // auto-hide slide: shown floats SHOWN_GAP above the bottom; hidden slides down.
         let shown_baseline = self.win_h - (PILL_PAD_Y + SHOWN_GAP) * self.dpi;
         let baseline = shown_baseline + (1.0 - self.reveal) * self.hide_slide();
         let mut icons = Vec::with_capacity(n);
-        for (i, &w) in widths.iter().enumerate() {
-            if i > 0 {
-                x += gap * self.slots[i].presence;
-            }
+        for (i, &cx) in centers.iter().enumerate() {
             // single smooth hop: 0 at phase 1 -> peak at 0.5 -> 0 at phase 0
             let bounce_y = (self.slots[i].bounce * std::f32::consts::PI).sin() * BOUNCE_AMP * base;
             icons.push(IconFrame {
                 idx: i,
-                cx: x + w / 2.0,
+                cx,
                 scale: self.slots[i].scale,
                 bounce_y,
                 presence: self.slots[i].presence,
                 running_presence: self.slots[i].running_presence,
             });
-            x += w;
         }
         let pill_l = icons[0].cx - widths[0] / 2.0 - PILL_PAD_X * self.dpi;
         let pill_r = icons[n - 1].cx + widths[n - 1] / 2.0 + PILL_PAD_X * self.dpi;
@@ -451,6 +514,7 @@ impl Dock {
 
     pub fn hit_test(&self, x: f32, y: f32) -> Option<usize> {
         let f = self.frame();
+        let (base, _) = self.metrics();
         for ic in &f.icons {
             if self.items[ic.idx].role == ItemRole::Divider {
                 continue; // separators aren't clickable
@@ -460,10 +524,15 @@ impl Dock {
                 continue;
             }
             let w = self.item_w(ic.idx) * ic.scale * ic.presence;
+            // The icon's visual bottom follows the same animation offsets the renderer
+            // applies: bounce up (`-bounce_y`) and enter rise (`+rise`).  The hit zone
+            // must track that movement so a click on the bouncing icon still registers.
+            let rise = (1.0 - ic.presence) * ENTER_RISE * base;
+            let icon_bottom = f.baseline - ic.bounce_y + rise;
             if x >= ic.cx - w / 2.0
                 && x <= ic.cx + w / 2.0
-                && y >= f.baseline - w
-                && y <= f.baseline
+                && y >= icon_bottom - w
+                && y <= icon_bottom
             {
                 return Some(ic.idx);
             }
@@ -858,6 +927,60 @@ mod tests {
             ]
         );
         assert_eq!(remap, vec![Some(0), Some(1), Some(2), None, Some(3)]);
+    }
+
+    #[test]
+    fn cursor_anchored_icon_stays_at_resting_centre() {
+        // Five icons so the middle one (index 2) has neighbours on both sides
+        // that also magnify when the cursor is nearby.
+        let mut dock = seeded(vec![
+            pinned("a", None),
+            pinned("b", None),
+            pinned("c", None),
+            pinned("d", None),
+            pinned("e", None),
+        ]);
+
+        // Resting centres with no cursor.
+        let rest = dock.rest_centers();
+        let hovered = 2;
+        dock.cursor_x = Some(rest[hovered]);
+
+        // Tick until the magnification eases to its target.
+        for _ in 0..200 {
+            if !dock.tick() {
+                break;
+            }
+        }
+
+        let frame = dock.frame();
+        let magnified_cx = frame.icons.iter().find(|ic| ic.idx == hovered).unwrap().cx;
+
+        // The hovered icon must stay at its resting centre — this is the fix.
+        // Before the fix the entire row was re-centred on magnified widths, which
+        // shifted the hovered icon sideways when neighbours also magnified.
+        assert!(
+            (magnified_cx - rest[hovered]).abs() < 0.5,
+            "hovered icon drifted from resting centre: rest={} mag={}",
+            rest[hovered],
+            magnified_cx
+        );
+
+        // Neighbours should have been pushed *outward* (away from the cursor).
+        let left_cx = frame.icons.iter().find(|ic| ic.idx == 0).unwrap().cx;
+        let right_cx = frame.icons.iter().find(|ic| ic.idx == 4).unwrap().cx;
+        assert!(
+            left_cx < rest[0],
+            "left neighbour should shift left: rest={} got={}",
+            rest[0],
+            left_cx
+        );
+        assert!(
+            right_cx > rest[4],
+            "right neighbour should shift right: rest={} got={}",
+            rest[4],
+            right_cx
+        );
     }
 
     #[test]
