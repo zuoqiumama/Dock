@@ -407,6 +407,15 @@ impl Dock {
     /// icons also magnify — which made the click-bounce and panel-open animations
     /// appear to originate from the wrong screen position.
     ///
+    /// The anchor is *continuous*, not discrete: as the cursor travels between two
+    /// neighbouring resting centres, the layout eases linearly from the "anchored
+    /// at the left icon" pose to the "anchored at the right icon" pose.  The two
+    /// poses differ by a single constant row shift (the two icons' combined
+    /// magnification extras, halved), so blending just slides the whole row by
+    /// `f * shift` — the old discrete anchor snapped the row by that amount in
+    /// one frame every time the cursor crossed an icon centre, which read as
+    /// left/right trembling while sweeping across the dock.
+    ///
     /// When the cursor is absent the layout falls back to a symmetric expand about
     /// the row centre, which is mathematically identical to the old re-centre
     /// algorithm at every scale value.
@@ -446,43 +455,61 @@ impl Dock {
             }
         }
 
-        // Anchor: the icon closest to the cursor.  When there is no cursor the
-        // centre icon is used, which reproduces the original symmetric re-centre.
-        let anchor_idx = match self.cursor_x {
-            Some(cx) => rest_cx
-                .iter()
-                .enumerate()
-                .min_by(|(_, a), (_, b)| {
-                    (*a - cx)
-                        .abs()
-                        .partial_cmp(&(*b - cx).abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .map(|(i, _)| i)
-                .unwrap_or(n / 2),
-            None => n / 2,
-        };
-
+        let mut centers = vec![0.0f32; n];
         // Pin the anchor at its resting centre, then lay out outward using the
         // magnified widths.  Icons to the right extend left→right; icons to the
         // left extend right→left.  Gap before slot `i` is `gap * presence[i]`,
         // matching the original left-to-right sweep.
-        let mut centers = vec![0.0f32; n];
-        centers[anchor_idx] = rest_cx[anchor_idx];
-
+        let anchor = match self.cursor_x {
+            // The icon whose resting centre is the LEFT edge of the cursor's
+            // segment.  (Not the *closest* centre: at the midpoint between two
+            // icons the closest flips, which would reset the blend below and
+            // snap the row — using the left edge keeps the blend continuous.)
+            Some(cx) => {
+                let mut j = 0;
+                while j + 1 < n && cx >= rest_cx[j + 1] {
+                    j += 1;
+                }
+                j
+            }
+            None => n / 2,
+        };
+        centers[anchor] = rest_cx[anchor];
         // Right of anchor
-        let mut edge = centers[anchor_idx] + widths[anchor_idx] / 2.0;
-        for i in (anchor_idx + 1)..n {
+        let mut edge = centers[anchor] + widths[anchor] / 2.0;
+        for i in (anchor + 1)..n {
             edge += gap * self.slots[i].presence;
             centers[i] = edge + widths[i] / 2.0;
             edge += widths[i];
         }
         // Left of anchor
-        let mut edge = centers[anchor_idx] - widths[anchor_idx] / 2.0;
-        for i in (0..anchor_idx).rev() {
+        let mut edge = centers[anchor] - widths[anchor] / 2.0;
+        for i in (0..anchor).rev() {
             edge -= gap * self.slots[i + 1].presence;
             centers[i] = edge - widths[i] / 2.0;
             edge -= widths[i];
+        }
+
+        // Continuous-anchor blend: the "anchored at `anchor`" and "anchored at
+        // `anchor + 1`" poses differ by exactly one constant row shift — half of
+        // the two icons' combined magnification extras.  Ease the whole row
+        // toward the next pose by the cursor's fractional progress past the
+        // anchor's resting centre, so crossing an icon's centre slides the row
+        // smoothly instead of snapping it (the old discrete anchor jumped the
+        // whole dock ~38px at every crossing — the "trembling" on hover).
+        if let Some(cx) = self.cursor_x {
+            if anchor + 1 < n {
+                let span = (rest_cx[anchor + 1] - rest_cx[anchor]).max(1e-4);
+                let f = ((cx - rest_cx[anchor]) / span).clamp(0.0, 1.0);
+                let shift = (widths[anchor] - rest_widths[anchor] + widths[anchor + 1]
+                    - rest_widths[anchor + 1])
+                    / 2.0;
+                if f > 0.0 {
+                    for center in &mut centers {
+                        *center -= f * shift;
+                    }
+                }
+            }
         }
 
         // auto-hide slide: shown floats SHOWN_GAP above the bottom; hidden slides down.
@@ -980,6 +1007,54 @@ mod tests {
             "right neighbour should shift right: rest={} got={}",
             rest[4],
             right_cx
+        );
+    }
+
+    #[test]
+    fn cursor_sweep_never_snaps_the_row_sideways() {
+        // Seven icons so several anchor crossings fit inside one sweep. The
+        // discrete anchor used to jump the WHOLE row by ~38px every time the
+        // cursor crossed an icon's centre — the "trembling" while sweeping.
+        let mut dock = seeded(vec![
+            pinned("a", None),
+            pinned("b", None),
+            pinned("c", None),
+            pinned("d", None),
+            pinned("e", None),
+            pinned("f", None),
+            pinned("g", None),
+        ]);
+        let rest = dock.rest_centers();
+        let span = rest[1] - rest[0];
+
+        // Sweep left → right in fine steps, easing magnification fully at each
+        // cursor position (like a slow hover) and tracking the biggest per-step
+        // jump of any icon. A discontinuous anchor flips somewhere in the middle
+        // of the row with a jump far larger than the step size.
+        let mut max_jump = 0.0f32;
+        let mut prev: Vec<f32> = dock.frame().icons.iter().map(|ic| ic.cx).collect();
+        let steps = 400;
+        for step in 1..=steps {
+            let cx = rest[0] - span * 0.5 + span * 1.5 * (step as f32 / steps as f32);
+            dock.cursor_x = Some(cx);
+            for _ in 0..200 {
+                if !dock.tick() {
+                    break;
+                }
+            }
+            let now: Vec<f32> = dock.frame().icons.iter().map(|ic| ic.cx).collect();
+            for (a, b) in now.iter().zip(&prev) {
+                max_jump = max_jump.max((a - b).abs());
+            }
+            prev = now;
+        }
+
+        // A sweep that crosses ~6 icon centres in 400 steps moves the row at
+        // most ~1px per step (magnified bell tracking). The old discrete anchor
+        // produced ~38px snaps — orders of magnitude above any reasonable bound.
+        assert!(
+            max_jump < 2.0,
+            "row snapped by {max_jump}px during a cursor sweep"
         );
     }
 
