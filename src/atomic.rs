@@ -61,3 +61,18 @@ pub fn write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let _ = File::open(parent).and_then(|dir| dir.sync_all());
     Ok(())
 }
+
+/// A stable 128-bit hex digest (FNV-1a over two seeds) of an arbitrary string —
+/// used to derive collision-resistant, filesystem-safe file names from entry keys.
+/// Deliberately dependency-free: the project ships no hash crate.
+pub fn hash_hex(value: &str) -> String {
+    let mut hi: u64 = 0xcbf29ce484222325;
+    let mut lo: u64 = 0x84222325cbf29ce4;
+    for byte in value.as_bytes() {
+        hi ^= *byte as u64;
+        hi = hi.wrapping_mul(0x100000001b3);
+        lo ^= (*byte as u64).rotate_left(5) ^ 0x9e3779b97f4a7c15;
+        lo = lo.wrapping_mul(0x100000001b3);
+    }
+    format!("{hi:016x}{lo:016x}")
+}

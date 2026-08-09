@@ -2174,7 +2174,7 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
         return;
     };
 
-    let glass = match Glass::new(hwnd, width as u32, height as u32) {
+    let glass = match Glass::new(hwnd, width as u32, height as u32, None) {
         Ok(glass) => glass,
         Err(error) => {
             crate::error_log::write("控制中心 GPU 初始化失败", &error);

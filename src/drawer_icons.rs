@@ -40,7 +40,7 @@ const BATCH_TIMEOUT_MS: u32 = 45_000;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Parse `--drawer-icons <job> <outdir>` from the command line. `None` for a
-/// normal dock launch �?checked at the very top of `main`, before any GUI setup.
+/// normal dock launch — checked at the very top of `main`, before any GUI setup.
 pub fn parse_args() -> Option<(PathBuf, PathBuf)> {
     let mut args = std::env::args().skip(1);
     if args.next().as_deref() != Some(FLAG) {
@@ -61,24 +61,24 @@ pub fn run(job: &Path, outdir: &Path) {
     else {
         return;
     };
-    for (idx, path) in read_job(job) {
-        extract_bmp(&wic, &path, outdir, idx);
+    for (key, path) in read_job(job) {
+        extract_bmp(&wic, &key, &path, outdir);
     }
 }
 
-fn read_job(job: &Path) -> Vec<(usize, String)> {
+fn read_job(job: &Path) -> Vec<(String, String)> {
     let Ok(text) = fs::read_to_string(job) else {
         return Vec::new();
     };
     text.lines()
         .filter_map(|line| {
             let mut parts = line.splitn(2, '\t');
-            let idx = parts.next()?.parse().ok()?;
+            let key = unescape(parts.next()?);
             let path = unescape(parts.next()?);
-            if path.is_empty() {
+            if key.is_empty() || path.is_empty() {
                 None
             } else {
-                Some((idx, path))
+                Some((key, path))
             }
         })
         .collect()
@@ -94,7 +94,7 @@ fn unescape(value: &str) -> String {
 
 /// Extract one path's icon and write it as a 32bpp BMP. Failures are skipped
 /// silently �?the dock falls back to a glyph tile for anything without a file.
-fn extract_bmp(wic: &IWICImagingFactory, path: &str, outdir: &Path, idx: usize) {
+fn extract_bmp(wic: &IWICImagingFactory, key: &str, path: &str, outdir: &Path) {
     let Some(icon) = (unsafe { icons::source_icon(path, 256) }) else {
         return;
     };
@@ -120,7 +120,7 @@ fn extract_bmp(wic: &IWICImagingFactory, path: &str, outdir: &Path, idx: usize) 
     if unsafe { bitmap.CopyPixels(&rect, stride, &mut pixels) }.is_err() {
         return;
     }
-    let target = outdir.join(format!("{idx}.bmp"));
+    let target = outdir.join(icon_file_name(key));
     write_bmp(&target, width, height, &pixels);
 }
 
@@ -197,26 +197,27 @@ pub unsafe fn load_icon_bitmap(dc: &ID2D1DeviceContext, path: &Path) -> Option<I
     dc.CreateBitmapFromWicBitmap(&src, None).ok()
 }
 
-/// Dock side: run one extraction batch for `jobs` (`(entry index, path)` pairs) in a
-/// helper process. Returns the BMP file written for each successful job index.
-/// NEVER panics and NEVER blocks longer than `BATCH_TIMEOUT_MS` �?a crashing or hung
+/// Dock side: run one extraction batch for `jobs` (`(entry key, path)` pairs) in a
+/// helper process. Returns the BMP file written for each successful job key.
+/// NEVER panics and NEVER blocks longer than `BATCH_TIMEOUT_MS` — a crashing or hung
 /// shell extension costs icons, not the dock.
-pub fn extract(jobs: &[(usize, String)]) -> Vec<(usize, PathBuf)> {
+///
+/// BMPs live in a PERSISTENT per-dock cache directory (`icon_cache_root`), named by
+/// the entry key, so they survive drawer open/close cycles — decoding only needs the
+/// file, and re-opening never re-extracts an icon that's already on disk.
+pub fn extract(jobs: &[(String, String)]) -> Vec<(String, PathBuf)> {
     if jobs.is_empty() {
         return Vec::new();
     }
-    let Some(dir) = batch_dir() else {
+    let Some(root) = icon_cache_root() else {
         return Vec::new();
     };
-    let _ = fs::remove_dir_all(&dir);
-    let _ = fs::create_dir_all(&dir);
-    let job = dir.join("job.tsv");
-    let out = dir.join("out");
-    let _ = fs::create_dir_all(&out);
+    let _ = fs::create_dir_all(&root);
+    let job = root.join("job.tsv");
 
     let mut body = String::new();
-    for (idx, path) in jobs {
-        body.push_str(&format!("{idx}\t{}\n", escape(path)));
+    for (key, path) in jobs {
+        body.push_str(&format!("{}\t{}\n", escape(key), escape(path)));
     }
     if fs::write(&job, body).is_err() {
         return Vec::new();
@@ -228,7 +229,7 @@ pub fn extract(jobs: &[(usize, String)]) -> Vec<(usize, PathBuf)> {
     let spawned = std::process::Command::new(exe)
         .arg(FLAG)
         .arg(&job)
-        .arg(&out)
+        .arg(&root)
         .creation_flags(CREATE_NO_WINDOW)
         .spawn();
 
@@ -255,36 +256,40 @@ pub fn extract(jobs: &[(usize, String)]) -> Vec<(usize, PathBuf)> {
         }
     }
 
-    let mut results: Vec<(usize, PathBuf)> = Vec::new();
-    if let Ok(read) = fs::read_dir(&out) {
-        for entry in read.flatten() {
-            let file = entry.file_name();
-            let Some(name) = file.to_str() else {
-                continue;
-            };
-            let Some(idx) = name.strip_suffix(".bmp").and_then(|stem| stem.parse().ok()) else {
-                continue;
-            };
-            if entry.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-                results.push((idx, entry.path()));
-            }
+    let mut results: Vec<(String, PathBuf)> = Vec::new();
+    for (key, _) in jobs {
+        let path = root.join(icon_file_name(key));
+        if path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+            results.push((key.clone(), path));
         }
     }
     results
 }
 
-/// The per-dock temp directory for the current extraction batch. Keyed by dock PID
-/// so a crashed dock's leftovers never collide with a later instance's files.
-fn batch_dir() -> Option<PathBuf> {
+/// A filesystem-safe file name for one entry key: a short SHA-256 hex digest is
+/// enough to keep it unique, stable and short (the helper parses no key out of the
+/// file name, so there's no need to keep the key readable).
+fn icon_file_name(key: &str) -> String {
+    let digest = crate::atomic::hash_hex(key);
+    format!("{}.bmp", &digest[..24])
+}
+
+/// The persistent per-dock icon cache directory. Keyed by dock PID so a crashed
+/// dock's leftovers never collide with a later instance's files.
+fn icon_cache_root() -> Option<PathBuf> {
     let mut dir = std::env::temp_dir();
-    dir.push(format!("featherdock-drawer-icons-{}", std::process::id()));
+    dir.push(format!(
+        "featherdock-drawer-icon-cache-{}",
+        std::process::id()
+    ));
     Some(dir)
 }
 
-/// Remove the extraction batch directory. Called after the BMPs have been decoded
-/// into GPU bitmaps so the temp files don't linger.
+/// Remove the per-dock icon cache directory. Called at dock exit so the temp files
+/// don't linger; the drawer keeps its BMPs across open/close cycles, so this is NOT
+/// called after each open.
 pub fn cleanup() {
-    if let Some(dir) = batch_dir() {
+    if let Some(dir) = icon_cache_root() {
         let _ = fs::remove_dir_all(dir);
     }
 }
@@ -328,10 +333,9 @@ mod tests {
         let _ = fs::create_dir_all(&dir);
         let job = dir.join("job.tsv");
         let path = r"C:\Users\Me\Desktop\My App.lnk";
-        fs::write(&job, format!("0\t{}\n", escape(path))).unwrap();
+        fs::write(&job, format!("{}\t{}\n", escape(path), escape(path))).unwrap();
         let jobs = read_job(&job);
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0], (0, path.to_string()));
+        assert_eq!(jobs, vec![(path.to_string(), path.to_string())]);
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -340,9 +344,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("fd-icon-mal-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
         let job = dir.join("job.tsv");
-        fs::write(&job, "x\tbad\n1\t\n\n2\tC:\\ok.exe\n").unwrap();
+        fs::write(&job, "\tbad\nC:\\ok.exe\t\n\nC:\\ok.exe\tC:\\ok.exe\n").unwrap();
         let jobs = read_job(&job);
-        assert_eq!(jobs, vec![(2, r"C:\ok.exe".to_string())]);
+        assert_eq!(
+            jobs,
+            vec![(r"C:\ok.exe".to_string(), r"C:\ok.exe".to_string())]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

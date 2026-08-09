@@ -19,6 +19,7 @@ use crate::windows_list;
 
 pub struct Gpu {
     _d3d: ID3D11Device,
+    d2device: ID2D1Device,
     dc: ID2D1DeviceContext,
     swapchain: IDXGISwapChain1,
     _dcomp: IDCompositionDevice,
@@ -106,6 +107,7 @@ impl Gpu {
 
         Ok(Gpu {
             _d3d: d3d,
+            d2device,
             dc,
             swapchain,
             _dcomp: dcomp,
@@ -116,6 +118,26 @@ impl Gpu {
             icons: Vec::new(),
             surface_size: (w, h),
         })
+    }
+
+    /// The shared Direct2D device. Popup surfaces (`Glass`) created with this device
+    /// can draw bitmaps that were created on it — so icons decoded once at startup
+    /// (see `drawer::warm_cache`) are reused by the drawer's own surface instead of
+    /// being re-uploaded every time the drawer opens.
+    pub fn d2d_device(&self) -> &ID2D1Device {
+        &self.d2device
+    }
+
+    /// The D3D11 device backing the Direct2D one, needed to create the popup
+    /// swapchains that share it.
+    pub fn d3d_device(&self) -> &ID3D11Device {
+        &self._d3d
+    }
+
+    /// The dock's Direct2D device context (bound to the dock swapchain). Only used
+    /// as a decode context at startup, before the message loop renders anything.
+    pub fn dc(&self) -> &ID2D1DeviceContext {
+        &self.dc
     }
 
     /// Extract one item's real icon into a GPU bitmap. None => draw a glyph/vector.

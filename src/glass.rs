@@ -18,6 +18,9 @@ const POPUP_PRESENT_SYNC_INTERVAL: u32 = 0;
 
 /// Owns the composition surface for one popup window. Draw between `begin()` and
 /// `present()`; both operate in device pixels (1 unit = 1px).
+///
+/// `_d3d` is kept alive because the swapchain (and any shared device) must outlive
+/// the surface; the name keeps rustc quiet about the otherwise-unused field.
 pub struct Glass {
     _d3d: ID3D11Device,
     dc: ID2D1DeviceContext,
@@ -28,16 +31,33 @@ pub struct Glass {
 }
 
 impl Glass {
-    pub unsafe fn new(hwnd: HWND, width: u32, height: u32) -> Result<Glass> {
-        let d3d = create_device(D3D_DRIVER_TYPE_HARDWARE)
-            .or_else(|_| create_device(D3D_DRIVER_TYPE_WARP))?;
+    /// Create a translucent GPU surface for `hwnd`. When `shared` is given, reuse the
+    /// dock's D3D11 + Direct2D devices instead of creating fresh ones — bitmaps decoded
+    /// on the dock (e.g. the drawer's startup icon cache) then work on this surface
+    /// directly, so the drawer opens without re-uploading any icons.
+    pub unsafe fn new(
+        hwnd: HWND,
+        width: u32,
+        height: u32,
+        shared: Option<(&ID3D11Device, &ID2D1Device)>,
+    ) -> Result<Glass> {
+        let (d3d, d2device) = match shared {
+            Some((d3d, d2device)) => (d3d.clone(), d2device.clone()),
+            None => {
+                let d3d = create_device(D3D_DRIVER_TYPE_HARDWARE)
+                    .or_else(|_| create_device(D3D_DRIVER_TYPE_WARP))?;
+                let dxdevice: IDXGIDevice = d3d.cast()?;
+                let factory: ID2D1Factory1 =
+                    D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
+                let d2device = factory.CreateDevice(&dxdevice)?;
+                (d3d, d2device)
+            }
+        };
         let dxdevice: IDXGIDevice = d3d.cast()?;
         if let Ok(dxdevice1) = d3d.cast::<IDXGIDevice1>() {
             let _ = dxdevice1.SetMaximumFrameLatency(1);
         }
 
-        let factory: ID2D1Factory1 = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
-        let d2device = factory.CreateDevice(&dxdevice)?;
         let dc = d2device.CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE)?;
         dc.SetDpi(96.0, 96.0);
 

@@ -41,6 +41,8 @@ mod windows_list;
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
+use windows::Win32::Graphics::Direct2D::ID2D1Device;
+use windows::Win32::Graphics::Direct3D11::ID3D11Device;
 use windows::Win32::Graphics::Gdi::{
     CreateRoundRectRgn, DeleteObject, GetMonitorInfoW, MonitorFromWindow, SetWindowRgn, HGDIOBJ,
     HRGN, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
@@ -187,6 +189,21 @@ fn resting_target(app: &App) -> f32 {
     } else {
         1.0
     }
+}
+
+/// The dock's D3D11 + Direct2D devices, for popup surfaces to share. This is what
+/// lets the drawer reuse the icon bitmaps decoded at startup instead of
+/// re-uploading them on every open. Returns owned clones (the popup keeps them
+/// alive for as long as its own surface exists).
+pub(crate) unsafe fn dock_shared_gpu(hwnd: HWND) -> Option<(ID3D11Device, ID2D1Device)> {
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
+    if ptr.is_null() {
+        return None;
+    }
+    Some((
+        (*ptr).gpu.d3d_device().clone(),
+        (*ptr).gpu.d2d_device().clone(),
+    ))
 }
 
 fn io_error(context: &str, error: std::io::Error) -> Error {
@@ -542,10 +559,17 @@ unsafe fn relayout_to_fit(hwnd: HWND, app: &mut App) -> Result<()> {
 }
 
 unsafe fn recover_gpu(hwnd: HWND, app: &mut App) -> Result<()> {
+    // Bitmaps decoded on the old device are dead — drop them, then re-decode from
+    // the persistent BMP cache onto the new device so the next drawer open is
+    // still instant.
+    drawer::invalidate_icon_cache();
     let (_, _, width, height) = app.full;
     let mut gpu = Gpu::new(hwnd, width as u32, height as u32, app.dock.dpi)?;
     gpu.load_icons(&app.dock.items, app.dock.dpi);
     gpu.render(&app.dock)?;
+    if app.settings.drawer_enabled {
+        drawer::reload_icon_cache(gpu.dc());
+    }
     app.gpu = gpu;
     Ok(())
 }
@@ -901,7 +925,9 @@ fn run() -> Result<()> {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
         if (*app_ptr).settings.drawer_enabled {
-            drawer::warm_cache();
+            // Extract + DECODE every drawer icon now, on the dock's GPU: the first
+            // drawer open then reuses ready-made bitmaps (no upload, no wait).
+            drawer::warm_cache((*app_ptr).gpu.dc());
         }
 
         // Event-driven loop: block in GetMessage when idle (0% CPU); when
@@ -1021,6 +1047,7 @@ unsafe fn cleanup(app_ptr: *mut App) {
         }
         windows_list::remove_hooks(std::mem::take(&mut (*app_ptr).hooks));
         (*app_ptr).tray.remove();
+        drawer_icons::cleanup(); // per-dock icon cache temp dir
         drop(Box::from_raw(app_ptr));
     }
 }

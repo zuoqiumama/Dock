@@ -84,6 +84,14 @@ const ADD_H: f32 = 34.0; // the "new category" button row at the bottom
 /// Ignore a re-open landing right after a click-away close (avoids button-toggle flicker).
 const REOPEN_GUARD_MS: u32 = 220;
 
+/// How many cached BMPs are decoded into GPU bitmaps per timer tick while the
+/// drawer is open, so icons stream in without stalling the first frame.
+const ICON_DECODE_BATCH: usize = 6;
+const TIMER_ICON_LOAD: usize = 3;
+const TIMER_ICON_LOAD_MS: u32 = 30;
+/// Posted by the background extraction thread once its batch is on disk.
+const WM_APP_ICONS_READY: u32 = WM_APP + 0x25;
+
 const ID_CTX_OPEN: usize = 3101;
 const ID_CTX_PIN: usize = 3102;
 const ID_CTX_HIDE: usize = 3103;
@@ -97,9 +105,22 @@ static PANEL_HWND: AtomicIsize = AtomicIsize::new(0);
 static LAST_CLOSED_TICK: AtomicU32 = AtomicU32::new(0);
 
 thread_local! {
-    // Extracted icon PNGs, keyed by entry key. Filled by the helper-process
+    // Extracted icon BMPs, keyed by entry key. Filled by the helper-process
     // extraction (`drawer_icons`); decoded into GPU bitmaps when the drawer opens.
+    // The BMPs live in a persistent per-dock cache directory, so the paths stay
+    // valid across open/close cycles (deleting them on close was what made every
+    // icon fall back to its glyph tile on the second open).
     static PRELOADED_ICONS: RefCell<HashMap<String, PathBuf>> = RefCell::new(HashMap::new());
+    // Decoded GPU bitmaps, keyed by entry key. Decoded ONCE (at startup by
+    // `warm_cache`, or on first use) on the dock's shared Direct2D device, then
+    // reused by every drawer open — opening the drawer uploads nothing.
+    static BITMAP_CACHE: RefCell<HashMap<String, ID2D1Bitmap1>> = RefCell::new(HashMap::new());
+    // Entry keys whose icon extraction failed (helper crash, timeout, or the
+    // shell returned no icon). Skipped on later opens so a broken `.lnk` target
+    // never spawns a fresh extraction batch on every open; cleared by an
+    // explicit "刷新程序列表".
+    static FAILED_EXTRACT: RefCell<std::collections::HashSet<String>> =
+        RefCell::new(std::collections::HashSet::new());
 }
 
 struct Entry {
@@ -138,6 +159,9 @@ struct Drawer {
     editing: bool, // a rename/new-category popup is open → don't dismiss on deactivate
     closing: bool,
     anim_start: Instant,
+    pending_icons: Vec<usize>, // entry indices still waiting for a GPU bitmap
+    extracting: bool,          // a background icon-extraction batch is in flight
+    extraction_keys: Vec<String>, // keys sent to the background batch (failed ones are skipped later)
 }
 
 fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
@@ -368,90 +392,212 @@ fn attach_preloaded_icons(entries: &mut [Entry]) {
     });
 }
 
-/// Batch-extract icons for every path entry that lacks a cached PNG — in a helper
+/// Batch-extract icons for every path entry that lacks a cached BMP — in a helper
 /// process, so a crashing third-party shell extension can never take the dock down.
 /// Virtual (PIDL) entries get no icon at all; the drawer falls back to a glyph tile.
+/// Synchronous: used at startup by `warm_cache`, before any window exists. The
+/// interactive open path instead extracts in the background (see `schedule_icon_load`).
 unsafe fn preload_missing_icons(entries: &mut [Entry]) {
-    let mut jobs: Vec<(usize, String)> = Vec::new();
-    PRELOADED_ICONS.with(|cache| {
-        let cache = cache.borrow();
-        for (i, entry) in entries.iter().enumerate() {
-            if entry.preloaded_icon.is_some() {
-                continue;
-            }
-            if let Some(path) = entry.path.as_deref() {
-                if !cache.contains_key(&entry.key) {
-                    jobs.push((i, path.to_string()));
-                }
-            }
-        }
-    });
+    let jobs = missing_extraction_jobs(entries);
     if jobs.is_empty() {
         return;
     }
-    let pngs = crate::drawer_icons::extract(&jobs);
-    if pngs.is_empty() {
+    let results = crate::drawer_icons::extract(&jobs);
+    mark_failed_jobs(
+        &jobs.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>(),
+        &results,
+    );
+    if results.is_empty() {
         return;
     }
     PRELOADED_ICONS.with(|cache| {
         let mut cache = cache.borrow_mut();
-        for (entry_idx, png) in pngs {
-            let Some(entry) = entries.get_mut(entry_idx) else {
-                continue;
-            };
-            cache.insert(entry.key.clone(), png.clone());
-            entry.preloaded_icon = Some(png);
+        for (key, png) in &results {
+            cache.insert(key.clone(), png.clone());
         }
     });
+    for entry in entries.iter_mut() {
+        if let Some((_, png)) = results.iter().find(|(k, _)| *k == entry.key) {
+            entry.preloaded_icon = Some(png.clone());
+        }
+    }
+}
+
+/// The `(key, path)` jobs for entries that still need an icon extracted — skipping
+/// keys that already failed once this session.
+fn missing_extraction_jobs(entries: &[Entry]) -> Vec<(String, String)> {
+    let failed = FAILED_EXTRACT.with(|f| f.borrow().clone());
+    entries
+        .iter()
+        .filter_map(|entry| {
+            if entry.preloaded_icon.is_some() {
+                return None;
+            }
+            entry
+                .path
+                .as_deref()
+                .map(|path| (entry.key.clone(), path.to_string()))
+        })
+        .filter(|(key, _)| !failed.contains(key))
+        .collect()
+}
+
+/// Remember which job keys produced no BMP, so they are not retried every open.
+fn mark_failed_jobs(job_keys: &[String], results: &[(String, PathBuf)]) {
+    let failed: Vec<String> = job_keys
+        .iter()
+        .filter(|key| !results.iter().any(|(result_key, _)| result_key == *key))
+        .cloned()
+        .collect();
+    if !failed.is_empty() {
+        FAILED_EXTRACT.with(|set| set.borrow_mut().extend(failed));
+    }
 }
 
 /// Warm the drawer's shell scan + icon extraction during dock startup, before the
 /// user opens it. Icon extraction runs out-of-process (`drawer_icons`), so a shell
 /// extension fault here only costs the icons, never the dock.
-pub unsafe fn warm_cache() {
+///
+/// `dc` is the dock's Direct2D context (on the shared device): every cached BMP is
+/// ALSO decoded into `BITMAP_CACHE` right here, so the first drawer open reuses
+/// ready-made GPU bitmaps and uploads nothing.
+pub unsafe fn warm_cache(dc: &ID2D1DeviceContext) {
     let categories = categories::load();
     let mut entries = build_entries(&categories);
     preload_missing_icons(&mut entries);
+    decode_into_cache(dc, &entries);
 }
 
-unsafe fn load_entry_icons(dc: &ID2D1DeviceContext, dpi: f32, entries: &mut [Entry]) {
-    let _ = dpi;
-    // Cold cache (drawer enabled mid-session, or a helper crash left gaps): run one
-    // more out-of-process extraction so real icons still appear — never shell calls
-    // in-process.
-    if entries
-        .iter()
-        .any(|entry| entry.preloaded_icon.is_none() && entry.path.is_some())
-    {
-        preload_missing_icons(entries);
-    }
+/// Decode every entry's cached BMP into `BITMAP_CACHE` (idempotent; existing keys
+/// are kept). Runs at startup and after a GPU reset, never on the drawer open path.
+unsafe fn decode_into_cache(dc: &ID2D1DeviceContext, entries: &[Entry]) {
     for entry in entries {
-        if let Some(bmp) = &entry.preloaded_icon {
+        let Some(bmp) = entry.preloaded_icon.as_deref() else {
+            continue;
+        };
+        let key = entry.key.clone();
+        let cached = BITMAP_CACHE.with(|c| c.borrow().contains_key(&key));
+        if cached {
+            continue;
+        }
+        if let Some(icon) = crate::drawer_icons::load_icon_bitmap(dc, bmp) {
+            BITMAP_CACHE.with(|c| c.borrow_mut().insert(key, icon));
+        }
+    }
+}
+
+/// The entry's GPU bitmap from the shared-device cache, if one was decoded earlier.
+/// Cloning a COM interface is an AddRef — the drawer and the cache share it.
+fn cached_icon(key: &str) -> Option<ID2D1Bitmap1> {
+    BITMAP_CACHE.with(|c| c.borrow().get(key).cloned())
+}
+
+/// Drop every cached GPU bitmap. Called when the dock's GPU is rebuilt (device
+/// lost): bitmaps belong to the old device and must not be drawn on the new one.
+pub fn invalidate_icon_cache() {
+    BITMAP_CACHE.with(|c| c.borrow_mut().clear());
+}
+
+/// Re-decode the cached BMPs onto a (fresh) device, after a GPU reset. Uses the
+/// fast cached desktop scan and never re-extracts — missing icons fall back to
+/// the batched background path on the next drawer open.
+pub unsafe fn reload_icon_cache(dc: &ID2D1DeviceContext) {
+    let categories = categories::load();
+    let entries = build_entries(&categories);
+    decode_into_cache(dc, &entries);
+}
+
+/// Decode one small batch of pending cached BMPs into GPU bitmaps. The drawer is
+/// already visible — glyph tiles hold the place — so this runs on a short timer
+/// instead of blocking the open. Returns true while more icons remain pending.
+/// Successfully decoded bitmaps join `BITMAP_CACHE` so later opens reuse them.
+unsafe fn decode_pending_batch(
+    dc: &ID2D1DeviceContext,
+    entries: &mut [Entry],
+    pending: &mut Vec<usize>,
+) -> bool {
+    let take = pending.len().min(ICON_DECODE_BATCH);
+    for _ in 0..take {
+        let Some(idx) = pending.pop() else { break };
+        let Some(entry) = entries.get_mut(idx) else {
+            continue;
+        };
+        if let Some(bmp) = entry.preloaded_icon.as_deref() {
             if let Some(icon) = unsafe { crate::drawer_icons::load_icon_bitmap(dc, bmp) } {
+                let key = entry.key.clone();
+                BITMAP_CACHE.with(|c| c.borrow_mut().insert(key.clone(), icon.clone()));
                 entry.icon = Some(icon);
-                continue;
             }
         }
-        // No cached icon (extraction failed, timed out, or the helper crashed):
-        // the tile falls back to its glyph — the dock never queries the shell here.
     }
-    crate::drawer_icons::cleanup();
+    !pending.is_empty()
 }
 
-unsafe fn reload_entries(panel: &mut Drawer, refresh_scan: bool) {
+/// Start loading icons without blocking the open:
+///
+/// * Entries that already have a cached BMP (the common case — `warm_cache` filled
+///   them at startup) are queued for batched decode on a short timer, so the first
+///   frame is cheap and icons pop in over a few ticks instead of stalling the
+///   `ShowWindow`.
+/// * Entries with no cached BMP yet are extracted in a background helper process;
+///   when its results arrive (`WM_APP_ICONS_READY`) they join the same decode
+///   queue. A hung/crashed helper costs icons, never the open.
+unsafe fn schedule_icon_load(hwnd: HWND, panel: &mut Drawer) {
+    if !panel.pending_icons.is_empty() {
+        let _ = SetTimer(hwnd, TIMER_ICON_LOAD, TIMER_ICON_LOAD_MS, None);
+    }
+    if panel.extracting {
+        return;
+    }
+    let jobs = missing_extraction_jobs(&panel.entries);
+    if jobs.is_empty() {
+        return;
+    }
+    panel.extracting = true;
+    panel.extraction_keys = jobs.iter().map(|(key, _)| key.clone()).collect();
+    let owner = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        // `extract` never panics and caps its wait, so the thread always posts
+        // (or frees its payload if the drawer window is already gone).
+        let results = crate::drawer_icons::extract(&jobs);
+        let payload = Box::into_raw(Box::new(results));
+        let ok = unsafe {
+            PostMessageW(
+                HWND(owner as *mut c_void),
+                WM_APP_ICONS_READY,
+                WPARAM(0),
+                LPARAM(payload as isize),
+            )
+        }
+        .is_ok();
+        if !ok {
+            drop(unsafe { Box::from_raw(payload) });
+        }
+    });
+}
+
+unsafe fn reload_entries(hwnd: HWND, panel: &mut Drawer, refresh_scan: bool) {
     if refresh_scan {
         desktop_scan::invalidate_cache();
+        // A fresh scan deserves fresh icon attempts.
+        FAILED_EXTRACT.with(|set| set.borrow_mut().clear());
     }
     panel.entries = build_entries(&panel.categories);
-    if refresh_scan {
-        preload_missing_icons(&mut panel.entries);
-    }
-    let dc = panel.glass.dc().clone();
-    load_entry_icons(&dc, panel.dpi, &mut panel.entries);
+    // Re-seed the decode queue with whatever icons are already cached on disk.
+    panel.pending_icons = panel
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.preloaded_icon.is_some())
+        .map(|(i, _)| i)
+        .collect();
+    panel.extraction_keys.clear();
+    panel.extracting = false;
     panel.hovered = -1;
     panel.drag = None;
     panel.relayout();
     render(panel);
+    schedule_icon_load(hwnd, panel);
 }
 
 unsafe fn fill_round(
@@ -1166,9 +1312,9 @@ unsafe fn show_background_menu(hwnd: HWND, panel: &mut Drawer) {
             if let Err(error) = categories::save(&panel.categories) {
                 crate::error_log::write("恢复抽屉隐藏项失败", &error);
             }
-            reload_entries(panel, false);
+            reload_entries(hwnd, panel, false);
         }
-        ID_CTX_REFRESH => reload_entries(panel, true),
+        ID_CTX_REFRESH => reload_entries(hwnd, panel, true),
         _ => {}
     }
 }
@@ -1372,7 +1518,15 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
         return;
     };
 
-    let glass = match Glass::new(hwnd, width as u32, height as u32) {
+    // Share the dock's D3D11 + Direct2D devices so the startup-decoded icon
+    // bitmaps can be drawn on this surface directly (no per-open upload).
+    let shared = crate::dock_shared_gpu(dock_hwnd);
+    let glass = match Glass::new(
+        hwnd,
+        width as u32,
+        height as u32,
+        shared.as_ref().map(|(d3d, d2d)| (d3d, d2d)),
+    ) {
         Ok(glass) => glass,
         Err(error) => {
             crate::error_log::write("应用抽屉 GPU 初始化失败", &error);
@@ -1390,10 +1544,20 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
         }
     };
 
-    // Icons are loaded before the first visible frame. Startup warm_cache() usually
-    // makes this a cheap HICON-to-D2D conversion; if the cache was cold, we still prefer
-    // a short open delay over showing placeholder icons that visibly swap in.
-    load_entry_icons(glass.dc(), dpi, &mut entries);
+    // The drawer shares the dock's Direct2D device, so bitmaps decoded at startup
+    // (`warm_cache` → BITMAP_CACHE) are reused directly — nothing to upload. Only
+    // entries without a cached bitmap fall through to the batched decode timer.
+    let mut pending_icons: Vec<usize> = Vec::new();
+    for (i, entry) in entries.iter_mut().enumerate() {
+        match cached_icon(&entry.key) {
+            Some(icon) => entry.icon = Some(icon),
+            None => {
+                if entry.preloaded_icon.is_some() {
+                    pending_icons.push(i);
+                }
+            }
+        }
+    }
 
     let panel = Box::into_raw(Box::new(Drawer {
         owner: dock_hwnd,
@@ -1420,6 +1584,9 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
         editing: false,
         closing: false,
         anim_start: Instant::now(),
+        pending_icons,
+        extracting: false,
+        extraction_keys: Vec::new(),
     }));
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, panel as isize);
     PANEL_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
@@ -1427,6 +1594,7 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
     render(&*panel);
     let _ = ShowWindow(hwnd, SW_SHOW);
     let _ = SetForegroundWindow(hwnd);
+    schedule_icon_load(hwnd, &mut *panel);
     wake_owner(&*panel);
 }
 
@@ -1554,6 +1722,57 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     } else {
                         let _ = DestroyWindow(hwnd);
                     }
+                }
+                LRESULT(0)
+            }
+            WM_TIMER if wparam.0 == TIMER_ICON_LOAD && !ptr.is_null() => {
+                let panel = &mut *ptr;
+                if panel.closing {
+                    let _ = KillTimer(hwnd, TIMER_ICON_LOAD);
+                } else if !decode_pending_batch(
+                    panel.glass.dc(),
+                    &mut panel.entries,
+                    &mut panel.pending_icons,
+                ) {
+                    // Queue drained: stop ticking and show the final frame.
+                    let _ = KillTimer(hwnd, TIMER_ICON_LOAD);
+                    render(panel);
+                    wake_owner(panel);
+                } else {
+                    // More icons are coming — redraw what we have now.
+                    render(panel);
+                }
+                LRESULT(0)
+            }
+            WM_APP_ICONS_READY if !ptr.is_null() => {
+                // The background extraction finished: merge its BMPs into the cache,
+                // queue the newly-covered entries for decode, and remember which
+                // keys failed so we don't re-extract them every open.
+                let results = Box::from_raw(lparam.0 as *mut Vec<(String, PathBuf)>);
+                let panel = &mut *ptr;
+                panel.extracting = false;
+                mark_failed_jobs(&panel.extraction_keys, &results);
+                panel.extraction_keys.clear();
+                let mut new_pending: Vec<usize> = Vec::new();
+                PRELOADED_ICONS.with(|cache| {
+                    let mut cache = cache.borrow_mut();
+                    for (key, png) in results.iter() {
+                        cache.insert(key.clone(), png.clone());
+                    }
+                });
+                for (i, entry) in panel.entries.iter_mut().enumerate() {
+                    if let Some((_, png)) = results.iter().find(|(key, _)| *key == entry.key) {
+                        entry.preloaded_icon = Some(png.clone());
+                        if entry.icon.is_none() {
+                            new_pending.push(i);
+                        }
+                    }
+                }
+                if !new_pending.is_empty() {
+                    panel.pending_icons.extend(new_pending);
+                    let _ = SetTimer(hwnd, TIMER_ICON_LOAD, TIMER_ICON_LOAD_MS, None);
+                    render(panel);
+                    wake_owner(panel);
                 }
                 LRESULT(0)
             }
