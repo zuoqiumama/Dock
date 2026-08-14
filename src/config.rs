@@ -302,7 +302,15 @@ fn registry_appx_package_names() -> Vec<String> {
 }
 
 fn add_item_at(path: &Path, label: &str, item_path_value: &Path) -> io::Result<bool> {
-    let mut content = fs::read_to_string(path).unwrap_or_else(|_| String::from(HEADER));
+    // A missing config just means "no items yet". Any other read error — invalid
+    // UTF-8, permission denied, transient I/O — must NOT fall back to a default
+    // header, or the atomic write below would replace the user's unreadable file
+    // with one containing only the new item. Mirrors `remove_item_at`.
+    let mut content = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::from(HEADER),
+        Err(error) => return Err(error),
+    };
     let config = parse(&content);
     let new_key = path_key(item_path_value);
     if config
@@ -574,6 +582,41 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("featherdock-config-{nonce}-{name}"))
+    }
+
+    #[test]
+    fn add_item_fails_without_touching_unreadable_config() {
+        let dir = temp_dir("unreadable-config");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("featherdock.toml");
+        // Invalid UTF-8: a UTF-16 BOM followed by "AB".
+        let original = [0xFFu8, 0xFE, 0x00, 0x41, 0x00, 0x42];
+        fs::write(&path, original).unwrap();
+
+        let result = add_item_at(&path, "App", Path::new(r"C:\app.exe"));
+
+        assert!(result.is_err(), "adding to an unreadable config must fail");
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            original,
+            "failed add must not overwrite the original bytes"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn add_item_creates_config_when_file_missing() {
+        let dir = temp_dir("missing-config");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("featherdock.toml");
+
+        let result = add_item_at(&path, "My App", Path::new(r"C:\app.exe"));
+
+        assert!(matches!(result, Ok(true)));
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("label = \"My App\""));
+        assert!(text.contains("path = \"C:\\\\app.exe\""));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
