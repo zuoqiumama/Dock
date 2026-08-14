@@ -28,6 +28,10 @@ pub const EXIT_TAU: f32 = 0.13; // disappear easing — a touch quicker than the
 pub const PRESENCE_GONE: f32 = 0.015; // below this, a fully-exited slot is dropped
 pub const ENTER_RISE: f32 = 0.16; // how far (fraction of icon) a new icon rises into place
 const RUNNING_TAU: f32 = 0.11;
+/// Seconds for the cursor low-pass: `cursor_smooth` eases toward the raw pointer
+/// with this time constant, filtering hand micro-jitter while deliberate sweeps
+/// still track within a couple of frames.
+const BLEND_TAU: f32 = 0.045;
 const MAX_FRAME_DT: f32 = 1.0 / 30.0;
 const IDLE_GAP: f32 = 0.10;
 
@@ -174,6 +178,15 @@ pub struct Dock {
     pub items: Vec<DockItem>,
     slots: Vec<Slot>, // per-item animation state, kept in lockstep with `items`
     pub cursor_x: Option<f32>,
+    /// Low-passed cursor position (px) that `frame` actually lays out against.
+    /// `tick` eases it toward the raw pointer so ±1px hand micro-jitter — which
+    /// the instantaneous anchor blend amplified ~0.7px of row shift per pointer
+    /// pixel into a visible dock tremble — is filtered like every other dock
+    /// animation. Reset to the raw position whenever the cursor re-enters.
+    cursor_smooth: f32,
+    /// Whether `cursor_x` was `Some` at the previous tick (drives the re-entry
+    /// reset of `cursor_smooth`).
+    had_cursor: bool,
     pub reveal: f32,        // 0 = fully hidden (slid down), 1 = fully shown
     pub reveal_target: f32, // where reveal is easing toward
     pub theme: ThemePreset,
@@ -211,6 +224,8 @@ impl Dock {
             // Whatever is present at construction starts fully shown (no intro animation).
             slots,
             cursor_x: None,
+            cursor_smooth: 0.0,
+            had_cursor: false,
             // Start shown; main.rs decides the resting target from settings + the
             // fullscreen state (always-resident vs. auto-hide vs. fullscreen retract).
             reveal: 1.0,
@@ -396,7 +411,50 @@ impl Dock {
         } else {
             self.reveal = self.reveal_target;
         }
+        // Cursor low-pass: ease `cursor_smooth` toward the raw pointer so the
+        // layout (magnification bell + anchor blend) derives from a filtered
+        // position. Tracking the raw pointer directly moved the row ~0.7px per
+        // pointer pixel, amplifying ±1px hand micro-jitter into a visible dock
+        // tremble. Re-entry resets to the raw position so the layout never
+        // starts from a stale cursor.
+        if let Some(cx) = self.cursor_x {
+            if self.had_cursor {
+                let dcx = cx - self.cursor_smooth;
+                if dcx.abs() > 0.001 {
+                    self.cursor_smooth += dcx * (1.0 - (-dt / BLEND_TAU).exp());
+                    moving = true;
+                } else {
+                    self.cursor_smooth = cx;
+                }
+            } else {
+                self.cursor_smooth = cx;
+            }
+        }
+        self.had_cursor = self.cursor_x.is_some();
         moving
+    }
+
+    /// The cursor position `frame` lays out against: the raw pointer right after
+    /// entry, then the low-passed `cursor_smooth` (see `tick`).
+    fn smooth_cursor(&self) -> Option<f32> {
+        self.cursor_x.map(|_| self.cursor_smooth)
+    }
+
+    /// Index of the anchor for the current cursor: the icon whose resting centre
+    /// is the LEFT edge of the cursor's segment. (Not the *closest* centre: at the
+    /// midpoint between two icons the closest flips, which would reset the blend
+    /// and snap the row — using the left edge keeps the blend continuous.)
+    fn anchor_index(&self, rest_cx: &[f32]) -> usize {
+        match self.smooth_cursor() {
+            Some(cx) => {
+                let mut j = 0;
+                while j + 1 < rest_cx.len() && cx >= rest_cx[j + 1] {
+                    j += 1;
+                }
+                j
+            }
+            None => rest_cx.len() / 2,
+        }
     }
 
     /// Compute the current laid-out frame (dynamic widths, cursor-anchored).
@@ -460,20 +518,7 @@ impl Dock {
         // magnified widths.  Icons to the right extend left→right; icons to the
         // left extend right→left.  Gap before slot `i` is `gap * presence[i]`,
         // matching the original left-to-right sweep.
-        let anchor = match self.cursor_x {
-            // The icon whose resting centre is the LEFT edge of the cursor's
-            // segment.  (Not the *closest* centre: at the midpoint between two
-            // icons the closest flips, which would reset the blend below and
-            // snap the row — using the left edge keeps the blend continuous.)
-            Some(cx) => {
-                let mut j = 0;
-                while j + 1 < n && cx >= rest_cx[j + 1] {
-                    j += 1;
-                }
-                j
-            }
-            None => n / 2,
-        };
+        let anchor = self.anchor_index(&rest_cx);
         centers[anchor] = rest_cx[anchor];
         // Right of anchor
         let mut edge = centers[anchor] + widths[anchor] / 2.0;
@@ -492,12 +537,15 @@ impl Dock {
 
         // Continuous-anchor blend: the "anchored at `anchor`" and "anchored at
         // `anchor + 1`" poses differ by exactly one constant row shift — half of
-        // the two icons' combined magnification extras.  Ease the whole row
+        // the two icons' combined magnification extras.  Slide the whole row
         // toward the next pose by the cursor's fractional progress past the
         // anchor's resting centre, so crossing an icon's centre slides the row
         // smoothly instead of snapping it (the old discrete anchor jumped the
-        // whole dock ~38px at every crossing — the "trembling" on hover).
-        if let Some(cx) = self.cursor_x {
+        // whole dock ~38px at every crossing — the "trembling" on hover). The
+        // cursor here is the LOW-PASSED position, so the blend no longer tracks
+        // the raw pointer pixel-for-pixel (that amplified ±1px hand micro-jitter
+        // into a residual tremble).
+        if let Some(cx) = self.smooth_cursor() {
             if anchor + 1 < n {
                 let span = (rest_cx[anchor + 1] - rest_cx[anchor]).max(1e-4);
                 let f = ((cx - rest_cx[anchor]) / span).clamp(0.0, 1.0);
@@ -1008,6 +1056,84 @@ mod tests {
             rest[4],
             right_cx
         );
+    }
+
+    #[test]
+    fn frame_lays_out_against_the_smoothed_cursor_not_the_raw_pointer() {
+        // `frame` must use the low-passed cursor (`cursor_smooth`), not the raw
+        // `cursor_x`: tracking the raw pointer directly moved the whole row
+        // ~0.7px per pointer pixel, which made the dock tremble while the cursor
+        // swept across icons.
+        let mut dock = seeded(vec![
+            pinned("a", None),
+            pinned("b", None),
+            pinned("c", None),
+        ]);
+        for s in &mut dock.slots {
+            s.scale = 1.5; // deterministic magnified widths (no real-time easing)
+        }
+        let rest = dock.rest_centers();
+        // Raw cursor mid-way between icon 0 and 1 (raw progress f = 0.5).
+        dock.cursor_x = Some((rest[0] + rest[1]) / 2.0);
+
+        dock.cursor_smooth = rest[0]; // smoothed cursor at icon 0's centre: f = 0
+        let anchor_pose: Vec<f32> = dock.frame().icons.iter().map(|ic| ic.cx).collect();
+        dock.cursor_smooth = rest[1]; // smoothed cursor at icon 1's centre: pose(1)
+        let shifted_pose: Vec<f32> = dock.frame().icons.iter().map(|ic| ic.cx).collect();
+        let total: f32 = anchor_pose
+            .iter()
+            .zip(&shifted_pose)
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(
+            total > 1.0,
+            "cursor_smooth must drive the row shift, got {total}px"
+        );
+
+        // The mid-point cursor must land exactly half-way between the two poses.
+        // If `frame` still read the raw cursor it would use f = 0.5 in all three
+        // poses above, pinning them together.
+        dock.cursor_smooth = (rest[0] + rest[1]) / 2.0;
+        let mid_pose: Vec<f32> = dock.frame().icons.iter().map(|ic| ic.cx).collect();
+        for ((m, a), b) in mid_pose.iter().zip(&anchor_pose).zip(&shifted_pose) {
+            assert!(
+                (m - (a + b) / 2.0).abs() < 1e-3,
+                "mid-point cursor must interpolate half-way between the poses"
+            );
+        }
+    }
+
+    #[test]
+    fn wake_frame_does_not_snap_the_row_to_the_raw_cursor() {
+        // Slow slides wake the idle message loop once per 1px pointer step, and
+        // the wake frame ticks with dt = 0. The raw blend used to apply the new
+        // cursor position instantly on that frame — a one-frame row snap on every
+        // step. The low-passed cursor must not move at dt = 0.
+        let mut dock = seeded(vec![
+            pinned("a", None),
+            pinned("b", None),
+            pinned("c", None),
+        ]);
+        for s in &mut dock.slots {
+            s.scale = 1.5; // deterministic magnified widths (no real-time easing)
+        }
+        let rest = dock.rest_centers();
+        let mid = (rest[0] + rest[1]) / 2.0;
+        dock.cursor_x = Some(mid);
+        dock.tick(); // entry reset: cursor_smooth jumps to the raw position
+
+        let before: Vec<f32> = dock.frame().icons.iter().map(|ic| ic.cx).collect();
+        // 1px pointer step, then the dt = 0 wake tick.
+        dock.cursor_x = Some(mid + 1.0);
+        dock.wake_animation_clock();
+        dock.tick();
+        let after: Vec<f32> = dock.frame().icons.iter().map(|ic| ic.cx).collect();
+        for (a, b) in before.iter().zip(&after) {
+            assert!(
+                (a - b).abs() < 1e-3,
+                "dt=0 wake frame moved the row: {a} -> {b}"
+            );
+        }
     }
 
     #[test]
