@@ -83,12 +83,12 @@ if ($Verify) {
     cargo fmt --all -- --check
     if ($LASTEXITCODE -ne 0) { throw "cargo fmt --check failed (exit $LASTEXITCODE)" }
 
-    Write-Host '==> Verify: cargo clippy --all-targets -- -D warnings' -ForegroundColor Cyan
-    cargo clippy --all-targets -- -D warnings
+    Write-Host '==> Verify: cargo clippy --all-targets --locked -- -D warnings' -ForegroundColor Cyan
+    cargo clippy --all-targets --locked -- -D warnings
     if ($LASTEXITCODE -ne 0) { throw "cargo clippy failed (exit $LASTEXITCODE)" }
 
-    Write-Host '==> Verify: cargo test' -ForegroundColor Cyan
-    cargo test
+    Write-Host '==> Verify: cargo test --locked' -ForegroundColor Cyan
+    cargo test --locked
     if ($LASTEXITCODE -ne 0) { throw "cargo test failed (exit $LASTEXITCODE)" }
 
     Write-Host '   Verify passed; proceeding to release build.' -ForegroundColor Green
@@ -105,9 +105,9 @@ if ($Verify) {
 $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE '.cargo' }
 $env:RUSTFLAGS = "-C link-self-contained=yes --remap-path-prefix=$env:USERPROFILE=/home --remap-path-prefix=$cargoHome=/cargo"
 
-Write-Host '==> cargo build --release' -ForegroundColor Cyan
-cargo build --release
-if ($LASTEXITCODE -ne 0) { throw "cargo build --release failed (exit $LASTEXITCODE)" }
+Write-Host '==> cargo build --release --locked' -ForegroundColor Cyan
+cargo build --release --locked
+if ($LASTEXITCODE -ne 0) { throw "cargo build --release --locked failed (exit $LASTEXITCODE)" }
 
 # Locate the freshly built release binary. Triple-agnostic (the project pins
 # x86_64-pc-windows-gnu in .cargo/config.toml, which adds a nested folder) and
