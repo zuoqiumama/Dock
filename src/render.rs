@@ -93,12 +93,14 @@ pub unsafe fn draw(
         if item.role == ItemRole::Divider {
             dc.SetTransform(&IDENTITY);
             draw_divider(
-                dc,
-                brush,
-                ic.cx,
-                frame.baseline,
-                base,
-                p,
+                &IndicatorCtx {
+                    dc,
+                    brush,
+                    cx: ic.cx,
+                    baseline: frame.baseline,
+                    base,
+                    presence: p,
+                },
                 theme.divider_alpha,
             );
             continue;
@@ -191,12 +193,14 @@ pub unsafe fn draw(
         }
         let rise = (1.0 - ic.presence) * ENTER_RISE * base;
         draw_running_dot(
-            dc,
-            brush,
-            ic.cx,
-            frame.baseline,
-            base,
-            indicator_presence,
+            &IndicatorCtx {
+                dc,
+                brush,
+                cx: ic.cx,
+                baseline: frame.baseline,
+                base,
+                presence: indicator_presence,
+            },
             running_dot,
             ic.bounce_y,
             rise,
@@ -209,31 +213,37 @@ fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
 }
 
-/// A soft vertical line separating pinned apps from open windows.
-unsafe fn draw_divider(
-    dc: &ID2D1DeviceContext,
-    brush: &ID2D1SolidColorBrush,
+/// Per-frame geometry shared by the small under-icon cues (the divider and the
+/// running dot): both draw at the same resting centre, baseline and base size,
+/// scaled by presence. Grouping these six inputs keeps both draw calls' parameter
+/// lists short (clippy `too_many_arguments`).
+struct IndicatorCtx<'a> {
+    dc: &'a ID2D1DeviceContext,
+    brush: &'a ID2D1SolidColorBrush,
     cx: f32,
     baseline: f32,
     base: f32,
     presence: f32,
-    alpha: f32,
-) {
-    let half = (base * 0.022).max(1.0); // ~2px line, scales gently with DPI
-                                        // Grow the line in from the baseline as the slot opens, so it doesn't pop.
-    let height = base * 0.72 * presence;
+}
+
+/// A soft vertical line separating pinned apps from open windows.
+unsafe fn draw_divider(ctx: &IndicatorCtx, alpha: f32) {
+    let half = (ctx.base * 0.022).max(1.0); // ~2px line, scales gently with DPI
+                                            // Grow the line in from the baseline as the slot opens, so it doesn't pop.
+    let height = ctx.base * 0.72 * ctx.presence;
     let line = D2D1_ROUNDED_RECT {
         rect: D2D_RECT_F {
-            left: cx - half,
-            top: baseline - base * 0.10 - height,
-            right: cx + half,
-            bottom: baseline - base * 0.10,
+            left: ctx.cx - half,
+            top: ctx.baseline - ctx.base * 0.10 - height,
+            right: ctx.cx + half,
+            bottom: ctx.baseline - ctx.base * 0.10,
         },
         radiusX: half,
         radiusY: half,
     };
-    brush.SetColor(&color(1.0, 1.0, 1.0, alpha * presence));
-    dc.FillRoundedRectangle(&line, brush);
+    ctx.brush
+        .SetColor(&color(1.0, 1.0, 1.0, alpha * ctx.presence));
+    ctx.dc.FillRoundedRectangle(&line, ctx.brush);
 }
 
 /// The Start button: a 2x2 grid of rounded panes (Windows-logo feel), drawn as
@@ -331,33 +341,23 @@ unsafe fn draw_drawer(dc: &ID2D1DeviceContext, brush: &ID2D1SolidColorBrush, til
 /// A small "running" dot centered under an icon, in the pill's bottom padding.
 /// The dot follows the icon's bounce and enter-rise offsets so it stays visually
 /// attached to the icon instead of being left behind during click/birth animations.
-unsafe fn draw_running_dot(
-    dc: &ID2D1DeviceContext,
-    brush: &ID2D1SolidColorBrush,
-    cx: f32,
-    baseline: f32,
-    base: f32,
-    presence: f32,
-    style: RunningDotStyle,
-    bounce_y: f32,
-    rise: f32,
-) {
-    let radius = (base * 0.045).max(2.0);
+unsafe fn draw_running_dot(ctx: &IndicatorCtx, style: RunningDotStyle, bounce_y: f32, rise: f32) {
+    let radius = (ctx.base * 0.045).max(2.0);
     // Icon moves up by bounce_y and down by rise; the dot tracks it identically.
-    let y = baseline + base * 0.09 - bounce_y + rise;
-    brush.SetColor(&color(
+    let y = ctx.baseline + ctx.base * 0.09 - bounce_y + rise;
+    ctx.brush.SetColor(&color(
         style.rgb.0,
         style.rgb.1,
         style.rgb.2,
-        style.alpha * presence,
+        style.alpha * ctx.presence,
     ));
-    dc.FillEllipse(
+    ctx.dc.FillEllipse(
         &D2D1_ELLIPSE {
-            point: D2D_POINT_2F { x: cx, y },
+            point: D2D_POINT_2F { x: ctx.cx, y },
             radiusX: radius,
             radiusY: radius,
         },
-        brush,
+        ctx.brush,
     );
 }
 
