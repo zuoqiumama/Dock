@@ -28,12 +28,31 @@ pub const EXIT_TAU: f32 = 0.13; // disappear easing — a touch quicker than the
 pub const PRESENCE_GONE: f32 = 0.015; // below this, a fully-exited slot is dropped
 pub const ENTER_RISE: f32 = 0.16; // how far (fraction of icon) a new icon rises into place
 const RUNNING_TAU: f32 = 0.11;
-/// Seconds for the cursor low-pass: `cursor_smooth` eases toward the raw pointer
-/// with this time constant, filtering hand micro-jitter while deliberate sweeps
-/// still track within a couple of frames.
+/// Seconds for the cursor low-pass AT REST: `cursor_smooth` eases toward the raw
+/// pointer with this time constant, filtering hand micro-jitter (±1px) while slow
+/// deliberate drift still tracks closely.
 const BLEND_TAU: f32 = 0.045;
+/// Low-pass time constant while the pointer sweeps FAST. A fixed 45ms filter put
+/// the magnification bell ~70px behind a fast cursor (45ms × ~1500px/s), so during
+/// a quick sweep the bulge visibly chased the pointer — the animation read as
+/// laggy and stiff. The effective constant tightens from `BLEND_TAU` to this as
+/// the pointer accelerates past `BLEND_TRACK_PX_S` (see `adaptive_blend_tau`).
+const BLEND_TAU_FAST: f32 = 0.010;
+/// Raw pointer speed (px/s) where the low-pass starts tightening, reaching
+/// `BLEND_TAU_FAST` at twice this speed. Below it the filter behaves exactly as
+/// the original 45ms constant, so rest-time micro-jitter stays filtered.
+const BLEND_TRACK_PX_S: f32 = 300.0;
 const MAX_FRAME_DT: f32 = 1.0 / 30.0;
 const IDLE_GAP: f32 = 0.10;
+
+/// The low-pass time constant for the measured raw-pointer speed: the full rest
+/// filter up to `BLEND_TRACK_PX_S`, tightening linearly to `BLEND_TAU_FAST` at
+/// twice that speed. Speed-adaptive smoothing keeps two properties at once —
+/// jitter suppression when the hand is still, tight tracking when it sweeps.
+fn adaptive_blend_tau(speed: f32) -> f32 {
+    let t = (speed / BLEND_TRACK_PX_S - 1.0).clamp(0.0, 1.0);
+    BLEND_TAU + (BLEND_TAU_FAST - BLEND_TAU) * t
+}
 
 fn animation_dt(elapsed: f32) -> f32 {
     if elapsed >= IDLE_GAP {
@@ -184,6 +203,11 @@ pub struct Dock {
     /// pixel into a visible dock tremble — is filtered like every other dock
     /// animation. Reset to the raw position whenever the cursor re-enters.
     cursor_smooth: f32,
+    /// Raw pointer position at the previous tick; with `tick`'s dt it yields the
+    /// pointer speed that drives `adaptive_blend_tau`.
+    raw_prev: f32,
+    /// Measured raw-pointer speed (px/s) at the last tick.
+    cursor_speed: f32,
     /// Whether `cursor_x` was `Some` at the previous tick (drives the re-entry
     /// reset of `cursor_smooth`).
     had_cursor: bool,
@@ -225,6 +249,8 @@ impl Dock {
             slots,
             cursor_x: None,
             cursor_smooth: 0.0,
+            raw_prev: 0.0,
+            cursor_speed: 0.0,
             had_cursor: false,
             // Start shown; main.rs decides the resting target from settings + the
             // fullscreen state (always-resident vs. auto-hide vs. fullscreen retract).
@@ -415,19 +441,31 @@ impl Dock {
         // layout (magnification bell + anchor blend) derives from a filtered
         // position. Tracking the raw pointer directly moved the row ~0.7px per
         // pointer pixel, amplifying ±1px hand micro-jitter into a visible dock
-        // tremble. Re-entry resets to the raw position so the layout never
-        // starts from a stale cursor.
+        // tremble. The time constant is SPEED-ADAPTIVE (see `adaptive_blend_tau`):
+        // heavy at rest for jitter suppression, tight during fast sweeps so the
+        // magnification bell stays under the pointer instead of chasing it.
+        // Re-entry resets to the raw position so the layout never starts from a
+        // stale cursor.
         if let Some(cx) = self.cursor_x {
             if self.had_cursor {
+                // dt = 0 wake frames freeze the blend entirely (their easing factor
+                // is 0), so only measured frames update the speed estimate.
+                if dt > 0.0 {
+                    self.cursor_speed = (cx - self.raw_prev).abs() / dt;
+                }
+                self.raw_prev = cx;
+                let blend_tau = adaptive_blend_tau(self.cursor_speed);
                 let dcx = cx - self.cursor_smooth;
                 if dcx.abs() > 0.001 {
-                    self.cursor_smooth += dcx * (1.0 - (-dt / BLEND_TAU).exp());
+                    self.cursor_smooth += dcx * (1.0 - (-dt / blend_tau).exp());
                     moving = true;
                 } else {
                     self.cursor_smooth = cx;
                 }
             } else {
                 self.cursor_smooth = cx;
+                self.raw_prev = cx;
+                self.cursor_speed = 0.0;
             }
         }
         self.had_cursor = self.cursor_x.is_some();
@@ -1101,6 +1139,79 @@ mod tests {
                 "mid-point cursor must interpolate half-way between the poses"
             );
         }
+    }
+
+    #[test]
+    fn blend_tau_tightens_with_pointer_speed_and_keeps_rest_filtering() {
+        // At rest and during slow drift the filter keeps its full 45ms strength —
+        // that is what suppresses ±1px hand micro-jitter.
+        assert_eq!(adaptive_blend_tau(0.0), BLEND_TAU);
+        assert_eq!(adaptive_blend_tau(60.0), BLEND_TAU);
+        // It tightens progressively between 1x and 2x the tracking threshold…
+        let mid = adaptive_blend_tau(BLEND_TRACK_PX_S * 1.5);
+        assert!(mid > BLEND_TAU_FAST && mid < BLEND_TAU, "mid tau {mid}");
+        // …and clamps at the fast constant beyond that.
+        let fast = adaptive_blend_tau(BLEND_TRACK_PX_S * 2.0);
+        assert!((fast - BLEND_TAU_FAST).abs() < 1e-6, "tau {fast}");
+        assert_eq!(
+            adaptive_blend_tau(BLEND_TRACK_PX_S * 20.0).total_cmp(&fast),
+            std::cmp::Ordering::Equal
+        );
+    }
+
+    #[test]
+    fn fast_sweep_keeps_the_smoothed_cursor_on_the_pointer() {
+        // 1200 px/s in 60 fps steps (20 px/frame). The old fixed 45ms low-pass
+        // trailed the pointer by ~54px in steady state, so the magnification
+        // bell visibly chased the cursor — the "laggy, stiff" fast sweep.
+        let mut dock = seeded(vec![
+            pinned("a", None),
+            pinned("b", None),
+            pinned("c", None),
+            pinned("d", None),
+            pinned("e", None),
+        ]);
+        let start = dock.rest_centers()[0];
+        dock.cursor_x = Some(start);
+        dock.tick(); // entry reset: cursor_smooth = raw position
+
+        let dt = 1.0 / 60.0;
+        let mut worst_lag = 0.0f32;
+        for step in 1..=90 {
+            dock.last = Instant::now() - Duration::from_secs_f32(dt);
+            dock.cursor_x = Some(start + 20.0 * step as f32);
+            dock.tick();
+            let lag = (dock.cursor_x.unwrap() - dock.cursor_smooth).abs();
+            worst_lag = worst_lag.max(lag);
+        }
+        assert!(
+            worst_lag < 25.0,
+            "fast sweep lagged {worst_lag}px behind the pointer (was ~54px with the fixed 45ms filter)"
+        );
+    }
+
+    #[test]
+    fn slow_pointer_keeps_the_heavy_jitter_filter() {
+        // A 1px-per-frame drift (60 px/s) is far below the tighten threshold, so
+        // the blend must keep its heavy 45ms strength: the smoothed cursor holds
+        // a ~2.2px trailing offset (alpha ≈ 0.31 per frame). A wrongly tightened
+        // filter (10ms) would collapse that to ~0.2px and re-expose hand tremble.
+        let mut dock = seeded(vec![pinned("a", None), pinned("b", None)]);
+        let start = dock.rest_centers()[0];
+        dock.cursor_x = Some(start);
+        dock.tick(); // entry reset
+
+        let dt = 1.0 / 60.0;
+        for step in 1..=10 {
+            dock.last = Instant::now() - Duration::from_secs_f32(dt);
+            dock.cursor_x = Some(start + step as f32);
+            dock.tick();
+        }
+        let lag = dock.cursor_x.unwrap() - dock.cursor_smooth;
+        assert!(
+            lag > 1.5 && lag < 3.0,
+            "slow drift lag {lag}px — the rest-time jitter filter changed strength"
+        );
     }
 
     #[test]
