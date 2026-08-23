@@ -12,7 +12,11 @@ use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
 
+use std::path::{Path, PathBuf};
+
+use crate::content::{classify_path, ContentKind};
 use crate::dock::{Dock, DockItem, ItemRole, BASE_ICON};
+use crate::drawer_icons;
 use crate::icons::IconLoader;
 use crate::render;
 use crate::windows_list;
@@ -33,6 +37,22 @@ pub struct Gpu {
 
 fn surface_resize_needed(current: (u32, u32), requested: (u32, u32)) -> bool {
     current != requested
+}
+
+/// The shell-extraction source path for an item's icon (job key == source), or None
+/// for items whose icon never comes from the shell (vector glyphs) or that have no
+/// source at all. Mirrors the old in-process fallback chain: a pinned item prefers
+/// its explicit `icon`, a running window its app exe's path.
+unsafe fn icon_source(it: &DockItem) -> Option<String> {
+    match it.role {
+        ItemRole::Pinned => it.icon.clone().or_else(|| it.path.clone()),
+        ItemRole::Running => it.icon.clone().or_else(|| {
+            it.hwnd
+                .map(|raw| HWND(raw as *mut core::ffi::c_void))
+                .and_then(|hwnd| windows_list::process_exe_path(hwnd))
+        }),
+        _ => None,
+    }
 }
 
 impl Gpu {
@@ -140,67 +160,98 @@ impl Gpu {
         &self.dc
     }
 
-    /// Extract one item's real icon into a GPU bitmap. None => draw a glyph/vector.
-    /// Always extracted at max native resolution (256px) so it stays crisp through
-    /// magnification, then high-quality-downscaled at draw time.
-    unsafe fn extract_icon(&self, loader: &IconLoader, it: &DockItem) -> Option<ID2D1Bitmap1> {
-        let size = 256u32;
+    /// Extract + decode the icons for `targets` (indices into `items`).
+    ///
+    /// The SHELL work (`SHDefExtractIconW`, `SHGetFileInfoW`, the JUMBO image list)
+    /// runs in the `--drawer-icons` helper process — those calls activate whatever
+    /// third-party shell extensions are registered on the machine, and a buggy one
+    /// (observed in the wild: PrivaZer's PrivaMenu6.dll) faults and takes its host
+    /// process down; doing this in-process crashed the whole dock whenever a new
+    /// window's icon was extracted. On this side only safe work remains: decoding
+    /// the helper's BMP files (WIC), decoding pinned images (WIC), and asking a
+    /// live window for its own HICON (WM_GETICON — a window message, no shell).
+    unsafe fn extract_bitmaps(
+        &self,
+        items: &[DockItem],
+        targets: &[usize],
+    ) -> Vec<Option<ID2D1Bitmap1>> {
+        let jobs: Vec<(String, String)> = targets
+            .iter()
+            .filter_map(|&i| items.get(i).and_then(|it| icon_source(it)))
+            .map(|src| (src.clone(), src))
+            .collect();
+        let extracted = drawer_icons::extract(&jobs);
+        let loader = IconLoader::new().ok();
+        targets
+            .iter()
+            .map(|&i| {
+                let bmp = items
+                    .get(i)
+                    .and_then(|it| self.decode_icon(loader.as_ref(), it, &extracted));
+                #[cfg(debug_assertions)]
+                if let Some(it) = items.get(i) {
+                    eprintln!("[icon] {:<14} loaded={}", it.label, bmp.is_some());
+                }
+                bmp
+            })
+            .collect()
+    }
+
+    /// Decode one item's icon from a completed helper batch. Never touches the
+    /// shell, so a crashing shell extension can only cost this icon, not the dock.
+    unsafe fn decode_icon(
+        &self,
+        loader: Option<&IconLoader>,
+        it: &DockItem,
+        extracted: &[(String, PathBuf)],
+    ) -> Option<ID2D1Bitmap1> {
+        let bmp_from_jobs = |key: &str| -> Option<ID2D1Bitmap1> {
+            extracted
+                .iter()
+                .find(|(job_key, _)| job_key == key)
+                .and_then(|(_, bmp)| drawer_icons::load_icon_bitmap(&self.dc, bmp))
+        };
         match it.role {
             // Start + Control + Drawer use custom vector glyphs; the divider draws a line.
             ItemRole::Start | ItemRole::Divider | ItemRole::Control | ItemRole::Drawer => None,
-            // Running window: prefer its app exe's full-res icon; fall back to the
-            // window's own icon (WM_GETICON, owned by the app — don't free).
+            // Running window: its app exe's helper-extracted icon, else the window's
+            // own icon (WM_GETICON, owned by the app — don't free).
             ItemRole::Running => {
-                let hwnd = it.hwnd.map(|raw| HWND(raw as *mut core::ffi::c_void));
-                let exe_icon = |exe: &str| {
-                    loader.load(
-                        &self.dc,
-                        exe,
-                        size,
-                        crate::content::ContentKind::Application,
-                    )
-                };
-                it.icon
-                    .as_deref()
-                    .and_then(&exe_icon)
-                    .or_else(|| {
-                        hwnd.and_then(|hwnd| windows_list::process_exe_path(hwnd))
-                            .and_then(|exe| exe_icon(&exe))
-                    })
-                    .or_else(|| {
-                        hwnd.and_then(|hwnd| windows_list::window_icon(hwnd))
-                            .and_then(|hicon| loader.load_hicon(&self.dc, hicon))
-                    })
+                if let Some(src) = icon_source(it) {
+                    if let Some(bmp) = bmp_from_jobs(&src) {
+                        return Some(bmp);
+                    }
+                }
+                it.hwnd
+                    .map(|raw| HWND(raw as *mut core::ffi::c_void))
+                    .and_then(|hwnd| windows_list::window_icon(hwnd))
+                    .and_then(|hicon| loader.and_then(|l| l.load_hicon(&self.dc, hicon)))
             }
+            // Pinned item: its own image decodes straight from the file (WIC, no
+            // shell); anything else takes the helper-extracted bitmap.
             ItemRole::Pinned => {
-                let src = it.icon.as_deref().or(it.path.as_deref());
+                let src = icon_source(it)?;
                 let kind = if it.icon.is_some() {
-                    src.map(std::path::Path::new)
-                        .map(crate::content::classify_path)
-                        .unwrap_or(it.kind)
+                    classify_path(Path::new(&src))
                 } else {
                     it.kind
                 };
-                src.and_then(|p| loader.load(&self.dc, p, size, kind))
+                if kind == ContentKind::Image {
+                    if let Some(bitmap) =
+                        loader.and_then(|l| l.load_image(&self.dc, &src, 256).ok())
+                    {
+                        return Some(bitmap);
+                    }
+                }
+                bmp_from_jobs(&src)
             }
         }
     }
 
     /// Extract every item's icon into a GPU bitmap (e.g. at startup).
     pub unsafe fn load_icons(&mut self, items: &[DockItem], _dpi: f32) {
-        let Ok(loader) = IconLoader::new() else {
-            self.icons = items.iter().map(|_| None).collect();
-            return;
-        };
-        self.icons = items
-            .iter()
-            .map(|it| {
-                let bmp = self.extract_icon(&loader, it);
-                #[cfg(debug_assertions)]
-                eprintln!("[icon] {:<14} loaded={}", it.label, bmp.is_some());
-                bmp
-            })
-            .collect();
+        let all: Vec<usize> = (0..items.len()).collect();
+        self.icons = self.extract_bitmaps(items, &all);
     }
 
     /// Realign the icon set to a reconciled item list (see `Dock::reconcile`). For
@@ -209,19 +260,18 @@ impl Gpu {
     /// (`None`). Far cheaper than re-extracting everything on each window open/close.
     pub unsafe fn remap_icons(&mut self, remap: &[Option<usize>], items: &[DockItem]) {
         let mut old = std::mem::take(&mut self.icons);
-        let loader = if remap.iter().any(Option::is_none) {
-            IconLoader::new().ok()
-        } else {
-            None
-        };
-        self.icons = remap
+        let fresh: Vec<usize> = remap
             .iter()
             .enumerate()
-            .map(|(p, src)| match src {
+            .filter_map(|(p, src)| src.is_none().then_some(p))
+            .collect();
+        let decoded = self.extract_bitmaps(items, &fresh);
+        let mut decoded = decoded.into_iter();
+        self.icons = remap
+            .iter()
+            .map(|src| match src {
                 Some(oi) => old.get_mut(*oi).and_then(Option::take),
-                None => loader
-                    .as_ref()
-                    .and_then(|l| items.get(p).and_then(|it| self.extract_icon(l, it))),
+                None => decoded.next().flatten(),
             })
             .collect();
     }
@@ -314,5 +364,91 @@ mod tests {
         assert!(!surface_resize_needed((1280, 180), (1280, 180)));
         assert!(surface_resize_needed((1280, 180), (1440, 180)));
         assert!(surface_resize_needed((1280, 180), (1280, 200)));
+    }
+
+    fn item(role: ItemRole, path: Option<&str>, icon: Option<&str>) -> DockItem {
+        DockItem {
+            label: String::new(),
+            glyph: "",
+            color: (0.0, 0.0, 0.0),
+            path: path.map(str::to_string),
+            icon: icon.map(str::to_string),
+            kind: ContentKind::Application,
+            role,
+            hwnd: None,
+            group_key: None,
+            windows: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn icon_source_prefers_the_explicit_icon_then_the_path() {
+        let pinned = item(ItemRole::Pinned, Some(r"C:\Apps\Tool.exe"), None);
+        assert_eq!(
+            unsafe { icon_source(&pinned) },
+            Some(r"C:\Apps\Tool.exe".to_string())
+        );
+        let with_icon = item(
+            ItemRole::Pinned,
+            Some(r"C:\Apps\Tool.exe"),
+            Some(r"C:\Apps\Tool.ico"),
+        );
+        assert_eq!(
+            unsafe { icon_source(&with_icon) },
+            Some(r"C:\Apps\Tool.ico".to_string())
+        );
+        let bare = item(ItemRole::Pinned, None, None);
+        assert_eq!(unsafe { icon_source(&bare) }, None);
+    }
+
+    #[test]
+    fn icon_source_skips_vector_and_windowless_items() {
+        for role in [
+            ItemRole::Start,
+            ItemRole::Divider,
+            ItemRole::Control,
+            ItemRole::Drawer,
+        ] {
+            assert_eq!(unsafe { icon_source(&item(role, None, None)) }, None);
+        }
+        // A running item with neither an icon source nor a window has nothing to extract.
+        assert_eq!(
+            unsafe { icon_source(&item(ItemRole::Running, None, None)) },
+            None
+        );
+    }
+
+    #[test]
+    fn icon_source_runs_an_icon_override_for_running_items() {
+        let running = item(ItemRole::Running, None, Some(r"C:\Apps\App.exe"));
+        assert_eq!(
+            unsafe { icon_source(&running) },
+            Some(r"C:\Apps\App.exe".to_string())
+        );
+    }
+
+    /// The dock must NEVER call the shell icon APIs in its own process: they load
+    /// third-party shell extensions (observed crashing the dock via PrivaZer's
+    /// PrivaMenu6.dll). Shell extraction lives in the `--drawer-icons` helper only.
+    #[test]
+    fn dock_icon_extraction_never_touches_the_shell_in_process() {
+        let source = include_str!("graphics.rs");
+        let production = source
+            .rsplit_once("#[cfg(test)]")
+            .map(|(head, _)| head)
+            .expect("graphics.rs production source");
+
+        assert!(
+            !production.contains("source_icon"),
+            "SHGetFileInfoW-family calls activate third-party shell extensions in-process"
+        );
+        assert!(
+            !production.contains("loader.load("),
+            "the in-process shell loader must not be used; route through drawer_icons::extract"
+        );
+        assert!(
+            production.contains("drawer_icons::extract"),
+            "dock icons must be extracted by the helper process"
+        );
     }
 }

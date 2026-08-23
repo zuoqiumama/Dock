@@ -14,8 +14,6 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, HICON};
 
-use crate::content::ContentKind;
-
 pub struct OwnedIcon {
     hicon: HICON,
 }
@@ -47,30 +45,12 @@ impl IconLoader {
         Ok(IconLoader { wic })
     }
 
-    /// Returns None (instead of erroring) so a missing icon just falls back to a glyph.
-    pub unsafe fn load(
-        &self,
-        dc: &ID2D1DeviceContext,
-        path: &str,
-        size: u32,
-        kind: ContentKind,
-    ) -> Option<ID2D1Bitmap1> {
-        if kind == ContentKind::Image {
-            if let Ok(bitmap) = self.load_image(dc, path, size) {
-                return Some(bitmap);
-            }
-        }
-
-        // Prefer the highest-resolution source so magnification stays crisp:
-        // SHDefExtractIconW at the requested (large) size handles exe/lnk/ico best,
-        // the JUMBO (256px) system image list covers folders/files, and the 32px
-        // shell icon is only a last resort.
-        let icon = source_icon(path, size)?;
-        self.to_bitmap(dc, icon.raw()).ok()
-    }
-
     /// Turn an existing HICON (e.g. a running window's icon) into a GPU bitmap.
     /// The caller still owns `hicon` — this does NOT destroy it.
+    ///
+    /// Only WIC-based decoding lives here on purpose: shell icon extraction
+    /// (`source_icon` below) activates third-party shell extensions inside the
+    /// caller and is therefore restricted to the `--drawer-icons` helper process.
     pub unsafe fn load_hicon(&self, dc: &ID2D1DeviceContext, hicon: HICON) -> Option<ID2D1Bitmap1> {
         self.to_bitmap(dc, hicon).ok()
     }

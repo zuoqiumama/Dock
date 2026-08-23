@@ -49,6 +49,17 @@ pub fn parse_args() -> Option<(PathBuf, PathBuf)> {
     Some((PathBuf::from(args.next()?), PathBuf::from(args.next()?)))
 }
 
+static JOB_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// A unique job file per batch. Batches can run CONCURRENTLY — the dock's UI thread
+/// extracts a newly-appeared window's icon while the drawer's background thread
+/// extracts its missing tiles — and a fixed name had them clobbering each other's
+/// job list mid-write.
+fn next_job_path(root: &Path) -> PathBuf {
+    let seq = JOB_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    root.join(format!("job-{seq}.tsv"))
+}
+
 /// Helper-process entry point: read the job file, extract one icon per line into
 /// `<outdir>/<idx>.bmp`, then exit. Any third-party shell crash ends THIS process
 /// only. Successes are detected by the dock from the written files, so a partial
@@ -93,7 +104,7 @@ fn unescape(value: &str) -> String {
 }
 
 /// Extract one path's icon and write it as a 32bpp BMP. Failures are skipped
-/// silently �?the dock falls back to a glyph tile for anything without a file.
+/// silently — the dock falls back to a glyph tile for anything without a file.
 fn extract_bmp(wic: &IWICImagingFactory, key: &str, path: &str, outdir: &Path) {
     let Some(icon) = (unsafe { icons::source_icon(path, 256) }) else {
         return;
@@ -101,9 +112,18 @@ fn extract_bmp(wic: &IWICImagingFactory, key: &str, path: &str, outdir: &Path) {
     let Ok(bitmap) = (unsafe { wic.CreateBitmapFromHICON(icon.raw()) }) else {
         return;
     };
+    // `CreateBitmapFromHICON` yields STRAIGHT-alpha BGRA, but the dock decodes
+    // every BMP as premultiplied (and Direct2D draws premultiplied). Icons whose
+    // transparent padding is WHITE (e.g. Clash Verge's round logo) then rendered
+    // with white spikes at their corners once the dock magnified them — the cubic
+    // interpolation happily blends that full-strength white against tiny alphas.
+    // Convert here so the bytes on disk match the declared format everywhere.
+    let Some(premultiplied) = (unsafe { to_premultiplied(wic, &bitmap) }) else {
+        return;
+    };
     let mut width = 0u32;
     let mut height = 0u32;
-    if unsafe { bitmap.GetSize(&mut width, &mut height) }.is_err() {
+    if unsafe { premultiplied.GetSize(&mut width, &mut height) }.is_err() {
         return;
     }
     if width == 0 || height == 0 {
@@ -117,11 +137,33 @@ fn extract_bmp(wic: &IWICImagingFactory, key: &str, path: &str, outdir: &Path) {
         Width: width as i32,
         Height: height as i32,
     };
-    if unsafe { bitmap.CopyPixels(&rect, stride, &mut pixels) }.is_err() {
+    if unsafe { premultiplied.CopyPixels(&rect, stride, &mut pixels) }.is_err() {
         return;
     }
     let target = outdir.join(icon_file_name(key));
     write_bmp(&target, width, height, &pixels);
+}
+
+/// A view of `source` converted to `32bppPBGRA` (premultiplied). This is the
+/// exact conversion the dock's old in-process path performed via
+/// `IconLoader::to_bitmap`; the helper must keep doing it now that it owns the
+/// shell-side extraction.
+unsafe fn to_premultiplied(
+    wic: &IWICImagingFactory,
+    source: &IWICBitmap,
+) -> Option<IWICFormatConverter> {
+    let converter = wic.CreateFormatConverter().ok()?;
+    converter
+        .Initialize(
+            source,
+            &GUID_WICPixelFormat32bppPBGRA,
+            WICBitmapDitherTypeNone,
+            None,
+            0.0,
+            WICBitmapPaletteTypeMedianCut,
+        )
+        .ok()?;
+    Some(converter)
 }
 
 /// A minimal top-down 32bpp `BI_RGB` BMP: 14-byte file header + 40-byte info
@@ -177,10 +219,11 @@ fn read_bmp(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
     Some((width as u32, height, data[54..54 + needed].to_vec()))
 }
 
-/// Turn an extracted BMP into a D2D bitmap for the drawer to draw. The pixels are
-/// premultiplied (WIC's `CreateBitmapFromHICON` output), matching the alpha mode
-/// D2D expects. Returns None for anything unreadable �?the tile falls back to its
-/// glyph without touching the shell.
+/// Turn an extracted BMP into a D2D bitmap for the drawer to draw. The helper
+/// writes every BMP already premultiplied (see `extract_bmp`), matching the
+/// `32bppPBGRA` format declared below and the alpha mode D2D expects. Returns
+/// None for anything unreadable — the tile falls back to its glyph without
+/// touching the shell.
 pub unsafe fn load_icon_bitmap(dc: &ID2D1DeviceContext, path: &Path) -> Option<ID2D1Bitmap1> {
     let (width, height, pixels) = read_bmp(path)?;
     let wic: IWICImagingFactory =
@@ -213,7 +256,7 @@ pub fn extract(jobs: &[(String, String)]) -> Vec<(String, PathBuf)> {
         return Vec::new();
     };
     let _ = fs::create_dir_all(&root);
-    let job = root.join("job.tsv");
+    let job = next_job_path(&root);
 
     let mut body = String::new();
     for (key, path) in jobs {
@@ -331,12 +374,73 @@ mod tests {
     fn job_paths_round_trip_through_escaping() {
         let dir = std::env::temp_dir().join(format!("fd-icon-job-{}", std::process::id()));
         let _ = fs::create_dir_all(&dir);
-        let job = dir.join("job.tsv");
+        let job = next_job_path(&dir);
         let path = r"C:\Users\Me\Desktop\My App.lnk";
         fs::write(&job, format!("{}\t{}\n", escape(path), escape(path))).unwrap();
         let jobs = read_job(&job);
         assert_eq!(jobs, vec![(path.to_string(), path.to_string())]);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_extraction_batches_get_distinct_job_files() {
+        // The dock UI thread and the drawer's background thread can both run a
+        // batch; sharing one file name made them overwrite each other's job list.
+        let root = Path::new("C:\\temp");
+        assert_ne!(next_job_path(root), next_job_path(root));
+    }
+
+    /// Straight-alpha white padding must become BLACK once premultiplied on the
+    /// helper side: misdeclared-as-premultiplied white (255,255,255,0) rendered
+    /// as white corner spikes on round icons (Clash Verge) under magnification.
+    #[test]
+    fn written_icons_premultiply_white_transparent_padding() {
+        // 2x2: opaque red, half-transparent white, transparent white, opaque blue.
+        let straight: [u8; 16] = [
+            0, 0, 255, 255, // (255,0,0,255) BGRA
+            255, 255, 255, 128, // (255,255,255,128)
+            255, 255, 255, 0, // (255,255,255,0)  <- the spike culprit
+            255, 0, 0, 255, // (0,0,255,255)
+        ];
+        let wic: Option<IWICImagingFactory> = (unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)
+        })
+        .ok();
+        let Some(wic) = wic else {
+            // COM unavailable in this environment; the conversion itself is
+            // exercised on every real extraction.
+            return;
+        };
+        let source = unsafe {
+            wic.CreateBitmapFromMemory(2, 2, &GUID_WICPixelFormat32bppBGRA, 8, &straight)
+        }
+        .expect("straight-alpha source bitmap");
+        let converted = unsafe { to_premultiplied(&wic, &source) }.expect("converter");
+        let mut out = vec![0u8; 16];
+        let rect = WICRect {
+            X: 0,
+            Y: 0,
+            Width: 2,
+            Height: 2,
+        };
+        unsafe {
+            converted
+                .CopyPixels(&rect, 8, &mut out)
+                .expect("copy premultiplied pixels");
+        }
+        // BGRA: white*alpha shrinks to <= alpha, transparent padding goes black.
+        let half: [u8; 4] = out[4..8].try_into().unwrap();
+        assert!(
+            half[0] <= half[3] && half[1] <= half[3] && half[2] <= half[3],
+            "half-transparent white must premultiply to rgb <= alpha, got {half:?}"
+        );
+        let corner: [u8; 4] = out[8..12].try_into().unwrap();
+        assert_eq!(
+            corner,
+            [0, 0, 0, 0],
+            "transparent white padding must premultiply to black, got {corner:?}"
+        );
     }
 
     #[test]
