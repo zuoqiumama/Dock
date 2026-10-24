@@ -21,14 +21,16 @@
 
 use std::fs;
 use std::io::Write;
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-use windows::Win32::Foundation::{CloseHandle, BOOL, WAIT_OBJECT_0};
+use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::Imaging::*;
 use windows::Win32::System::Com::*;
-use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+use windows::Win32::System::Threading::WaitForSingleObject;
 
 use crate::icons;
 
@@ -66,7 +68,10 @@ fn next_job_path(root: &Path) -> PathBuf {
 /// batch (crash or timeout mid-way) still yields usable icons.
 pub fn run(job: &Path, outdir: &Path) {
     let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-    let _ = fs::create_dir_all(outdir);
+    if let Err(error) = fs::create_dir_all(outdir) {
+        crate::error_log::write("创建图标输出目录失败", &error);
+        return;
+    }
     let Ok(wic) =
         (unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER) })
     else {
@@ -141,7 +146,68 @@ fn extract_bmp(wic: &IWICImagingFactory, key: &str, path: &str, outdir: &Path) {
         return;
     }
     let target = outdir.join(icon_file_name(key));
-    write_bmp(&target, width, height, &pixels);
+    if let Some((width, height, pixels)) = crop_excess_padding(width, height, &pixels) {
+        write_bmp(&target, width, height, &pixels);
+    } else {
+        write_bmp(&target, width, height, &pixels);
+    }
+}
+
+/// Some shell icons are a small image inside a 256px JUMBO canvas. Scaling that
+/// canvas scales the empty space too. Trim only excessive transparent padding;
+/// preserve normal icon margins, premultiplied colors and the content's aspect.
+/// This scan runs once in the extraction helper, never in the render loop.
+fn crop_excess_padding(width: u32, height: u32, pixels: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let pixel_count = (width as usize).checked_mul(height as usize)?;
+    if width == 0 || height == 0 || pixels.len() < pixel_count.checked_mul(4)? {
+        return None;
+    }
+    let (mut left, mut top, mut right, mut bottom) = (width, height, 0, 0);
+    for (index, pixel) in pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .take(pixel_count)
+        .enumerate()
+    {
+        // Ignore almost-invisible alpha noise when measuring the actual glyph.
+        if pixel[3] < 8 {
+            continue;
+        }
+        let x = (index % width as usize) as u32;
+        let y = (index / width as usize) as u32;
+        left = left.min(x);
+        top = top.min(y);
+        right = right.max(x);
+        bottom = bottom.max(y);
+    }
+    if left > right || top > bottom {
+        return None;
+    }
+    let content_w = right - left + 1;
+    let content_h = bottom - top + 1;
+    if content_w.max(content_h) as f32 >= width.max(height) as f32 * 0.70 {
+        return None;
+    }
+    let padding = ((content_w.max(content_h) as f32 * 0.06).ceil() as u32).max(1);
+    let cropped_w = content_w + padding * 2;
+    let cropped_h = content_h + padding * 2;
+    let mut cropped = vec![0; cropped_w as usize * cropped_h as usize * 4];
+    // Copy a little surrounding alpha fringe as well, keeping the new padding
+    // symmetric even when the shell placed the glyph in a corner of its canvas.
+    let source_left = left.saturating_sub(padding);
+    let source_top = top.saturating_sub(padding);
+    let source_right = right.saturating_add(padding).min(width - 1);
+    let source_bottom = bottom.saturating_add(padding).min(height - 1);
+    let row_bytes = (source_right - source_left + 1) as usize * 4;
+    let dest_x = padding - (left - source_left);
+    for y in source_top..=source_bottom {
+        let source = (y as usize * width as usize + source_left as usize) * 4;
+        let dest_y = padding + y - top;
+        let dest = (dest_y as usize * cropped_w as usize + dest_x as usize) * 4;
+        cropped[dest..dest + row_bytes].copy_from_slice(&pixels[source..source + row_bytes]);
+    }
+    Some((cropped_w, cropped_h, cropped))
 }
 
 /// A view of `source` converted to `32bppPBGRA` (premultiplied). This is the
@@ -255,14 +321,14 @@ pub fn extract(jobs: &[(String, String)]) -> Vec<(String, PathBuf)> {
     let Some(root) = icon_cache_root() else {
         return Vec::new();
     };
-    let _ = fs::create_dir_all(&root);
     let job = next_job_path(&root);
 
     let mut body = String::new();
     for (key, path) in jobs {
         body.push_str(&format!("{}\t{}\n", escape(key), escape(path)));
     }
-    if fs::write(&job, body).is_err() {
+    if let Err(error) = fs::write(&job, body) {
+        crate::error_log::write("写入图标提取任务失败", &error);
         return Vec::new();
     }
 
@@ -276,25 +342,27 @@ pub fn extract(jobs: &[(String, String)]) -> Vec<(String, PathBuf)> {
         .creation_flags(CREATE_NO_WINDOW)
         .spawn();
 
-    let Some(mut child) = spawned.ok() else {
-        return Vec::new();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            crate::error_log::write("启动图标提取助手失败", &error);
+            return Vec::new();
+        }
     };
     {
         // Wait on the process handle with a hard cap; if the helper outlives it
         // (a hung shell call), stop it and take whatever icons were written first.
-        let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, BOOL(0), child.id()) };
-        match handle {
-            Ok(h) if !h.is_invalid() => {
-                let result = unsafe { WaitForSingleObject(h, BATCH_TIMEOUT_MS) };
-                if result != WAIT_OBJECT_0 {
-                    let _ = child.kill();
-                }
-                let _ = child.wait();
-                let _ = unsafe { CloseHandle(h) };
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
+        // Command already owns a synchronized handle. Reopening the child by
+        // PID can be denied in a restricted session and used to kill it early.
+        let result =
+            unsafe { WaitForSingleObject(HANDLE(child.as_raw_handle()), BATCH_TIMEOUT_MS) };
+        if result != WAIT_OBJECT_0 {
+            let _ = child.kill();
+            crate::error_log::write("图标提取助手等待失败或超时", &format!("wait={result:?}"));
+        }
+        if let Ok(status) = child.wait() {
+            if !status.success() {
+                crate::error_log::write("图标提取助手异常退出", &status);
             }
         }
     }
@@ -319,20 +387,61 @@ fn icon_file_name(key: &str) -> String {
 
 /// The persistent per-dock icon cache directory. Keyed by dock PID so a crashed
 /// dock's leftovers never collide with a later instance's files.
+static ICON_CACHE_ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
+
 fn icon_cache_root() -> Option<PathBuf> {
-    let mut dir = std::env::temp_dir();
-    dir.push(format!(
-        "featherdock-drawer-icon-cache-{}",
-        std::process::id()
-    ));
-    Some(dir)
+    ICON_CACHE_ROOT
+        .get_or_init(|| {
+            let name = format!("featherdock-drawer-icon-cache-{}", std::process::id());
+            let mut candidates = vec![std::env::temp_dir().join(&name)];
+            if let Some(local) = std::env::var_os("LOCALAPPDATA").filter(|value| !value.is_empty())
+            {
+                candidates.push(PathBuf::from(local).join("FeatherDock").join(&name));
+            }
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(parent) = exe.parent() {
+                    candidates.push(parent.join("outputs").join(&name));
+                }
+            }
+            match prepare_cache_root(&candidates) {
+                Ok(root) => {
+                    if candidates.first() != Some(&root) {
+                        crate::error_log::write("图标缓存已切换到可写的备用目录", &root.display());
+                    }
+                    Some(root)
+                }
+                Err(error) => {
+                    crate::error_log::write("无法创建可写的图标缓存目录", &error);
+                    None
+                }
+            }
+        })
+        .clone()
+}
+
+/// A TEMP directory can exist but reject this process's writes. Verify both
+/// directory creation and file creation before committing the session to it.
+fn prepare_cache_root(candidates: &[PathBuf]) -> std::io::Result<PathBuf> {
+    let mut last_error =
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no icon cache location");
+    for root in candidates {
+        let probe = root.join(".write-probe");
+        let result = fs::create_dir_all(root)
+            .and_then(|()| fs::write(&probe, []))
+            .and_then(|()| fs::remove_file(&probe));
+        match result {
+            Ok(()) => return Ok(root.clone()),
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
 }
 
 /// Remove the per-dock icon cache directory. Called at dock exit so the temp files
 /// don't linger; the drawer keeps its BMPs across open/close cycles, so this is NOT
 /// called after each open.
 pub fn cleanup() {
-    if let Some(dir) = icon_cache_root() {
+    if let Some(Some(dir)) = ICON_CACHE_ROOT.get() {
         let _ = fs::remove_dir_all(dir);
     }
 }
@@ -340,6 +449,61 @@ pub fn cleanup() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_primary_cache_uses_a_writable_fallback() {
+        let root = std::env::temp_dir().join(format!("fd-icon-cache-test-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let blocked = root.join("not-a-directory");
+        fs::write(&blocked, b"occupied").unwrap();
+        let fallback = root.join("fallback");
+        let selected = prepare_cache_root(&[blocked.join("cache"), fallback.clone()]).unwrap();
+        assert_eq!(selected, fallback);
+        assert!(!selected.join(".write-probe").exists());
+        assert!(prepare_cache_root(&[blocked.join("cache")]).is_err());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    fn padded_pixels(size: u32, left: u32, top: u32, extent: u32) -> Vec<u8> {
+        let mut pixels = vec![0; (size * size * 4) as usize];
+        for y in top..top + extent {
+            for x in left..left + extent {
+                let offset = ((y * size + x) * 4) as usize;
+                pixels[offset..offset + 4].copy_from_slice(&[20, 40, 60, 128]);
+            }
+        }
+        pixels
+    }
+
+    #[test]
+    fn jumbo_canvas_with_a_small_glyph_is_normalized() {
+        let pixels = padded_pixels(256, 0, 0, 16);
+        let (width, height, cropped) =
+            crop_excess_padding(256, 256, &pixels).expect("trim jumbo padding");
+        assert_eq!((width, height), (18, 18));
+        assert_eq!(&cropped[0..4], &[0, 0, 0, 0]);
+        assert_eq!(
+            &cropped[(width as usize + 1) * 4..(width as usize + 2) * 4],
+            &[20, 40, 60, 128]
+        );
+        assert_eq!(
+            cropped
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|pixel| pixel[3] == 128)
+                .count(),
+            16 * 16
+        );
+    }
+
+    #[test]
+    fn normal_margins_and_transparent_images_are_preserved() {
+        assert!(crop_excess_padding(64, 64, &padded_pixels(64, 8, 8, 48)).is_none());
+        assert!(crop_excess_padding(32, 32, &[0; 32 * 32 * 4]).is_none());
+        assert!(crop_excess_padding(0, 0, &[]).is_none());
+        assert!(crop_excess_padding(32, 32, &[0; 4]).is_none());
+    }
 
     #[test]
     fn bmp_round_trips_through_write_and_read() {

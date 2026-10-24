@@ -644,13 +644,15 @@ unsafe fn draw_text(
     );
 }
 
-unsafe fn fit_icon(container: D2D_RECT_F, size: D2D_SIZE_F) -> D2D_RECT_F {
+fn fit_icon(container: D2D_RECT_F, size: D2D_SIZE_F) -> D2D_RECT_F {
     if size.width <= 0.0 || size.height <= 0.0 {
         return container;
     }
     let cw = container.right - container.left;
     let ch = container.bottom - container.top;
-    let scale = (cw / size.width).min(ch / size.height).min(1.0);
+    // Shell fallbacks can be only 16/32px. Fit them to the same visual slot as
+    // high-resolution icons instead of leaving them at their source pixel size.
+    let scale = (cw / size.width).min(ch / size.height);
     let w = size.width * scale;
     let h = size.height * scale;
     let left = container.left + (cw - w) / 2.0;
@@ -1816,6 +1818,49 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 
 #[cfg(test)]
 mod tests {
+    use super::{fit_icon, rect, D2D_SIZE_F};
+
+    #[test]
+    fn small_shell_icons_fill_the_drawer_slot() {
+        let dest = fit_icon(
+            rect(10.0, 20.0, 66.0, 76.0),
+            D2D_SIZE_F {
+                width: 16.0,
+                height: 16.0,
+            },
+        );
+        assert_eq!(
+            (dest.left, dest.top, dest.right, dest.bottom),
+            (10.0, 20.0, 66.0, 76.0)
+        );
+    }
+
+    #[test]
+    fn fitting_icons_preserves_aspect_ratio_and_centers_them() {
+        let dest = fit_icon(
+            rect(0.0, 0.0, 56.0, 56.0),
+            D2D_SIZE_F {
+                width: 32.0,
+                height: 16.0,
+            },
+        );
+        assert_eq!(
+            (dest.left, dest.top, dest.right, dest.bottom),
+            (0.0, 14.0, 56.0, 42.0)
+        );
+        let dest = fit_icon(
+            rect(0.0, 0.0, 56.0, 56.0),
+            D2D_SIZE_F {
+                width: 256.0,
+                height: 256.0,
+            },
+        );
+        assert_eq!(
+            (dest.left, dest.top, dest.right, dest.bottom),
+            (0.0, 0.0, 56.0, 56.0)
+        );
+    }
+
     #[test]
     fn drawer_uses_shared_frame_loop_instead_of_self_posting() {
         let source = include_str!("drawer.rs");

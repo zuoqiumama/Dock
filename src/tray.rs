@@ -1,4 +1,4 @@
-//! Minimal tray icon with a right-click "Exit" menu, so the dock is quittable.
+//! Notification-area icon and the dock's management menu.
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
@@ -14,6 +14,12 @@ pub const ID_ADD: usize = 1003;
 pub const ID_ADD_FOLDER: usize = 1004;
 pub const ID_SETTINGS: usize = 1005;
 pub const ID_TOGGLE_DOCK_MODE: usize = 1006;
+// Keep retrying if Explorer is still starting or restarting when NIM_ADD runs.
+pub const TIMER_TRAY_RETRY: usize = 1007;
+const TRAY_RETRY_MS: u32 = 1000;
+const TRAY_ICON_ID: u32 = 1;
+// shellapi.h defines this expression as a macro, omitted by windows 0.58.
+const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
 
 pub struct Tray {
     nid: NOTIFYICONDATAW,
@@ -25,8 +31,8 @@ impl Tray {
         let mut nid = NOTIFYICONDATAW {
             cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: hwnd,
-            uID: 1,
-            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP,
+            uID: TRAY_ICON_ID,
+            uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
             uCallbackMessage: WM_TRAY,
             hIcon: crate::app_icon::load(),
             ..Default::default()
@@ -47,10 +53,58 @@ impl Tray {
     }
 
     pub unsafe fn restore(&self) -> Result<()> {
-        Shell_NotifyIconW(NIM_ADD, &self.nid).ok()?;
+        // Explorer can reject the initial add while its notification area is
+        // unavailable. Do not leave the user without settings until a restart.
+        // A duplicate TaskbarCreated notification may also reach an existing
+        // icon, in which case MODIFY is enough to refresh it.
+        let (added, add_error) = notify_icon(NIM_ADD, &self.nid);
+        if !added.as_bool() {
+            let (modified, modify_error) = notify_icon(NIM_MODIFY, &self.nid);
+            if !modified.as_bool() {
+                let code = if modify_error.0 != 0 {
+                    HRESULT::from_win32(modify_error.0)
+                } else if add_error.0 != 0 {
+                    HRESULT::from_win32(add_error.0)
+                } else {
+                    E_FAIL
+                };
+                let error = Error::new(
+                    code,
+                    format!(
+                        "Shell_NotifyIconW rejected registration: NIM_ADD BOOL={} GetLastError={}; NIM_MODIFY BOOL={} GetLastError={}; hwnd={:?} hIcon={:?} uID={}. LastError is advisory; zero does not mean success.",
+                        added.0, add_error.0, modified.0, modify_error.0,
+                        self.nid.hWnd, self.nid.hIcon, self.nid.uID
+                    ),
+                );
+                crate::error_log::write("托盘注册失败（将重试）", &error);
+                SetTimer(self.nid.hWnd, TIMER_TRAY_RETRY, TRAY_RETRY_MS, None);
+                return Err(error);
+            }
+        }
+        let _ = KillTimer(self.nid.hWnd, TIMER_TRAY_RETRY);
         let mut versioned = self.nid;
         versioned.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-        Shell_NotifyIconW(NIM_SETVERSION, &versioned).ok()
+        // The icon is already present even if an older shell refuses version 4.
+        // Its legacy callbacks are accepted by is_menu_event as well.
+        let (version_set, version_error) = notify_icon(NIM_SETVERSION, &versioned);
+        if !version_set.as_bool() {
+            let code = if version_error.0 == 0 {
+                E_FAIL
+            } else {
+                HRESULT::from_win32(version_error.0)
+            };
+            crate::error_log::write(
+                "设置托盘回调版本失败",
+                &Error::new(
+                    code,
+                    format!(
+                        "NIM_SETVERSION BOOL={} GetLastError={} (advisory)",
+                        version_set.0, version_error.0
+                    ),
+                ),
+            );
+        }
+        Ok(())
     }
 
     pub fn taskbar_created_message(&self) -> u32 {
@@ -58,7 +112,22 @@ impl Tray {
     }
 
     pub unsafe fn remove(&self) {
+        let _ = KillTimer(self.nid.hWnd, TIMER_TRAY_RETRY);
         let _ = Shell_NotifyIconW(NIM_DELETE, &self.nid);
+    }
+
+    /// Version 4 puts the event in LOWORD(lParam) and the icon ID in HIWORD.
+    /// It reports context-menu and keyboard selection events instead of only
+    /// the legacy mouse-up messages.
+    pub fn is_menu_event(lparam: LPARAM) -> bool {
+        let event = (lparam.0 & 0xffff) as u32;
+        match ((lparam.0 >> 16) & 0xffff) as u32 {
+            // Version 4 also sends raw mouse messages. Act only on its semantic
+            // activation so one click cannot open the menu twice.
+            TRAY_ICON_ID => matches!(event, WM_CONTEXTMENU | NIN_SELECT | NIN_KEYSELECT),
+            0 => matches!(event, WM_RBUTTONUP | WM_LBUTTONUP),
+            _ => false,
+        }
     }
 
     /// Show the context menu and return the chosen command id (the caller acts on it).
@@ -112,9 +181,56 @@ impl Tray {
             None,
         );
         let _ = DestroyMenu(menu);
+        // Finish the foreground-menu interaction before the next invocation.
+        let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));
+        let _ = Shell_NotifyIconW(NIM_SETFOCUS, &self.nid);
         match cmd.0 as usize {
             0 => None,
             id => Some(id),
         }
+    }
+}
+
+unsafe fn notify_icon(
+    operation: NOTIFY_ICON_MESSAGE,
+    icon: &NOTIFYICONDATAW,
+) -> (BOOL, WIN32_ERROR) {
+    // Shell_NotifyIconW documents its BOOL result, not a last-error contract.
+    // Clear the thread's stale error and capture its value immediately anyway
+    // so logs retain both actual return values without claiming FALSE/0 worked.
+    SetLastError(WIN32_ERROR(0));
+    let result = Shell_NotifyIconW(operation, icon);
+    (result, GetLastError())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_four_tray_menu_events_include_mouse_and_keyboard_selection() {
+        for event in [WM_CONTEXTMENU, NIN_SELECT, NIN_KEYSELECT] {
+            assert!(Tray::is_menu_event(LPARAM(((1 << 16) | event) as isize)));
+        }
+        assert!(!Tray::is_menu_event(LPARAM(
+            ((1 << 16) | WM_MOUSEMOVE) as isize
+        )));
+        assert!(!Tray::is_menu_event(LPARAM(
+            ((1 << 16) | NIN_BALLOONUSERCLICK) as isize
+        )));
+        assert!(!Tray::is_menu_event(LPARAM(
+            ((1 << 16) | WM_LBUTTONUP) as isize
+        )));
+        assert!(!Tray::is_menu_event(LPARAM(
+            ((2 << 16) | WM_CONTEXTMENU) as isize
+        )));
+    }
+
+    #[test]
+    fn legacy_tray_mouse_up_events_still_open_the_menu() {
+        for event in [WM_LBUTTONUP, WM_RBUTTONUP] {
+            assert!(Tray::is_menu_event(LPARAM(event as isize)));
+        }
+        assert!(!Tray::is_menu_event(LPARAM(WM_LBUTTONDOWN as isize)));
     }
 }

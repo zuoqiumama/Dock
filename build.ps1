@@ -45,6 +45,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 Set-Location -LiteralPath $root
+& (Join-Path $root 'scripts\dev-env.ps1') -Quiet
 
 # The single canonical executable. This is the only exe you should ever launch.
 $FinalExe   = Join-Path $root 'FeatherDock.exe'
@@ -123,6 +124,15 @@ if (-not $built) {
 
 # Place the one canonical exe at the repo root, then wipe all the strays.
 Copy-Item -LiteralPath $built.FullName -Destination $FinalExe -Force
+# Sandboxed workspaces can inherit a Low mandatory label onto newly built EXEs.
+# Windows then starts even an Explorer-launched Dock at Low integrity, which
+# blocks normal user-cache writes and communication with Explorer's tray. Give
+# only the shipped executable the normal desktop-app level; no elevation needed.
+$artifactAclTool = Join-Path $env:SystemRoot 'System32\icacls.exe'
+& $artifactAclTool $FinalExe /setintegritylevel M /q
+if ($LASTEXITCODE -ne 0) {
+    throw 'Could not set Medium integrity on FeatherDock.exe; the build was not published successfully.'
+}
 Remove-StrayExes
 
 # Kill the legacy release\ folder if it ever reappears (old publish location).

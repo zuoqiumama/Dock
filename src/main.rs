@@ -85,9 +85,11 @@ const ANIMATION_MESSAGE_BUDGET: usize = 4;
 const QUIT_WAIT_MS: u32 = 5_000;
 const ID_SEARCH_HOTKEY: i32 = 3001;
 const QUIT_FLAG: &str = "--quit";
+const SETTINGS_FLAG: &str = "--settings";
 const RESTORE_SYSTEM_FLAG: &str = "--restore-system";
 const WM_SHOW_EXISTING: u32 = 0x8033;
 pub(crate) const WM_ANIMATION_WAKE: u32 = 0x8034;
+const WM_OPEN_SETTINGS: u32 = 0x8035;
 
 fn animation_message_batch_has_capacity(dispatched: usize) -> bool {
     dispatched < ANIMATION_MESSAGE_BUDGET
@@ -604,6 +606,15 @@ fn handle_control_args() -> bool {
             unsafe { request_graceful_quit() };
             true
         }
+        Some(SETTINGS_FLAG) => unsafe {
+            let hwnd = dock_window();
+            if hwnd.is_invalid() {
+                false // Start the dock, then open settings once it is ready.
+            } else {
+                let _ = PostMessageW(hwnd, WM_OPEN_SETTINGS, WPARAM(0), LPARAM(0));
+                true
+            }
+        },
         Some(RESTORE_SYSTEM_FLAG) => {
             unsafe { restore_stranded_system_state() };
             true
@@ -928,6 +939,9 @@ fn run() -> Result<()> {
             // Extract + DECODE every drawer icon now, on the dock's GPU: the first
             // drawer open then reuses ready-made bitmaps (no upload, no wait).
             drawer::warm_cache((*app_ptr).gpu.dc());
+        }
+        if std::env::args().nth(1).as_deref() == Some(SETTINGS_FLAG) {
+            let _ = PostMessageW(hwnd, WM_OPEN_SETTINGS, WPARAM(0), LPARAM(0));
         }
 
         // Event-driven loop: block in GetMessage when idle (0% CPU); when
@@ -1586,7 +1600,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
         let app = &mut *ptr;
-        if msg == app.tray.taskbar_created_message() {
+        if msg != 0 && msg == app.tray.taskbar_created_message() {
             if let Err(error) = app.tray.restore() {
                 show_error(hwnd, "恢复托盘图标失败", error);
             }
@@ -1786,7 +1800,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                             }
                         }
                         dock::ItemRole::Start => run_tray_menu(hwnd, app),
-                        dock::ItemRole::Control => {}
+                        // Keep settings reachable directly from the dock even
+                        // when Explorer has put its notification icon in overflow.
+                        dock::ItemRole::Control => settings_window::open(hwnd),
                         dock::ItemRole::Drawer => {}
                         dock::ItemRole::Divider => {}
                     }
@@ -1794,14 +1810,21 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_TRAY => {
-                let evt = (lparam.0 & 0xFFFF) as u32;
-                if evt == WM_RBUTTONUP || evt == WM_LBUTTONUP {
+                if Tray::is_menu_event(lparam) {
                     run_tray_menu(hwnd, app);
                 }
                 LRESULT(0)
             }
+            WM_TIMER if wparam.0 == tray::TIMER_TRAY_RETRY => {
+                let _ = app.tray.restore();
+                LRESULT(0)
+            }
             WM_HOTKEY if wparam.0 == ID_SEARCH_HOTKEY as usize => {
                 command_palette::toggle(hwnd);
+                LRESULT(0)
+            }
+            WM_OPEN_SETTINGS => {
+                settings_window::open(hwnd);
                 LRESULT(0)
             }
             WM_SHOW_EXISTING => {

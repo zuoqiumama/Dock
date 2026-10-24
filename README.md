@@ -67,9 +67,10 @@ FeatherDock 是一个 Windows 上的 Dock，用 Rust 直接写在系统原生图
 可执行文件不提交到仓库。运行构建脚本后，最终产物会收敛到仓库根目录的单个 `FeatherDock.exe`：
 
 ```powershell
-.\build.ps1          # 构建 release 并生成根目录 FeatherDock.exe
-.\build.ps1 -Run     # 构建后立即启动
-.\build.ps1 -Clean   # 先 cargo clean，再从零构建
+.\build.cmd          # 构建 release 并生成根目录 FeatherDock.exe
+.\build.cmd -Run     # 构建后立即启动
+.\build.cmd -Clean   # 先 cargo clean，再从零构建
+.\build.cmd -Verify  # 格式、Clippy、测试通过后再构建 release
 ```
 
 规则很简单：需要分发或日常运行时，只运行根目录的 `FeatherDock.exe`。`target\` 下的 exe 只是 cargo 构建缓存。
@@ -84,6 +85,7 @@ Dock 常用交互：
 - 点击文件夹固定项会展开 Stack 菜单；菜单打开时才读取该目录。
 - 按 `Ctrl+Alt+Space` 打开命令面板，搜索固定项、运行窗口和桌面程序。
 - 左侧 Start 按钮打开 Windows 开始菜单，右侧 Control 按钮打开 FeatherDock 控制中心。
+- 右键最右侧 Control（滑杆）按钮可直接打开设置；也可运行 `FeatherDock.exe --settings`。
 - 控制中心支持主页面与音频、网络、蓝牙、输入法、电量子页面；页面切换保留玻璃背景和短动画，网络状态刷新使用独立的短时刷新计时器。
 - 音频页可切换活动设备；网络页可刷新并连接 Wi-Fi；蓝牙页和输入法页提供设备/输入法状态与系统设置入口。
 - Windows 右下角通知区域里的 FeatherDock 小图标右键菜单，以及设置窗口，都可切换常驻 / 自动隐藏、任务栏显示策略、主题预设、桌面图标隐藏和抽屉按钮。
@@ -181,11 +183,32 @@ Dock 行为设置：
 - Rust stable toolchain
 - `rust-toolchain.toml` 中固定的 Windows GNU target
 
+`build.ps1` 会自动准备当前进程的开发环境。本工作区已安装独立的 GNU Rust 工具链
+（含 Cargo、rustfmt、Clippy），位于仓库同级的 `Dock-build-tools\`；构建脚本会自动使用它。
+其他机器上没有该目录时，会使用已安装的 Rust。环境配置不会修改系统 PATH、注册表或
+PowerShell 配置文件。GNU linker 的临时文件保存在忽略的 `outputs\tool-temp\` 中，
+手动运行 `cargo clean` 也不会删掉该目录。
+`build.cmd` 调用同一个构建脚本，并仅为子进程启用脚本运行，不更改电脑的执行策略。
+发布时会将最终 `FeatherDock.exe` 的文件完整性标记设为普通桌面应用使用的 Medium，
+避免沙箱工作目录继承的 Low 标记导致托盘注册、用户缓存写入失败；不需要管理员运行。
+
+手动使用 Cargo 时，可运行 `scripts\dev-shell.cmd` 打开已准备好的开发终端。
+如果当前 PowerShell 允许本地脚本，也可直接运行：
+
+```powershell
+.\scripts\dev-env.ps1
+cargo --version
+rustc --version
+```
+
+如需使用放在其他位置的独立工具链，可传入 `-ToolRoot <目录>`。目录结构应与
+`Dock-build-tools\` 一致。首次在其他机器编译仍需下载 `Cargo.lock` 中的依赖。
+
 发布构建（推荐，产出唯一的 `FeatherDock.exe`）：
 
 ```powershell
-.\build.ps1            # = cargo build --release + 收敛成根目录单个 exe
-.\build.ps1 -Clean     # 先 cargo clean，再从零构建
+.\build.cmd            # = cargo build --release + 收敛成根目录单个 exe
+.\build.cmd -Clean     # 先 cargo clean，再从零构建
 ```
 
 开发期的常用 cargo 命令：
@@ -201,6 +224,21 @@ cargo build --release
 本项目通过 `.cargo/gnu-linker.cmd` 定位 Rustup 自带的 GNU linker，并将
 `windows` crate 固定在 `0.58`，以使用预构建 import libraries，避免依赖本机
 `dlltool` 或 `as` 的状态。应用图标资源使用预生成的 `assets/featherdock.res.o` 链接进 Windows 可执行文件。
+
+应用图标采用折纸收纳设计：`assets/featherdock-artwork.png` 保存原稿，
+`assets/featherdock.svg` 提供干净的透明圆角边界，`featherdock-256.png` 用于预览。
+`featherdock.ico` 包含 16、24、32、48、64、128、256 像素版本。
+修改 ICO 后，需要同步更新预编译资源（普通构建仍不依赖资源编译器）：
+
+```powershell
+python scripts/build-icon-resource.py
+# 若 CVTRES 不在默认 .NET Framework 目录，使用 --cvtres 指定其路径。
+```
+
+抽屉会将低分辨率 Shell 图标等比放大到统一的图标区域；提取阶段会裁去过大的透明
+留白，避免 256 像素画布中只有一小块图案。普通图标的边距和宽高比保持不变。
+图标缓存会实际检查目录能否写入；临时目录不可写时，依次尝试本地应用数据目录和
+EXE 旁的 `outputs\`。每个实例使用独立目录，正常退出时清理；失败会写入诊断日志。
 
 ## Project Layout
 
