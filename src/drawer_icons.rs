@@ -307,9 +307,8 @@ pub unsafe fn load_icon_bitmap(dc: &ID2D1DeviceContext, path: &Path) -> Option<I
 }
 
 /// Dock side: run one extraction batch for `jobs` (`(entry key, path)` pairs) in a
-/// helper process. Returns the BMP file written for each successful job key.
-/// NEVER panics and NEVER blocks longer than `BATCH_TIMEOUT_MS` — a crashing or hung
-/// shell extension costs icons, not the dock.
+/// helper process. Returns the BMP file written for each successful job key. Cached
+/// BMPs are returned without spawning a helper; all process waits are bounded.
 ///
 /// BMPs live in a PERSISTENT per-dock cache directory (`icon_cache_root`), named by
 /// the entry key, so they survive drawer open/close cycles — decoding only needs the
@@ -321,19 +320,32 @@ pub fn extract(jobs: &[(String, String)]) -> Vec<(String, PathBuf)> {
     let Some(root) = icon_cache_root() else {
         return Vec::new();
     };
-    let job = next_job_path(&root);
-
-    let mut body = String::new();
+    let mut results = Vec::new();
+    let mut pending = Vec::new();
     for (key, path) in jobs {
+        let cached = root.join(icon_file_name(key));
+        if cached.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+            results.push((key.clone(), cached));
+        } else {
+            pending.push((key.clone(), path.clone()));
+        }
+    }
+    if pending.is_empty() {
+        return results;
+    }
+
+    let job = next_job_path(&root);
+    let mut body = String::new();
+    for (key, path) in &pending {
         body.push_str(&format!("{}\t{}\n", escape(key), escape(path)));
     }
     if let Err(error) = fs::write(&job, body) {
         crate::error_log::write("写入图标提取任务失败", &error);
-        return Vec::new();
+        return results;
     }
 
     let Ok(exe) = std::env::current_exe() else {
-        return Vec::new();
+        return results;
     };
     let spawned = std::process::Command::new(exe)
         .arg(FLAG)
@@ -346,32 +358,48 @@ pub fn extract(jobs: &[(String, String)]) -> Vec<(String, PathBuf)> {
         Ok(child) => child,
         Err(error) => {
             crate::error_log::write("启动图标提取助手失败", &error);
-            return Vec::new();
+            return results;
         }
     };
-    {
-        // Wait on the process handle with a hard cap; if the helper outlives it
-        // (a hung shell call), stop it and take whatever icons were written first.
-        // Command already owns a synchronized handle. Reopening the child by
-        // PID can be denied in a restricted session and used to kill it early.
-        let result =
-            unsafe { WaitForSingleObject(HANDLE(child.as_raw_handle()), BATCH_TIMEOUT_MS) };
-        if result != WAIT_OBJECT_0 {
-            let _ = child.kill();
-            crate::error_log::write("图标提取助手等待失败或超时", &format!("wait={result:?}"));
+    let started = std::time::Instant::now();
+    let mut wait = unsafe { WaitForSingleObject(HANDLE(child.as_raw_handle()), BATCH_TIMEOUT_MS) };
+    let exited = if wait == WAIT_OBJECT_0 {
+        true
+    } else {
+        crate::error_log::write("图标提取助手等待失败或超时", &format!("wait={wait:?}"));
+        match child.kill() {
+            Ok(()) => {
+                let elapsed = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                let remaining = BATCH_TIMEOUT_MS.saturating_sub(elapsed);
+                wait = unsafe { WaitForSingleObject(HANDLE(child.as_raw_handle()), remaining) };
+                if wait != WAIT_OBJECT_0 {
+                    crate::error_log::write(
+                        "图标提取助手终止后未按时退出",
+                        &format!("wait={wait:?}"),
+                    );
+                }
+                wait == WAIT_OBJECT_0
+            }
+            Err(error) => {
+                crate::error_log::write("终止图标提取助手失败", &error);
+                false
+            }
         }
-        if let Ok(status) = child.wait() {
-            if !status.success() {
+    };
+    if exited {
+        match child.try_wait() {
+            Ok(Some(status)) if !status.success() => {
                 crate::error_log::write("图标提取助手异常退出", &status);
             }
+            Ok(_) => {}
+            Err(error) => crate::error_log::write("读取图标提取助手退出状态失败", &error),
         }
     }
 
-    let mut results: Vec<(String, PathBuf)> = Vec::new();
-    for (key, _) in jobs {
-        let path = root.join(icon_file_name(key));
+    for (key, _) in pending {
+        let path = root.join(icon_file_name(&key));
         if path.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-            results.push((key.clone(), path));
+            results.push((key, path));
         }
     }
     results

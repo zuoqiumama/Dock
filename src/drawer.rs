@@ -13,7 +13,7 @@ use core::ffi::c_void;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::time::Instant;
 
 use windows::core::*;
@@ -38,6 +38,7 @@ use crate::content::fallback_visual;
 use crate::desktop_scan::{self, Pidl};
 use crate::drawer_layout::{self, Layout, Section, SectionKind};
 use crate::glass::Glass;
+use crate::theme::SurfaceTheme;
 
 /// Cursor travel (device px) before a press turns into a drag rather than a click.
 const DRAG_THRESHOLD: f32 = 6.0;
@@ -58,6 +59,24 @@ struct DragState {
     active: bool, // crossed the movement threshold
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PanelMotion {
+    alpha: f32,
+    e: f32,
+}
+
+impl PanelMotion {
+    const HIDDEN: Self = Self { alpha: 0.0, e: 0.0 };
+    #[cfg(test)]
+    const VISIBLE: Self = Self { alpha: 1.0, e: 1.0 };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ReopenGuard {
+    owner: isize,
+    tick: u32,
+}
+
 // --- layout, in logical px @96dpi (multiplied by dpi for device px) ---
 const LPAD: f32 = 14.0; // left/right padding
 const BPAD: f32 = 14.0; // bottom padding
@@ -68,7 +87,6 @@ const CELL_H: f32 = 94.0;
 const ICON: f32 = 46.0;
 const GAP_X: f32 = 6.0;
 const GAP_Y: f32 = 6.0;
-const RADIUS: f32 = 18.0;
 const OPEN_ANIM_SECS: f32 = 0.26;
 const CLOSE_ANIM_SECS: f32 = 0.13;
 /// How far (device px @96dpi) the panel rises into place as it pops open.
@@ -102,9 +120,9 @@ const ID_CTX_REFRESH: usize = 3107;
 const ID_CTX_CATEGORY_BASE: usize = 3200;
 
 static PANEL_HWND: AtomicIsize = AtomicIsize::new(0);
-static LAST_CLOSED_TICK: AtomicU32 = AtomicU32::new(0);
 
 thread_local! {
+    static CLICK_AWAY_GUARD: RefCell<Option<ReopenGuard>> = const { RefCell::new(None) };
     // Extracted icon BMPs, keyed by entry key. Filled by the helper-process
     // extraction (`drawer_icons`); decoded into GPU bitmaps when the drawer opens.
     // The BMPs live in a persistent per-dock cache directory, so the paths stay
@@ -136,6 +154,7 @@ struct Entry {
 
 struct Drawer {
     owner: HWND,
+    material: SurfaceTheme,
     glass: Glass,
     brush: ID2D1SolidColorBrush,
     title: IDWriteTextFormat,
@@ -159,6 +178,8 @@ struct Drawer {
     editing: bool, // a rename/new-category popup is open → don't dismiss on deactivate
     closing: bool,
     anim_start: Instant,
+    motion_from: PanelMotion,
+    cascade_suppressed: bool,
     pending_icons: Vec<usize>, // entry indices still waiting for a GPU bitmap
     extracting: bool,          // a background icon-extraction batch is in flight
     extraction_keys: Vec<String>, // keys sent to the background batch (failed ones are skipped later)
@@ -175,6 +196,10 @@ fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
 
 fn rgba(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
+}
+
+fn material_color(rgb: (f32, f32, f32), alpha: f32) -> D2D1_COLOR_F {
+    rgba(rgb.0, rgb.1, rgb.2, alpha)
 }
 
 fn in_rect(rc: &D2D_RECT_F, x: f32, y: f32) -> bool {
@@ -204,8 +229,56 @@ fn ease_out_quint(t: f32) -> f32 {
     1.0 - (1.0 - t).powi(5)
 }
 
+fn transition_from(from: PanelMotion, closing: bool, elapsed: f32) -> PanelMotion {
+    if closing {
+        let t = (elapsed / CLOSE_ANIM_SECS).clamp(0.0, 1.0);
+        PanelMotion {
+            alpha: from.alpha * (1.0 - smoothstep(t)),
+            e: from.e * (1.0 - ease_in_cubic(t)),
+        }
+    } else {
+        let t = (elapsed / OPEN_ANIM_SECS).clamp(0.0, 1.0);
+        PanelMotion {
+            alpha: from.alpha + (1.0 - from.alpha) * smoothstep(t),
+            e: from.e + (1.0 - from.e) * ease_out_quint(t),
+        }
+    }
+}
+
+fn click_away_guard(owner: isize, activated: isize, tick: u32) -> Option<ReopenGuard> {
+    (owner != 0 && activated == owner).then_some(ReopenGuard { owner, tick })
+}
+
+fn take_reopen_guard(slot: &mut Option<ReopenGuard>, owner: isize, now: u32) -> bool {
+    slot.take()
+        .is_some_and(|guard| guard.owner == owner && now.wrapping_sub(guard.tick) < REOPEN_GUARD_MS)
+}
+
+fn reopen_closing_with_toggle(slot: &mut Option<ReopenGuard>, owner: isize, now: u32) -> bool {
+    !take_reopen_guard(slot, owner, now)
+}
+
+fn record_click_away_guard(owner: HWND, activated: HWND, tick: u32) {
+    let guard = click_away_guard(owner.0 as isize, activated.0 as isize, tick);
+    if guard.is_some() {
+        CLICK_AWAY_GUARD.with(|slot| *slot.borrow_mut() = guard);
+    }
+}
+
+fn consume_reopen_guard(owner: HWND, now: u32) -> bool {
+    CLICK_AWAY_GUARD.with(|slot| take_reopen_guard(&mut slot.borrow_mut(), owner.0 as isize, now))
+}
+
+fn clear_reopen_guard() {
+    CLICK_AWAY_GUARD.with(|slot| *slot.borrow_mut() = None);
+}
+
 fn offset_rect(r: D2D_RECT_F, dx: f32, dy: f32) -> D2D_RECT_F {
     rect(r.left + dx, r.top + dy, r.right + dx, r.bottom + dy)
+}
+
+fn risen_rect(r: D2D_RECT_F, progress: f32, rise: f32) -> D2D_RECT_F {
+    offset_rect(r, 0.0, (1.0 - progress) * rise)
 }
 
 /// Matrix product `a * b` (apply `a`, then `b`) — composes the scroll + open transforms.
@@ -230,6 +303,41 @@ fn scale_about(s: f32, ax: f32, ay: f32, dy: f32) -> Matrix3x2 {
         M31: ax * (1.0 - s),
         M32: ay * (1.0 - s) + dy,
     }
+}
+
+fn panel_transform(motion: PanelMotion, anchor_x: f32, height: f32, dpi: f32) -> Matrix3x2 {
+    let scale = 0.96 + 0.04 * motion.e;
+    let dy = (1.0 - motion.e) * RISE * dpi;
+    scale_about(scale, anchor_x, height, dy)
+}
+
+fn transform_point(m: Matrix3x2, x: f32, y: f32) -> (f32, f32) {
+    (x * m.M11 + y * m.M21 + m.M31, x * m.M12 + y * m.M22 + m.M32)
+}
+
+fn inverse_transform_point(m: Matrix3x2, x: f32, y: f32) -> Option<(f32, f32)> {
+    let det = m.M11 * m.M22 - m.M12 * m.M21;
+    if det.abs() <= f32::EPSILON {
+        return None;
+    }
+    let x = x - m.M31;
+    let y = y - m.M32;
+    Some(((x * m.M22 - y * m.M21) / det, (y * m.M11 - x * m.M12) / det))
+}
+
+fn content_point_from_client(
+    base: Matrix3x2,
+    grid_top: f32,
+    viewport_h: f32,
+    scroll: f32,
+    x: f32,
+    y: f32,
+) -> Option<(f32, f32)> {
+    let (x, y) = inverse_transform_point(base, x, y)?;
+    if y < grid_top || y > grid_top + viewport_h {
+        return None;
+    }
+    Some((x, y - grid_top + scroll))
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -273,12 +381,24 @@ impl Drawer {
         HEADER_H * self.dpi
     }
 
+    fn motion_at(&self, elapsed: f32) -> PanelMotion {
+        transition_from(self.motion_from, self.closing, elapsed)
+    }
+
+    fn motion(&self) -> PanelMotion {
+        self.motion_at(self.anim_start.elapsed().as_secs_f32())
+    }
+
+    fn base_transform(&self, motion: PanelMotion) -> Matrix3x2 {
+        panel_transform(motion, self.anchor_x, self.height, self.dpi)
+    }
+
     /// Per-row open progress (0→1) for a content-space element at vertical `content_top`.
     /// Elements near the top of the viewport start first and lower ones follow, so the
     /// whole drawer — section headers, tiles and the add button — assembles as a single
-    /// top-to-bottom wave. Closing returns 1.0 so the dismiss is a flat, quick fade.
+    /// top-to-bottom wave. Closing and reopened panels keep the content assembled.
     fn row_progress(&self, elapsed: f32, content_top: f32) -> f32 {
-        if self.closing {
+        if self.closing || self.cascade_suppressed {
             return 1.0;
         }
         let frac = ((content_top - self.scroll) / self.viewport_h.max(1.0)).clamp(0.0, 1.0);
@@ -297,39 +417,61 @@ impl Drawer {
         self.scroll = self.scroll.clamp(0.0, self.max_scroll);
     }
 
-    /// Map a client-space Y to content space (un-scrolled), or None if outside the
-    /// scrollable viewport (i.e. over the fixed title bar).
-    fn content_y(&self, client_y: f32) -> Option<f32> {
-        let grid_top = self.grid_top();
-        if client_y < grid_top || client_y > grid_top + self.viewport_h {
-            return None;
-        }
-        Some(client_y - grid_top + self.scroll)
+    /// Map a client point through the inverse panel transform into un-scrolled content.
+    fn content_point(&self, x: f32, y: f32, motion: PanelMotion) -> Option<(f32, f32)> {
+        content_point_from_client(
+            self.base_transform(motion),
+            self.grid_top(),
+            self.viewport_h,
+            self.scroll,
+            x,
+            y,
+        )
     }
 
-    /// The layout cell index under a client-space point, accounting for scroll.
-    fn hit_cell(&self, x: f32, y: f32) -> Option<usize> {
-        let cy = self.content_y(y)?;
-        drawer_layout::hit_cell(&self.layout, x, cy)
+    /// The layout cell index under a client-space point, at its current animated pose.
+    fn hit_cell(&self, x: f32, y: f32, motion: PanelMotion, elapsed: f32) -> Option<usize> {
+        let (cx, cy) = self.content_point(x, y, motion)?;
+        self.layout.cells.iter().position(|cell| {
+            let progress = self.row_progress(elapsed, cell.rect.top);
+            let cell = risen_rect(to_d2d(cell.rect), progress, TILE_RISE * self.dpi);
+            in_rect(&cell, cx, cy)
+        })
     }
 
     /// True if a client-space point is over the "new category" button.
-    fn hit_add_button(&self, x: f32, y: f32) -> bool {
-        self.content_y(y)
-            .is_some_and(|cy| in_rect(&to_d2d(self.layout.add_button), x, cy))
+    fn hit_add_button(&self, x: f32, y: f32, motion: PanelMotion, elapsed: f32) -> bool {
+        let Some((cx, cy)) = self.content_point(x, y, motion) else {
+            return false;
+        };
+        let progress = self.row_progress(elapsed, self.layout.add_button.top);
+        let button = risen_rect(
+            to_d2d(self.layout.add_button),
+            progress,
+            HEADER_RISE * self.dpi,
+        );
+        in_rect(&button, cx, cy)
     }
 
     /// A custom category's rename/delete button under a client-space point, returned as
     /// `(category index, action)`. Only custom sections carry these controls.
-    fn hit_header_action(&self, x: f32, y: f32) -> Option<(usize, HeaderAction)> {
-        let cy = self.content_y(y)?;
+    fn hit_header_action(
+        &self,
+        x: f32,
+        y: f32,
+        motion: PanelMotion,
+        elapsed: f32,
+    ) -> Option<(usize, HeaderAction)> {
+        let (cx, cy) = self.content_point(x, y, motion)?;
         for band in &self.layout.bands {
             if let SectionKind::Custom(ci) = self.sections[band.section].kind {
-                let (rename, delete) = header_action_rects(to_d2d(band.header), self.dpi);
-                if in_rect(&delete, x, cy) {
+                let progress = self.row_progress(elapsed, band.header.top);
+                let header = risen_rect(to_d2d(band.header), progress, HEADER_RISE * self.dpi);
+                let (rename, delete) = header_action_rects(header, self.dpi);
+                if in_rect(&delete, cx, cy) {
                     return Some((ci, HeaderAction::Delete));
                 }
-                if in_rect(&rename, x, cy) {
+                if in_rect(&rename, cx, cy) {
                     return Some((ci, HeaderAction::Rename));
                 }
             }
@@ -680,7 +822,7 @@ unsafe fn draw_cell(
             &panel.brush,
             cell,
             12.0 * dpi,
-            rgba(1.0, 1.0, 1.0, 0.12 * a),
+            material_color(panel.material.hover_rgb, panel.material.hover_alpha * a),
         );
     }
     let icon_box = rect(
@@ -733,20 +875,15 @@ unsafe fn draw_cell(
         &entry.label,
         &panel.label,
         label_box,
-        rgba(0.92, 0.93, 0.96, 0.95 * alpha),
+        material_color(panel.material.text_rgb, 0.98 * alpha),
         false,
     );
 }
 
 unsafe fn render(panel: &Drawer) {
     let elapsed = panel.anim_start.elapsed().as_secs_f32();
-    let (a, e) = if panel.closing {
-        let t = (elapsed / CLOSE_ANIM_SECS).clamp(0.0, 1.0);
-        (1.0 - smoothstep(t), 1.0 - ease_in_cubic(t))
-    } else {
-        let t = (elapsed / OPEN_ANIM_SECS).clamp(0.0, 1.0);
-        (smoothstep(t), ease_out_quint(t))
-    };
+    let motion = panel.motion_at(elapsed);
+    let a = motion.alpha;
     let dpi = panel.dpi;
     let s = |v: f32| v * dpi;
     let dc = panel.glass.dc();
@@ -755,9 +892,8 @@ unsafe fn render(panel: &Drawer) {
     // at the button's X (not the panel centre) so a panel clamped to a monitor edge still
     // appears to grow *out of the button that summoned it*. Close reverses the same
     // transform, keeping the motion spatial instead of snapping away.
-    let open_scale = 0.96 + 0.04 * e;
-    let open_dy = (1.0 - e) * RISE * dpi;
-    let base = scale_about(open_scale, panel.anchor_x, panel.height, open_dy);
+    let base = panel.base_transform(motion);
+    let open_scale = base.M11;
 
     dc.BeginDraw();
     dc.Clear(Some(&rgba(0.0, 0.0, 0.0, 0.0)));
@@ -770,19 +906,41 @@ unsafe fn render(panel: &Drawer) {
         panel.width - 0.5 * dpi,
         panel.height - 0.5 * dpi,
     );
+    let bg_top_left = transform_point(base, bg.left, bg.top);
+    let bg_bottom_right = transform_point(base, bg.right, bg.bottom);
+    let _ = panel.glass.update_backdrop(
+        (
+            bg_top_left.0,
+            bg_top_left.1,
+            bg_bottom_right.0,
+            bg_bottom_right.1,
+        ),
+        panel.material.radius * dpi * open_scale,
+        if panel.material.backdrop { a } else { 0.0 },
+    );
+    // An update can disable a lost/unsupported compositor surface. Check after
+    // updating so even that frame gets an opaque, readable fallback.
+    let background_alpha = if panel.material.backdrop && !panel.glass.has_backdrop() {
+        0.98
+    } else {
+        panel.material.alpha
+    };
     fill_round(
         dc,
         &panel.brush,
         bg,
-        RADIUS * dpi,
-        rgba(0.12, 0.12, 0.14, 0.88 * a),
+        panel.material.radius * dpi,
+        material_color(panel.material.rgb, background_alpha * a),
     );
-    panel.brush.SetColor(&rgba(1.0, 1.0, 1.0, 0.12 * a));
+    panel.brush.SetColor(&material_color(
+        panel.material.border_rgb,
+        panel.material.border_alpha * a,
+    ));
     dc.DrawRoundedRectangle(
         &D2D1_ROUNDED_RECT {
             rect: bg,
-            radiusX: RADIUS * dpi,
-            radiusY: RADIUS * dpi,
+            radiusX: panel.material.radius * dpi,
+            radiusY: panel.material.radius * dpi,
         },
         &panel.brush,
         1.0 * dpi,
@@ -802,7 +960,7 @@ unsafe fn render(panel: &Drawer) {
         &title,
         &panel.title,
         header,
-        rgba(0.96, 0.96, 0.98, 0.96 * a),
+        material_color(panel.material.text_rgb, a),
         false,
     );
 
@@ -819,7 +977,7 @@ unsafe fn render(panel: &Drawer) {
             "桌面上没有程序",
             &panel.label,
             empty,
-            rgba(0.72, 0.74, 0.78, 0.9 * a),
+            material_color(panel.material.muted_rgb, a),
             false,
         );
         dc.SetTransform(&Matrix3x2::identity());
@@ -838,10 +996,10 @@ unsafe fn render(panel: &Drawer) {
 
     // highlight the section a dragged tile would drop into (drawn under everything else)
     if let Some(drag) = panel.drag.as_ref().filter(|d| d.active) {
-        if let Some(cy) = panel.content_y(drag.cur_y) {
+        if let Some((cx, cy)) = panel.content_point(drag.cur_x, drag.cur_y, motion) {
             let m = metrics(panel.width, panel.dpi);
             if let Some((sec_idx, _)) =
-                drawer_layout::drop_target(&panel.sections, &panel.layout, &m, drag.cur_x, cy)
+                drawer_layout::drop_target(&panel.sections, &panel.layout, &m, cx, cy)
             {
                 if let Some(band) = panel.layout.bands.iter().find(|b| b.section == sec_idx) {
                     let hl = rect(
@@ -855,7 +1013,10 @@ unsafe fn render(panel: &Drawer) {
                         &panel.brush,
                         hl,
                         s(10.0),
-                        rgba(0.30, 0.55, 0.95, 0.14 * a),
+                        material_color(
+                            panel.material.accent_rgb,
+                            panel.material.selected_alpha * a,
+                        ),
                     );
                 }
             }
@@ -871,7 +1032,7 @@ unsafe fn render(panel: &Drawer) {
         // Ride the same top-to-bottom wave as the tiles below this header.
         let hp = panel.row_progress(elapsed, band.header.top);
         let ha = a * hp;
-        let hdr = offset_rect(to_d2d(band.header), 0.0, (1.0 - hp) * s(HEADER_RISE));
+        let hdr = risen_rect(to_d2d(band.header), hp, s(HEADER_RISE));
         let is_custom = matches!(sec.kind, SectionKind::Custom(_));
         let name = if sec.entries.is_empty() {
             sec.name.clone()
@@ -890,10 +1051,13 @@ unsafe fn render(panel: &Drawer) {
             &name,
             &panel.section,
             label_rc,
-            rgba(0.86, 0.88, 0.93, 0.92 * ha),
+            material_color(panel.material.muted_rgb, ha),
             false,
         );
-        panel.brush.SetColor(&rgba(1.0, 1.0, 1.0, 0.07 * ha));
+        panel.brush.SetColor(&material_color(
+            panel.material.muted_rgb,
+            panel.material.divider_alpha * ha,
+        ));
         let ly = hdr.bottom - s(1.0);
         dc.FillRectangle(&rect(hdr.left, ly, hdr.right, ly + s(1.0)), &panel.brush);
         if is_custom {
@@ -904,7 +1068,7 @@ unsafe fn render(panel: &Drawer) {
                 "\u{270E}",
                 &panel.center,
                 ren,
-                rgba(0.82, 0.85, 0.92, 0.7 * ha),
+                material_color(panel.material.muted_rgb, 0.9 * ha),
                 false,
             );
             draw_text(
@@ -929,13 +1093,12 @@ unsafe fn render(panel: &Drawer) {
             .as_ref()
             .is_some_and(|d| d.active && d.entry == cell.entry);
         let hovered = panel.hovered == i as i32 && panel.drag.is_none();
-        let cell_a = panel.row_progress(elapsed, cell.rect.top);
-        let rise = (1.0 - cell_a) * s(TILE_RISE);
+        let cell_p = panel.row_progress(elapsed, cell.rect.top);
         draw_cell(
             panel,
-            offset_rect(to_d2d(cell.rect), 0.0, rise),
+            risen_rect(to_d2d(cell.rect), cell_p, s(TILE_RISE)),
             &panel.entries[cell.entry],
-            a * cell_a,
+            a * cell_p,
             hovered,
             drag_src,
         );
@@ -946,15 +1109,21 @@ unsafe fn render(panel: &Drawer) {
     if ab0.bottom >= vis_top && ab0.top <= vis_bot {
         let abp = panel.row_progress(elapsed, panel.layout.add_button.top);
         let aba = a * abp;
-        let ab = offset_rect(ab0, 0.0, (1.0 - abp) * s(HEADER_RISE));
+        let ab = risen_rect(ab0, abp, s(HEADER_RISE));
         let round = D2D1_ROUNDED_RECT {
             rect: ab,
             radiusX: s(10.0),
             radiusY: s(10.0),
         };
-        panel.brush.SetColor(&rgba(1.0, 1.0, 1.0, 0.05 * aba));
+        panel.brush.SetColor(&material_color(
+            panel.material.hover_rgb,
+            panel.material.hover_alpha * 0.4 * aba,
+        ));
         dc.FillRoundedRectangle(&round, &panel.brush);
-        panel.brush.SetColor(&rgba(1.0, 1.0, 1.0, 0.16 * aba));
+        panel.brush.SetColor(&material_color(
+            panel.material.border_rgb,
+            panel.material.border_alpha * 0.45 * aba,
+        ));
         dc.DrawRoundedRectangle(&round, &panel.brush, s(1.0), None);
         let txt = rect(ab.left + s(10.0), ab.top, ab.right - s(10.0), ab.bottom);
         draw_text(
@@ -963,7 +1132,7 @@ unsafe fn render(panel: &Drawer) {
             "＋  新建分类",
             &panel.section,
             txt,
-            rgba(0.82, 0.85, 0.90, 0.92 * aba),
+            material_color(panel.material.muted_rgb, aba),
             false,
         );
     }
@@ -980,35 +1149,49 @@ unsafe fn render(panel: &Drawer) {
         let thumb_top = grid_top + travel * (panel.scroll / panel.max_scroll);
         let x = panel.width - s(5.0);
         let bar = rect(x, thumb_top, x + s(3.0), thumb_top + thumb_h);
-        fill_round(dc, &panel.brush, bar, s(1.5), rgba(1.0, 1.0, 1.0, 0.22 * a));
-    }
-
-    // --- drag ghost: the tile being dragged, floating under the cursor (client space) ---
-    if let Some(drag) = panel.drag.as_ref().filter(|d| d.active) {
-        let cw = s(CELL_W);
-        let ch = s(CELL_H);
-        let gx = drag.cur_x - cw / 2.0;
-        let gy = drag.cur_y - ch / 2.0;
-        let gcell = rect(gx, gy, gx + cw, gy + ch);
         fill_round(
             dc,
             &panel.brush,
-            gcell,
-            12.0 * dpi,
-            rgba(0.22, 0.24, 0.28, 0.92 * a),
+            bar,
+            s(1.5),
+            material_color(panel.material.muted_rgb, 0.32 * a),
         );
-        panel.brush.SetColor(&rgba(1.0, 1.0, 1.0, 0.14 * a));
-        dc.DrawRoundedRectangle(
-            &D2D1_ROUNDED_RECT {
-                rect: gcell,
-                radiusX: 12.0 * dpi,
-                radiusY: 12.0 * dpi,
-            },
-            &panel.brush,
-            s(1.0),
-            None,
-        );
-        draw_cell(panel, gcell, &panel.entries[drag.entry], a, false, false);
+    }
+
+    // --- drag ghost: keep the raw client pointer centred under the base transform ---
+    if let Some(drag) = panel.drag.as_ref().filter(|d| d.active) {
+        if let Some((px, py)) = inverse_transform_point(base, drag.cur_x, drag.cur_y) {
+            let cw = s(CELL_W);
+            let ch = s(CELL_H);
+            let gx = px - cw / 2.0;
+            let gy = py - ch / 2.0;
+            let gcell = rect(gx, gy, gx + cw, gy + ch);
+            fill_round(
+                dc,
+                &panel.brush,
+                gcell,
+                12.0 * dpi,
+                material_color(
+                    panel.material.rgb,
+                    (panel.material.alpha + 0.08).min(1.0) * a,
+                ),
+            );
+            panel.brush.SetColor(&material_color(
+                panel.material.border_rgb,
+                panel.material.border_alpha * a,
+            ));
+            dc.DrawRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: gcell,
+                    radiusX: 12.0 * dpi,
+                    radiusY: 12.0 * dpi,
+                },
+                &panel.brush,
+                s(1.0),
+                None,
+            );
+            draw_cell(panel, gcell, &panel.entries[drag.entry], a, false, false);
+        }
     }
 
     dc.SetTransform(&Matrix3x2::identity());
@@ -1041,12 +1224,26 @@ unsafe fn start_close(_hwnd: HWND, panel: &mut Drawer) {
     if panel.closing {
         return;
     }
+    panel.motion_from = panel.motion();
+    panel.cascade_suppressed = true;
     panel.closing = true;
     panel.hovered = -1;
     panel.drag = None;
     let _ = ReleaseCapture();
     panel.anim_start = Instant::now();
     render(panel);
+    wake_owner(panel);
+}
+
+unsafe fn reopen(hwnd: HWND, panel: &mut Drawer) {
+    if !panel.closing {
+        return;
+    }
+    panel.motion_from = panel.motion();
+    panel.closing = false;
+    panel.anim_start = Instant::now();
+    render(panel);
+    let _ = SetForegroundWindow(hwnd);
     wake_owner(panel);
 }
 
@@ -1069,7 +1266,12 @@ pub unsafe fn animate_frame() -> bool {
 /// Press on a tile arms a potential drag (it becomes a plain click if it never moves
 /// past the threshold). We grab the mouse so the drag tracks outside the tile.
 unsafe fn on_down(hwnd: HWND, panel: &mut Drawer, x: f32, y: f32) {
-    if let Some(ci) = panel.hit_cell(x, y) {
+    if panel.closing {
+        return;
+    }
+    let elapsed = panel.anim_start.elapsed().as_secs_f32();
+    let motion = panel.motion_at(elapsed);
+    if let Some(ci) = panel.hit_cell(x, y, motion, elapsed) {
         panel.drag = Some(DragState {
             entry: panel.layout.cells[ci].entry,
             start_x: x,
@@ -1083,6 +1285,9 @@ unsafe fn on_down(hwnd: HWND, panel: &mut Drawer, x: f32, y: f32) {
 }
 
 unsafe fn on_move(panel: &mut Drawer, x: f32, y: f32) {
+    if panel.closing {
+        return;
+    }
     if let Some(drag) = panel.drag.as_mut() {
         drag.cur_x = x;
         drag.cur_y = y;
@@ -1097,7 +1302,12 @@ unsafe fn on_move(panel: &mut Drawer, x: f32, y: f32) {
         }
         return;
     }
-    let hovered = panel.hit_cell(x, y).map(|i| i as i32).unwrap_or(-1);
+    let elapsed = panel.anim_start.elapsed().as_secs_f32();
+    let motion = panel.motion_at(elapsed);
+    let hovered = panel
+        .hit_cell(x, y, motion, elapsed)
+        .map(|i| i as i32)
+        .unwrap_or(-1);
     if hovered != panel.hovered {
         panel.hovered = hovered;
         render(panel);
@@ -1244,6 +1454,7 @@ unsafe fn show_entry_menu(hwnd: HWND, panel: &mut Drawer, entry: usize) {
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     let _ = SetForegroundWindow(hwnd);
+    let menu_style = crate::menu_style::style(menu, crate::dock_theme(panel.owner), hwnd);
     let cmd = TrackPopupMenu(
         menu,
         TPM_RIGHTBUTTON | TPM_RETURNCMD,
@@ -1253,6 +1464,7 @@ unsafe fn show_entry_menu(hwnd: HWND, panel: &mut Drawer, entry: usize) {
         hwnd,
         None,
     );
+    drop(menu_style);
     let _ = DestroyMenu(menu);
 
     match cmd.0 as usize {
@@ -1296,6 +1508,7 @@ unsafe fn show_background_menu(hwnd: HWND, panel: &mut Drawer) {
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     let _ = SetForegroundWindow(hwnd);
+    let menu_style = crate::menu_style::style(menu, crate::dock_theme(panel.owner), hwnd);
     let cmd = TrackPopupMenu(
         menu,
         TPM_RIGHTBUTTON | TPM_RETURNCMD,
@@ -1305,6 +1518,7 @@ unsafe fn show_background_menu(hwnd: HWND, panel: &mut Drawer) {
         hwnd,
         None,
     );
+    drop(menu_style);
     let _ = DestroyMenu(menu);
 
     match cmd.0 as usize {
@@ -1323,12 +1537,16 @@ unsafe fn show_background_menu(hwnd: HWND, panel: &mut Drawer) {
 
 /// Commit a dropped tile into the section + slot under the cursor (None = uncategorized).
 unsafe fn commit_drop(panel: &mut Drawer, entry: usize, x: f32, y: f32) {
-    let Some(cy) = panel.content_y(y) else {
+    if panel.closing {
+        return;
+    }
+    let motion = panel.motion();
+    let Some((cx, cy)) = panel.content_point(x, y, motion) else {
         return;
     };
     let m = metrics(panel.width, panel.dpi);
     let Some((sec_idx, index)) =
-        drawer_layout::drop_target(&panel.sections, &panel.layout, &m, x, cy)
+        drawer_layout::drop_target(&panel.sections, &panel.layout, &m, cx, cy)
     else {
         return;
     };
@@ -1393,7 +1611,7 @@ unsafe fn begin_rename(hwnd: HWND, category: usize) {
 }
 
 unsafe fn handle_scroll(panel: &mut Drawer, delta: f32) {
-    if panel.max_scroll <= 0.0 {
+    if panel.closing || panel.max_scroll <= 0.0 {
         return;
     }
     let step = (CELL_H + GAP_Y) * panel.dpi;
@@ -1402,6 +1620,9 @@ unsafe fn handle_scroll(panel: &mut Drawer, delta: f32) {
 }
 
 unsafe fn on_up(hwnd: HWND, panel: &mut Drawer, x: f32, y: f32) {
+    if panel.closing {
+        return;
+    }
     if let Some(drag) = panel.drag.take() {
         let _ = ReleaseCapture();
         if drag.active {
@@ -1420,15 +1641,17 @@ unsafe fn on_up(hwnd: HWND, panel: &mut Drawer, x: f32, y: f32) {
         }
         return;
     }
+    let elapsed = panel.anim_start.elapsed().as_secs_f32();
+    let motion = panel.motion_at(elapsed);
     // Not a tile press: category rename/delete controls, then the "new category" button.
-    if let Some((ci, action)) = panel.hit_header_action(x, y) {
+    if let Some((ci, action)) = panel.hit_header_action(x, y, motion, elapsed) {
         match action {
             HeaderAction::Delete => delete_category(panel, ci),
             HeaderAction::Rename => begin_rename(hwnd, ci),
         }
         return;
     }
-    if panel.hit_add_button(x, y) {
+    if panel.hit_add_button(x, y, motion, elapsed) {
         add_category(hwnd, panel);
     }
 }
@@ -1563,6 +1786,7 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
 
     let panel = Box::into_raw(Box::new(Drawer {
         owner: dock_hwnd,
+        material: crate::dock_theme(dock_hwnd).surface(),
         glass,
         brush,
         title,
@@ -1586,6 +1810,8 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
         editing: false,
         closing: false,
         anim_start: Instant::now(),
+        motion_from: PanelMotion::HIDDEN,
+        cascade_suppressed: false,
         pending_icons,
         extracting: false,
         extraction_keys: Vec::new(),
@@ -1654,19 +1880,66 @@ unsafe fn resources(
     Ok((brush, title, section, center, label, glyph))
 }
 
-/// Toggle the drawer anchored above a dock button. Closes it if open; otherwise opens
-/// it (unless we *just* closed it via click-away, to avoid a button-toggle flicker).
+/// Close through the normal animated path, including when its theme changes.
+pub unsafe fn hide() {
+    let raw = PANEL_HWND.load(Ordering::Relaxed);
+    if raw != 0 {
+        let hwnd = HWND(raw as *mut c_void);
+        if IsWindow(hwnd).as_bool() {
+            let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+/// Destroy the GPU popup synchronously before its owner's devices are dropped.
+/// Exit must not enqueue the normal close animation or another owner frame.
+pub unsafe fn shutdown() {
+    let raw = PANEL_HWND.swap(0, Ordering::Relaxed);
+    if raw == 0 {
+        return;
+    }
+    let hwnd = HWND(raw as *mut c_void);
+    if IsWindow(hwnd).as_bool() {
+        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Drawer;
+        if !ptr.is_null() {
+            (*ptr).closing = true;
+            (*ptr).owner = HWND::default();
+        }
+        let _ = DestroyWindow(hwnd);
+    }
+}
+
+/// Toggle the drawer anchored above a dock button. The click that dismisses through
+/// click-away stays consumed even while the close animation is still running; only a
+/// separate toggle reverses that closing window in place.
 pub unsafe fn toggle(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
     let existing = PANEL_HWND.load(Ordering::Relaxed);
     if existing != 0 {
         let hwnd = HWND(existing as *mut c_void);
         if IsWindow(hwnd).as_bool() {
-            let _ = SendMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+            let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Drawer;
+            if ptr.is_null() {
+                clear_reopen_guard();
+                let _ = SendMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+            } else if (*ptr).closing {
+                let should_reopen = CLICK_AWAY_GUARD.with(|slot| {
+                    reopen_closing_with_toggle(
+                        &mut slot.borrow_mut(),
+                        dock_hwnd.0 as isize,
+                        GetTickCount(),
+                    )
+                });
+                if should_reopen {
+                    reopen(hwnd, &mut *ptr);
+                }
+            } else {
+                clear_reopen_guard();
+                start_close(hwnd, &mut *ptr);
+            }
             return;
         }
     }
-    let since = GetTickCount().wrapping_sub(LAST_CLOSED_TICK.load(Ordering::Relaxed));
-    if since < REOPEN_GUARD_MS {
+    if consume_reopen_guard(dock_hwnd, GetTickCount()) {
         return;
     }
     open(dock_hwnd, anchor_cx, anchor_top);
@@ -1674,6 +1947,9 @@ pub unsafe fn toggle(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
 
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
+        if let Some(result) = crate::menu_style::handle_message(hwnd, msg, wparam, lparam) {
+            return result;
+        }
         let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Drawer;
         match msg {
             WM_LBUTTONDOWN if !ptr.is_null() => {
@@ -1706,7 +1982,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if panel.closing {
                     return LRESULT(0);
                 }
-                if let Some(ci) = panel.hit_cell(x, y) {
+                let elapsed = panel.anim_start.elapsed().as_secs_f32();
+                let motion = panel.motion_at(elapsed);
+                if let Some(ci) = panel.hit_cell(x, y, motion, elapsed) {
                     let entry = panel.layout.cells[ci].entry;
                     show_entry_menu(hwnd, panel, entry);
                 } else {
@@ -1720,7 +1998,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let editing = !ptr.is_null() && (*ptr).editing;
                 if (wparam.0 & 0xFFFF) == 0 && !editing {
                     if !ptr.is_null() {
-                        start_close(hwnd, &mut *ptr);
+                        let panel = &mut *ptr;
+                        if !panel.closing {
+                            let activated = HWND(lparam.0 as *mut c_void);
+                            record_click_away_guard(panel.owner, activated, GetTickCount());
+                        }
+                        start_close(hwnd, panel);
                     } else {
                         let _ = DestroyWindow(hwnd);
                     }
@@ -1803,13 +2086,16 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_DESTROY => {
-                LAST_CLOSED_TICK.store(GetTickCount(), Ordering::Relaxed);
+                let _ = KillTimer(hwnd, TIMER_ICON_LOAD);
                 PANEL_HWND.store(0, Ordering::Relaxed);
+                LRESULT(0)
+            }
+            WM_NCDESTROY => {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 if !ptr.is_null() {
                     drop(Box::from_raw(ptr));
-                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 }
-                LRESULT(0)
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
@@ -1818,7 +2104,24 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 
 #[cfg(test)]
 mod tests {
-    use super::{fit_icon, rect, D2D_SIZE_F};
+    use super::{
+        click_away_guard, content_point_from_client, fit_icon, in_rect, mul, panel_transform, rect,
+        reopen_closing_with_toggle, risen_rect, take_reopen_guard, transform_point,
+        transition_from, translate, PanelMotion, CLOSE_ANIM_SECS, D2D_SIZE_F, OPEN_ANIM_SECS,
+        REOPEN_GUARD_MS,
+    };
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() < 0.0001,
+            "expected {expected}, got {actual}"
+        );
+    }
+
+    fn assert_motion(actual: PanelMotion, expected: PanelMotion) {
+        assert_close(actual.alpha, expected.alpha);
+        assert_close(actual.e, expected.e);
+    }
 
     #[test]
     fn small_shell_icons_fill_the_drawer_slot() {
@@ -1858,6 +2161,114 @@ mod tests {
         assert_eq!(
             (dest.left, dest.top, dest.right, dest.bottom),
             (0.0, 0.0, 56.0, 56.0)
+        );
+    }
+
+    #[test]
+    fn middle_frame_render_point_inverts_to_the_same_content_hit() {
+        let motion = transition_from(PanelMotion::HIDDEN, false, OPEN_ANIM_SECS * 0.43);
+        assert!(motion.e > 0.0 && motion.e < 1.0);
+        let base = panel_transform(motion, 117.0, 420.0, 1.5);
+        let grid_top = 48.0;
+        let viewport_h = 280.0;
+        let scroll = 73.0;
+        let content = (88.0, 146.0);
+        let content_to_client = mul(translate(0.0, grid_top - scroll), base);
+        let client = transform_point(content_to_client, content.0, content.1);
+
+        let hit = content_point_from_client(base, grid_top, viewport_h, scroll, client.0, client.1)
+            .expect("rendered content point must remain inside the viewport");
+        assert_close(hit.0, content.0);
+        assert_close(hit.1, content.1);
+        assert!(in_rect(&rect(40.0, 120.0, 140.0, 200.0), hit.0, hit.1));
+
+        let title = transform_point(base, 88.0, grid_top - 0.5);
+        assert!(
+            content_point_from_client(base, grid_top, viewport_h, scroll, title.0, title.1,)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn row_rise_hit_rect_matches_the_rendered_rect() {
+        let static_rect = rect(10.0, 100.0, 60.0, 140.0);
+        let animated_rect = risen_rect(static_rect, 0.5, 18.0);
+        assert_eq!((animated_rect.top, animated_rect.bottom), (109.0, 149.0));
+
+        assert!(in_rect(&static_rect, 20.0, 105.0));
+        assert!(!in_rect(&animated_rect, 20.0, 105.0));
+        assert!(!in_rect(&static_rect, 20.0, 145.0));
+        assert!(in_rect(&animated_rect, 20.0, 145.0));
+    }
+
+    #[test]
+    fn only_dock_click_away_arms_a_one_shot_reopen_guard() {
+        let owner = 42;
+        assert_eq!(click_away_guard(owner, 77, 1_000), None);
+        assert_eq!(click_away_guard(0, 0, 1_000), None);
+
+        let mut guard = click_away_guard(owner, owner, 1_000);
+        assert!(take_reopen_guard(
+            &mut guard,
+            owner,
+            1_000 + REOPEN_GUARD_MS - 1,
+        ));
+        assert!(!take_reopen_guard(&mut guard, owner, 1_000));
+
+        let mut expired = click_away_guard(owner, owner, 1_000);
+        assert!(!take_reopen_guard(
+            &mut expired,
+            owner,
+            1_000 + REOPEN_GUARD_MS,
+        ));
+
+        let mut other_owner = click_away_guard(owner, owner, 1_000);
+        assert!(!take_reopen_guard(&mut other_owner, 99, 1_001));
+        assert_eq!(other_owner, None);
+    }
+
+    #[test]
+    fn click_away_close_consumes_only_the_original_dock_toggle() {
+        let owner = 42;
+        let mut click_away = click_away_guard(owner, owner, 1_000);
+        assert!(!reopen_closing_with_toggle(&mut click_away, owner, 1_005));
+        assert_eq!(click_away, None);
+
+        let mut independent_toggle = None;
+        assert!(reopen_closing_with_toggle(
+            &mut independent_toggle,
+            owner,
+            1_006
+        ));
+    }
+
+    #[test]
+    fn reopen_guard_age_handles_get_tick_count_wrap() {
+        let owner = 42;
+        let tick = u32::MAX - 99;
+        let mut fresh = click_away_guard(owner, owner, tick);
+        assert!(take_reopen_guard(&mut fresh, owner, 50));
+
+        let mut expired = click_away_guard(owner, owner, tick);
+        assert!(!take_reopen_guard(&mut expired, owner, 150));
+    }
+
+    #[test]
+    fn close_reopen_is_continuous_and_preserves_normal_curves() {
+        let opening = transition_from(PanelMotion::HIDDEN, false, OPEN_ANIM_SECS * 0.5);
+        assert_close(opening.alpha, 0.5);
+        assert_close(opening.e, 0.96875);
+        let closing = transition_from(PanelMotion::VISIBLE, true, CLOSE_ANIM_SECS * 0.5);
+        assert_close(closing.alpha, 0.5);
+        assert_close(closing.e, 0.875);
+
+        let sampled = transition_from(PanelMotion::VISIBLE, true, CLOSE_ANIM_SECS * 0.37);
+        assert!(sampled.alpha > 0.0 && sampled.alpha < 1.0);
+        assert!(sampled.e > 0.0 && sampled.e < 1.0);
+        assert_motion(transition_from(sampled, false, 0.0), sampled);
+        assert_motion(
+            transition_from(sampled, false, OPEN_ANIM_SECS),
+            PanelMotion::VISIBLE,
         );
     }
 

@@ -125,6 +125,7 @@ pub unsafe fn show(owner: HWND, folder: &str, anchor_cx: i32, anchor_top: i32) {
     append(menu, ID_REVEAL_FOLDER, "在资源管理器中显示", true);
 
     let _ = SetForegroundWindow(owner);
+    let menu_style = crate::menu_style::style(menu, crate::dock_theme(owner), owner);
     let cmd = TrackPopupMenu(
         menu,
         TPM_RIGHTBUTTON | TPM_RETURNCMD,
@@ -134,6 +135,7 @@ pub unsafe fn show(owner: HWND, folder: &str, anchor_cx: i32, anchor_top: i32) {
         owner,
         None,
     );
+    drop(menu_style);
     let _ = DestroyMenu(menu);
 
     let id = cmd.0 as usize;

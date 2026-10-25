@@ -12,12 +12,15 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::SetWindowTheme;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE, VK_RETURN};
-use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::Shell::{
+    DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass, ShellExecuteW,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 const ID_EDIT: usize = 4301;
 const ID_LIST: usize = 4302;
 const MAX_RESULTS: usize = 18;
+const PALETTE_SUBCLASS_ID: usize = 1;
 
 static PALETTE_HWND: AtomicIsize = AtomicIsize::new(0);
 
@@ -208,6 +211,30 @@ unsafe fn activate_selection(hwnd: HWND, state: &Palette) {
     }
 }
 
+unsafe fn install_key_subclass(hwnd: HWND) -> bool {
+    SetWindowSubclass(hwnd, Some(key_subclass_proc), PALETTE_SUBCLASS_ID, 0).as_bool()
+}
+
+unsafe extern "system" fn key_subclass_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    subclass_id: usize,
+    _ref_data: usize,
+) -> LRESULT {
+    if msg == WM_KEYDOWN && (wparam.0 == VK_RETURN.0 as usize || wparam.0 == VK_ESCAPE.0 as usize) {
+        if let Ok(parent) = GetParent(hwnd) {
+            SendMessageW(parent, msg, wparam, lparam);
+        }
+        return LRESULT(0);
+    }
+    if msg == WM_NCDESTROY {
+        let _ = RemoveWindowSubclass(hwnd, Some(key_subclass_proc), subclass_id);
+    }
+    DefSubclassProc(hwnd, msg, wparam, lparam)
+}
+
 pub unsafe fn toggle(owner: HWND) {
     let existing = PALETTE_HWND.load(Ordering::Relaxed);
     if existing != 0 {
@@ -329,6 +356,9 @@ unsafe fn open(owner: HWND) {
         None,
     )
     .unwrap_or_default();
+    for control in [edit, list] {
+        let _ = install_key_subclass(control);
+    }
     SendMessageW(edit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
     SendMessageW(list, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
     let _ = SetWindowTheme(edit, w!("DarkMode_CFD"), PCWSTR::null());
@@ -410,7 +440,152 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use windows::Win32::UI::Input::KeyboardAndMouse::VK_DOWN;
+
     use super::*;
+
+    static NEXT_TEST_CLASS_ID: AtomicUsize = AtomicUsize::new(0);
+
+    struct RoutingTestKeys(Vec<(usize, isize)>);
+
+    impl std::ops::Deref for RoutingTestKeys {
+        type Target = Vec<(usize, isize)>;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl std::ops::DerefMut for RoutingTestKeys {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
+    extern "system" fn routing_test_parent_wndproc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        unsafe {
+            if msg == WM_KEYDOWN {
+                let keys = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut RoutingTestKeys;
+                if !keys.is_null() {
+                    (*keys).0.push((wparam.0, lparam.0));
+                }
+                return LRESULT(0);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+    }
+
+    struct RoutingTestWindows {
+        instance: HINSTANCE,
+        class_name: Vec<u16>,
+        class_registered: bool,
+        parent: HWND,
+        edit: HWND,
+        list: HWND,
+        keys: Box<RoutingTestKeys>,
+    }
+
+    impl RoutingTestWindows {
+        fn new() -> Self {
+            unsafe {
+                let instance: HINSTANCE =
+                    GetModuleHandleW(None).expect("test module handle").into();
+                let class_name = wide_nul(&format!(
+                    "FeatherDockPaletteSubclassTest.{}.{}",
+                    std::process::id(),
+                    NEXT_TEST_CLASS_ID.fetch_add(1, Ordering::Relaxed)
+                ));
+                let mut windows = Self {
+                    instance,
+                    class_name,
+                    class_registered: false,
+                    parent: HWND::default(),
+                    edit: HWND::default(),
+                    list: HWND::default(),
+                    keys: Box::new(RoutingTestKeys(Vec::new())),
+                };
+                let wc = WNDCLASSEXW {
+                    cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                    lpfnWndProc: Some(routing_test_parent_wndproc),
+                    hInstance: instance,
+                    lpszClassName: PCWSTR(windows.class_name.as_ptr()),
+                    ..Default::default()
+                };
+                assert_ne!(RegisterClassExW(&wc), 0, "register test parent class");
+                windows.class_registered = true;
+                windows.parent = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    PCWSTR(windows.class_name.as_ptr()),
+                    w!(""),
+                    WS_OVERLAPPED,
+                    0,
+                    0,
+                    200,
+                    120,
+                    None,
+                    None,
+                    instance,
+                    None,
+                )
+                .expect("create hidden test parent");
+                let keys = &mut *windows.keys as *mut RoutingTestKeys;
+                SetWindowLongPtrW(windows.parent, GWLP_USERDATA, keys as isize);
+                windows.edit = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("EDIT"),
+                    w!(""),
+                    WS_CHILD,
+                    0,
+                    0,
+                    180,
+                    24,
+                    windows.parent,
+                    None,
+                    instance,
+                    None,
+                )
+                .expect("create test EDIT");
+                windows.list = CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    w!("LISTBOX"),
+                    w!(""),
+                    WS_CHILD | WINDOW_STYLE(LBS_NOINTEGRALHEIGHT as u32),
+                    0,
+                    30,
+                    180,
+                    80,
+                    windows.parent,
+                    None,
+                    instance,
+                    None,
+                )
+                .expect("create test LISTBOX");
+                assert!(install_key_subclass(windows.edit), "subclass EDIT");
+                assert!(install_key_subclass(windows.list), "subclass LISTBOX");
+                windows
+            }
+        }
+    }
+
+    impl Drop for RoutingTestWindows {
+        fn drop(&mut self) {
+            unsafe {
+                if IsWindow(self.parent).as_bool() {
+                    let _ = DestroyWindow(self.parent);
+                }
+                if self.class_registered {
+                    let _ = UnregisterClassW(PCWSTR(self.class_name.as_ptr()), self.instance);
+                }
+            }
+        }
+    }
 
     #[test]
     fn query_matches_label_words_and_detail() {
@@ -432,5 +607,59 @@ mod tests {
         let filtered = filter_entries(&entries, "code", 10);
         let labels: Vec<&str> = filtered.iter().map(|entry| entry.label.as_str()).collect();
         assert_eq!(labels, vec!["Code Notes", "Visual Studio Code"]);
+    }
+
+    #[test]
+    fn edit_and_listbox_route_only_enter_and_escape_to_parent_once() {
+        let mut windows = RoutingTestWindows::new();
+        unsafe {
+            for (index, label) in ["first", "second"].into_iter().enumerate() {
+                let label = wide_nul(label);
+                let added = SendMessageW(
+                    windows.list,
+                    LB_ADDSTRING,
+                    WPARAM(0),
+                    LPARAM(label.as_ptr() as isize),
+                );
+                assert_eq!(added.0, index as isize);
+            }
+            SendMessageW(windows.list, LB_SETCURSEL, WPARAM(0), LPARAM(0));
+
+            for control in [windows.edit, windows.list] {
+                for key in [VK_RETURN, VK_ESCAPE] {
+                    windows.keys.clear();
+                    let key_flags = 0x0001_0001isize;
+                    SendMessageW(
+                        control,
+                        WM_KEYDOWN,
+                        WPARAM(key.0 as usize),
+                        LPARAM(key_flags),
+                    );
+                    assert_eq!(
+                        windows.keys.as_slice(),
+                        &[(key.0 as usize, key_flags)],
+                        "parent must receive one unchanged key message"
+                    );
+                }
+
+                windows.keys.clear();
+                SendMessageW(
+                    control,
+                    WM_KEYDOWN,
+                    WPARAM(VK_DOWN.0 as usize),
+                    LPARAM(0x0050_0001),
+                );
+                assert!(
+                    windows.keys.is_empty(),
+                    "non-Enter/Escape keys must not be forwarded"
+                );
+            }
+
+            assert_eq!(
+                SendMessageW(windows.list, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0,
+                1,
+                "LISTBOX must still handle its native navigation key"
+            );
+        }
     }
 }

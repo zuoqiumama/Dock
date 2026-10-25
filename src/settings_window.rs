@@ -1,5 +1,5 @@
 //! Native settings window (standard Win32 controls — dependency-free, accessible),
-//! dark-themed to match the dock. Choose the system-taskbar hide mode, dock mode,
+//! themed to match the dock. Choose the system-taskbar hide mode, dock mode,
 //! startup options, and manage the pinned ("resident") apps. Changes apply live:
 //! the taskbar is reconfigured immediately and the dock is notified to re-read.
 
@@ -8,11 +8,15 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 
 use windows::core::*;
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_USE_IMMERSIVE_DARK_MODE};
+use windows::Win32::Graphics::Dwm::{
+    DwmSetWindowAttribute, DWMWA_CAPTION_COLOR, DWMWA_COLOR_DEFAULT, DWMWA_TEXT_COLOR,
+    DWMWA_USE_IMMERSIVE_DARK_MODE,
+};
 use windows::Win32::Graphics::Gdi::{
     CreateFontW, CreateSolidBrush, DeleteObject, FillRect, GetMonitorInfoW, MonitorFromWindow,
-    SetBkColor, SetBkMode, SetTextColor, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, TRANSPARENT,
+    RedrawWindow, SetBkColor, SetBkMode, SetTextColor, HBRUSH, HDC, HFONT, HGDIOBJ, HRGN,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, RDW_ALLCHILDREN, RDW_ERASE, RDW_FRAME, RDW_INVALIDATE,
+    TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::SetWindowTheme;
@@ -72,6 +76,18 @@ struct SettingsState {
     bg: HBRUSH,
 }
 
+fn save_or_restore(
+    current: &mut Settings,
+    previous: Settings,
+    save: impl FnOnce(&Settings) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let result = save(current);
+    if result.is_err() {
+        *current = previous;
+    }
+    result
+}
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -80,11 +96,29 @@ fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(r as u32 | ((g as u32) << 8) | ((b as u32) << 16))
 }
 
-fn bg_color() -> COLORREF {
-    rgb(0x22, 0x22, 0x26)
+fn light_theme(theme: ThemePreset) -> bool {
+    matches!(theme, ThemePreset::Glass | ThemePreset::Macos)
 }
-fn text_color() -> COLORREF {
-    rgb(0xEC, 0xEC, 0xEC)
+
+fn surface_color((r, g, b): (f32, f32, f32)) -> COLORREF {
+    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    rgb(channel(r), channel(g), channel(b))
+}
+
+fn bg_color(theme: ThemePreset) -> COLORREF {
+    if light_theme(theme) {
+        surface_color(theme.surface().rgb)
+    } else {
+        rgb(0x22, 0x22, 0x26)
+    }
+}
+
+fn text_color(theme: ThemePreset) -> COLORREF {
+    if light_theme(theme) {
+        surface_color(theme.surface().text_rgb)
+    } else {
+        rgb(0xEC, 0xEC, 0xEC)
+    }
 }
 
 unsafe fn checked(hwnd: HWND) -> bool {
@@ -137,10 +171,83 @@ unsafe fn control(
     hwnd
 }
 
-/// Apply the dark explorer theme to every child control (scrollbars, glyphs).
-unsafe extern "system" fn theme_child(hwnd: HWND, _: LPARAM) -> BOOL {
-    let _ = SetWindowTheme(hwnd, w!("DarkMode_Explorer"), PCWSTR::null());
+/// Keep native control glyphs and scrollbars consistent with the surface.
+unsafe extern "system" fn theme_child(hwnd: HWND, light: LPARAM) -> BOOL {
+    let name = if light.0 != 0 {
+        w!("Explorer")
+    } else {
+        w!("DarkMode_Explorer")
+    };
+    let _ = SetWindowTheme(hwnd, name, PCWSTR::null());
     BOOL(1)
+}
+
+unsafe fn apply_window_theme(hwnd: HWND, theme: ThemePreset) {
+    let light = light_theme(theme);
+    let dark: i32 = i32::from(!light);
+    let _ = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+        &dark as *const i32 as *const c_void,
+        std::mem::size_of::<i32>() as u32,
+    );
+    // Windows 11 can tint the native caption to match; older Windows versions
+    // ignore these optional attributes and keep their standard caption.
+    let caption = if light {
+        bg_color(theme).0
+    } else {
+        DWMWA_COLOR_DEFAULT
+    };
+    let text = if light {
+        text_color(theme).0
+    } else {
+        DWMWA_COLOR_DEFAULT
+    };
+    for (attribute, color) in [(DWMWA_CAPTION_COLOR, caption), (DWMWA_TEXT_COLOR, text)] {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            attribute,
+            &color as *const u32 as *const c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+    }
+    let _ = EnumChildWindows(hwnd, Some(theme_child), LPARAM(isize::from(light)));
+    let _ = RedrawWindow(
+        hwnd,
+        None,
+        HRGN::default(),
+        RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN,
+    );
+}
+
+unsafe fn refresh_surface(hwnd: HWND, state: &mut SettingsState) {
+    let bg = CreateSolidBrush(bg_color(state.settings.theme));
+    if !bg.0.is_null() {
+        let previous = std::mem::replace(&mut state.bg, bg);
+        let _ = DeleteObject(HGDIOBJ(previous.0));
+    }
+    apply_window_theme(hwnd, state.settings.theme);
+}
+
+/// Keep an already-open settings window in sync with tray theme changes.
+pub unsafe fn sync_theme(theme: ThemePreset) {
+    let value = SETTINGS_HWND.load(Ordering::Relaxed);
+    if value == 0 {
+        return;
+    }
+    let hwnd = HWND(value as *mut c_void);
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut SettingsState;
+    if ptr.is_null() || (*ptr).settings.theme == theme {
+        return;
+    }
+    let state = &mut *ptr;
+    state.settings.theme = theme;
+    let index = ThemePreset::ALL
+        .iter()
+        .position(|preset| *preset == theme)
+        .unwrap_or(0);
+    SendMessageW(state.theme_combo, FD_CB_SETCURSEL, WPARAM(index), LPARAM(0));
+    refresh_surface(hwnd, state);
 }
 
 unsafe fn refresh_pins(state: &mut SettingsState) {
@@ -203,12 +310,24 @@ unsafe fn monitor_work_area(dock_hwnd: HWND) -> (i32, i32, i32, i32) {
     }
 }
 
+/// Destroy the independent settings window before application state is released.
+pub unsafe fn close() {
+    let value = SETTINGS_HWND.load(Ordering::Relaxed);
+    if value != 0 {
+        let hwnd = HWND(value as *mut c_void);
+        if IsWindow(hwnd).as_bool() {
+            let _ = DestroyWindow(hwnd);
+        }
+    }
+}
+
 /// Open (or focus, if already open) the settings window.
 pub unsafe fn open(dock_hwnd: HWND) {
     let existing = SETTINGS_HWND.load(Ordering::Relaxed);
     if existing != 0 {
         let hwnd = HWND(existing as *mut c_void);
         if IsWindow(hwnd).as_bool() {
+            sync_theme(settings::load().theme);
             let _ = SetForegroundWindow(hwnd);
             return;
         }
@@ -224,7 +343,7 @@ pub unsafe fn open(dock_hwnd: HWND) {
         lpfnWndProc: Some(wndproc),
         hInstance: instance,
         hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-        hbrBackground: HBRUSH(std::ptr::null_mut()), // we paint the dark bg in WM_ERASEBKGND
+        hbrBackground: HBRUSH(std::ptr::null_mut()), // painted in WM_ERASEBKGND
         lpszClassName: class_name,
         ..Default::default()
     };
@@ -264,15 +383,7 @@ pub unsafe fn open(dock_hwnd: HWND) {
         return;
     };
 
-    // Dark title bar (Win11).
-    let dark: i32 = 1;
-    let _ = DwmSetWindowAttribute(
-        hwnd,
-        DWMWA_USE_IMMERSIVE_DARK_MODE,
-        &dark as *const i32 as *const c_void,
-        4,
-    );
-
+    let current = settings::load();
     let height = -((9.0 * scale * 96.0 / 72.0) as i32);
     let face = wide("Microsoft YaHei UI");
     let font = CreateFontW(
@@ -291,7 +402,7 @@ pub unsafe fn open(dock_hwnd: HWND) {
         0,
         PCWSTR(face.as_ptr()),
     );
-    let bg = CreateSolidBrush(bg_color());
+    let bg = CreateSolidBrush(bg_color(current.theme));
 
     let btn = w!("BUTTON");
     let group = WINDOW_STYLE(BS_GROUPBOX as u32).0;
@@ -402,9 +513,6 @@ pub unsafe fn open(dock_hwnd: HWND) {
 
     mk("关闭", push, ID_CLOSE, (332, 660, 76, 28));
 
-    let _ = EnumChildWindows(hwnd, Some(theme_child), LPARAM(0));
-
-    let current = settings::load();
     select_one(
         &tb_radios,
         match current.taskbar_mode {
@@ -450,23 +558,82 @@ pub unsafe fn open(dock_hwnd: HWND) {
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
     SETTINGS_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
     refresh_pins(&mut *state);
+    apply_window_theme(hwnd, (*state).settings.theme);
 
     let _ = ShowWindow(hwnd, SW_SHOW);
     let _ = SetForegroundWindow(hwnd);
 }
 
-unsafe fn persist_and_notify(state: &SettingsState) {
-    let _ = settings::save(&state.settings);
-    notify(state, WM_SETTINGS_CHANGED);
+unsafe fn restore_controls(state: &SettingsState) {
+    select_one(
+        &state.tb_radios,
+        match state.settings.taskbar_mode {
+            TaskbarMode::Show => 0,
+            TaskbarMode::AutoHide => 1,
+            TaskbarMode::Hidden => 2,
+        },
+    );
+    select_one(
+        &state.dock_radios,
+        match state.settings.dock_mode {
+            DockMode::Always => 0,
+            DockMode::AutoHide => 1,
+        },
+    );
+    set_checked(state.fullscreen, state.settings.hide_on_fullscreen);
+    set_checked(state.maximized, state.settings.hide_on_maximized);
+    set_checked(state.drawer_enabled, state.settings.drawer_enabled);
+    set_checked(state.hide_desktop, state.settings.hide_desktop_icons);
+    let theme = ThemePreset::ALL
+        .iter()
+        .position(|preset| *preset == state.settings.theme)
+        .unwrap_or(0);
+    SendMessageW(state.theme_combo, FD_CB_SETCURSEL, WPARAM(theme), LPARAM(0));
 }
 
-unsafe fn dark_ctl_color(state: *mut SettingsState, wparam: WPARAM) -> LRESULT {
+unsafe fn persist_and_notify(
+    hwnd: HWND,
+    state: &mut SettingsState,
+    previous: Settings,
+    message: u32,
+) {
+    let restore_taskbar = previous.taskbar_mode != state.settings.taskbar_mode;
+    let restore_desktop = previous.hide_desktop_icons != state.settings.hide_desktop_icons;
+    let restore_theme = previous.theme != state.settings.theme;
+    match save_or_restore(&mut state.settings, previous, settings::save) {
+        Ok(()) => notify(state, message),
+        Err(error) => {
+            if restore_taskbar {
+                taskbar::apply(previous.taskbar_mode);
+            }
+            if restore_desktop {
+                crate::desktop_icons::set_hidden(previous.hide_desktop_icons);
+            }
+            restore_controls(state);
+            if restore_theme {
+                refresh_surface(hwnd, state);
+            }
+            error_log::write("保存设置失败，已恢复原设置", &error);
+            let text = wide(&format!(
+                "无法保存设置：{error}\n\n已恢复更改前的设置和系统状态。"
+            ));
+            let _ = MessageBoxW(
+                hwnd,
+                PCWSTR(text.as_ptr()),
+                w!("FeatherDock 设置"),
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
+}
+
+unsafe fn ctl_color(state: *mut SettingsState, wparam: WPARAM) -> LRESULT {
     if state.is_null() {
         return LRESULT(0);
     }
     let hdc = HDC(wparam.0 as *mut c_void);
-    SetTextColor(hdc, text_color());
-    SetBkColor(hdc, bg_color());
+    SetTextColor(hdc, text_color((*state).settings.theme));
+    SetBkColor(hdc, bg_color((*state).settings.theme));
     SetBkMode(hdc, TRANSPARENT);
     LRESULT((*state).bg.0 as isize)
 }
@@ -482,11 +649,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 FillRect(hdc, &rc, (*ptr).bg);
                 LRESULT(1)
             }
-            WM_CTLCOLORSTATIC | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN => dark_ctl_color(ptr, wparam),
+            WM_CTLCOLORSTATIC | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN | WM_CTLCOLOREDIT => {
+                ctl_color(ptr, wparam)
+            }
             WM_COMMAND if !ptr.is_null() => {
                 let state = &mut *ptr;
                 let id = wparam.0 & 0xFFFF;
                 let code = (wparam.0 >> 16) & 0xFFFF;
+                let previous = state.settings;
                 match id {
                     ID_TB_SHOW | ID_TB_AUTOHIDE | ID_TB_HIDDEN => {
                         let (mode, index) = match id {
@@ -497,7 +667,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         state.settings.taskbar_mode = mode;
                         select_one(&state.tb_radios, index);
                         taskbar::apply(mode);
-                        persist_and_notify(state);
+                        persist_and_notify(hwnd, state, previous, WM_SETTINGS_CHANGED);
                     }
                     ID_DOCK_ALWAYS | ID_DOCK_AUTOHIDE => {
                         let (mode, index) = if id == ID_DOCK_ALWAYS {
@@ -507,15 +677,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         };
                         state.settings.dock_mode = mode;
                         select_one(&state.dock_radios, index);
-                        persist_and_notify(state);
+                        persist_and_notify(hwnd, state, previous, WM_SETTINGS_CHANGED);
                     }
                     ID_FULLSCREEN => {
                         state.settings.hide_on_fullscreen = checked(state.fullscreen);
-                        persist_and_notify(state);
+                        persist_and_notify(hwnd, state, previous, WM_SETTINGS_CHANGED);
                     }
                     ID_MAXIMIZED => {
                         state.settings.hide_on_maximized = checked(state.maximized);
-                        persist_and_notify(state);
+                        persist_and_notify(hwnd, state, previous, WM_SETTINGS_CHANGED);
                     }
                     ID_THEME if code == FD_CBN_SELCHANGE => {
                         let sel =
@@ -524,7 +694,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         if sel >= 0 {
                             if let Some(theme) = ThemePreset::ALL.get(sel as usize) {
                                 state.settings.theme = *theme;
-                                persist_and_notify(state);
+                                refresh_surface(hwnd, state);
+                                persist_and_notify(hwnd, state, previous, WM_SETTINGS_CHANGED);
                             }
                         }
                     }
@@ -563,17 +734,14 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     ID_DRAWER_ENABLED => {
                         // Show/hide the dock's app-drawer button → the dock must rebuild.
                         state.settings.drawer_enabled = checked(state.drawer_enabled);
-                        let _ = settings::save(&state.settings);
-                        notify(state, WM_PINS_CHANGED);
+                        persist_and_notify(hwnd, state, previous, WM_PINS_CHANGED);
                     }
                     ID_HIDE_DESKTOP_ICONS => {
-                        // Apply live, then persist AND notify the dock: it must re-read so its
-                        // in-memory `hide_desktop_icons` is current — otherwise the exit cleanup
-                        // (which restores icons only if the dock thinks it hid them) leaves the
-                        // user with a blank desktop after FeatherDock quits.
+                        // Notify only after a successful save so the owner's cleanup and
+                        // watchdog plan always match the actual desktop-icon state.
                         state.settings.hide_desktop_icons = checked(state.hide_desktop);
                         crate::desktop_icons::set_hidden(state.settings.hide_desktop_icons);
-                        persist_and_notify(state);
+                        persist_and_notify(hwnd, state, previous, WM_SETTINGS_CHANGED);
                     }
                     ID_CLOSE => {
                         let _ = DestroyWindow(hwnd);
@@ -598,5 +766,53 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_save_restores_the_previous_settings() {
+        let previous = Settings::default();
+        let mut current = Settings {
+            taskbar_mode: TaskbarMode::Hidden,
+            theme: ThemePreset::Compact,
+            ..previous
+        };
+        let result = save_or_restore(&mut current, previous, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected save failure",
+            ))
+        });
+
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(current, previous);
+    }
+
+    #[test]
+    fn successful_save_keeps_the_new_settings() {
+        let previous = Settings::default();
+        let mut current = Settings {
+            drawer_enabled: false,
+            ..previous
+        };
+        save_or_restore(&mut current, previous, |saved| {
+            assert!(!saved.drawer_enabled);
+            Ok(())
+        })
+        .expect("injected save succeeds");
+
+        assert!(!current.drawer_enabled);
+        let expected = Settings {
+            drawer_enabled: false,
+            ..previous
+        };
+        assert_eq!(current, expected);
     }
 }

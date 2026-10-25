@@ -185,6 +185,17 @@ fn cache_path() -> PathBuf {
 
 fn load_cache(now: SystemTime, current_signature: &str) -> Option<Vec<DesktopEntry>> {
     let text = fs::read_to_string(cache_path()).ok()?;
+    parse_cached_entries(&text, now, current_signature, |path| {
+        Path::new(path).exists()
+    })
+}
+
+fn parse_cached_entries(
+    text: &str,
+    now: SystemTime,
+    current_signature: &str,
+    mut path_exists: impl FnMut(&str) -> bool,
+) -> Option<Vec<DesktopEntry>> {
     let mut written: Option<SystemTime> = None;
     let mut signature: Option<String> = None;
     let mut entries = Vec::new();
@@ -204,25 +215,23 @@ fn load_cache(now: SystemTime, current_signature: &str) -> Option<Vec<DesktopEnt
                 let key = parts.next().map(unescape)?;
                 let path = parts.next().map(unescape)?;
                 let kind = parts.next().and_then(kind_from_code)?;
-                if Path::new(&path).exists() {
-                    entries.push(DesktopEntry {
-                        label,
-                        key,
-                        path: Some(path),
-                        pidl: None,
-                        kind,
-                    });
-                }
+                entries.push(DesktopEntry {
+                    label,
+                    key,
+                    path: Some(path),
+                    pidl: None,
+                    kind,
+                });
             }
             _ => {}
         }
     }
 
-    if cache_is_fresh(written?, now, signature.as_deref()?, current_signature) {
-        Some(entries)
-    } else {
-        None
+    if !cache_is_fresh(written?, now, signature.as_deref()?, current_signature) {
+        return None;
     }
+    entries.retain(|entry| entry.path.as_deref().is_some_and(&mut path_exists));
+    Some(entries)
 }
 
 fn save_cache(now: SystemTime, signature: &str, entries: &[DesktopEntry]) -> std::io::Result<()> {
@@ -482,6 +491,32 @@ mod tests {
             "desktop-a",
             "desktop-a"
         ));
+    }
+
+    #[test]
+    fn stale_cache_is_rejected_before_probing_entry_paths() {
+        let cache = format!(
+            "written\t1000\nsignature\tdesktop-a\nentry\tApp\tapp-key\tC:\\\\Cloud\\\\App.exe\t{}\n",
+            kind_code(ContentKind::Application)
+        );
+        let probes = std::cell::Cell::new(0);
+        let stale = UNIX_EPOCH + Duration::from_secs(1_000 + CACHE_TTL_SECS + 1);
+        assert!(parse_cached_entries(&cache, stale, "desktop-a", |_| {
+            probes.set(probes.get() + 1);
+            true
+        })
+        .is_none());
+        assert_eq!(probes.get(), 0);
+
+        let fresh = UNIX_EPOCH + Duration::from_secs(1_001);
+        let entries = parse_cached_entries(&cache, fresh, "desktop-a", |path| {
+            assert_eq!(path, r"C:\Cloud\App.exe");
+            probes.set(probes.get() + 1);
+            false
+        })
+        .expect("fresh cache is parsed before path validation");
+        assert!(entries.is_empty());
+        assert_eq!(probes.get(), 1);
     }
 
     #[test]

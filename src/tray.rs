@@ -171,6 +171,7 @@ impl Tray {
         let _ = AppendMenuW(menu, MF_STRING, ID_EXIT, PCWSTR(exit.as_ptr()));
         // Required so the menu dismisses correctly when clicking elsewhere.
         let _ = SetForegroundWindow(hwnd);
+        let menu_style = crate::menu_style::style(menu, crate::dock_theme(hwnd), hwnd);
         let cmd = TrackPopupMenu(
             menu,
             TPM_RIGHTBUTTON | TPM_RETURNCMD,
@@ -180,6 +181,7 @@ impl Tray {
             hwnd,
             None,
         );
+        drop(menu_style);
         let _ = DestroyMenu(menu);
         // Finish the foreground-menu interaction before the next invocation.
         let _ = PostMessageW(hwnd, WM_NULL, WPARAM(0), LPARAM(0));

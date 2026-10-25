@@ -10,6 +10,7 @@ mod app_icon;
 mod apps;
 mod atomic;
 mod autostart;
+mod backdrop;
 mod categories;
 mod command_palette;
 mod config;
@@ -27,6 +28,7 @@ mod folder_stack;
 mod glass;
 mod graphics;
 mod icons;
+mod menu_style;
 mod render;
 mod settings;
 mod settings_window;
@@ -48,14 +50,8 @@ use windows::Win32::Graphics::Gdi::{
     HRGN, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
 };
 use windows::Win32::System::Com::*;
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
-};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::{
-    GetCurrentProcessId, OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
-    PROCESS_TERMINATE,
-};
+use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -90,6 +86,7 @@ const RESTORE_SYSTEM_FLAG: &str = "--restore-system";
 const WM_SHOW_EXISTING: u32 = 0x8033;
 pub(crate) const WM_ANIMATION_WAKE: u32 = 0x8034;
 const WM_OPEN_SETTINGS: u32 = 0x8035;
+pub(crate) const WM_DOCK_ICONS_READY: u32 = 0x8036;
 
 fn animation_message_batch_has_capacity(dispatched: usize) -> bool {
     dispatched < ANIMATION_MESSAGE_BUDGET
@@ -144,7 +141,7 @@ struct App {
     strip_h: i32,               // window height when collapsed to the reveal strip
     expanded: bool,             // true = full window, false = thin bottom strip
     window_hidden: bool,        // fully SW_HIDE'd because a fullscreen app is in front
-    region_full: bool,          // input region: true = whole window, false = clipped to pill
+    region_full: bool,          // window/input clip: true = full, false = expanded pill
     pending_relayout: bool,     // shrink the window to fit once exit animations settle
     pending_rebuild: bool, // a window-set/display change deferred while a fullscreen app owned the screen
     taskbar_invoked_at: Option<Instant>,
@@ -208,6 +205,16 @@ pub(crate) unsafe fn dock_shared_gpu(hwnd: HWND) -> Option<(ID3D11Device, ID2D1D
     ))
 }
 
+/// Snapshot the owner's preset without manufacturing another mutable App borrow.
+pub(crate) unsafe fn dock_theme(hwnd: HWND) -> theme::ThemePreset {
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const App;
+    if ptr.is_null() {
+        theme::ThemePreset::default()
+    } else {
+        (*ptr).dock.theme
+    }
+}
+
 fn io_error(context: &str, error: std::io::Error) -> Error {
     Error::new(E_FAIL, format!("{context}: {error}"))
 }
@@ -215,14 +222,7 @@ fn io_error(context: &str, error: std::io::Error) -> Error {
 /// The pinned (left-of-divider) items, from the user's config or built-in defaults.
 fn pinned_items() -> Result<Vec<dock::DockItem>> {
     match config::load().map_err(|error| io_error("读取配置失败", error))? {
-        Some(cfg) => {
-            let items = apps::from_config(&cfg.items);
-            if items.is_empty() {
-                Ok(apps::default_items())
-            } else {
-                Ok(items)
-            }
-        }
+        Some(cfg) => Ok(apps::from_config(&cfg.items)),
         None => {
             let items = apps::default_items();
             config::write_default(&items).map_err(|error| io_error("创建默认配置失败", error))?;
@@ -456,38 +456,48 @@ unsafe fn set_window_hidden(hwnd: HWND, app: &mut App, hide: bool) {
     let _ = ShowWindow(hwnd, if hide { SW_HIDE } else { SW_SHOWNOACTIVATE });
 }
 
-/// Clip the window's *input* region to just the visible pill (at rest) or remove the clip
-/// so the whole window takes input (while hovering / animating, when magnified icons rise
-/// above the pill and must stay interactive).
-///
-/// This is what truly frees the head-room above and slack beside the dock: `HTTRANSPARENT`
-/// from `WM_NCHITTEST` does NOT pass clicks through for this layered DirectComposition
-/// window — the window physically covers the area and swallows the click. A real window
-/// region makes those pixels not belong to the window at all, so clicks reach the app
-/// beneath (e.g. a Send button just above the dock). Rounded to match the pill's corners.
+/// Geometry for the resting window region. The margin keeps the hard, aliased GDI
+/// boundary outside Direct2D's stroke and antialiased pixels instead of cutting
+/// dark notches into the two curved ends. `right` / `bottom` stay exclusive.
+fn resting_region(pill: (f32, f32, f32, f32), radius: f32, dpi: f32) -> (i32, i32, i32, i32, i32) {
+    let (l, t, r, b) = pill;
+    let margin = (1.5 * dpi).ceil().max(2.0) as i32;
+    let ellipse = (2.0 * (radius + margin as f32)).ceil() as i32;
+    (
+        l.floor() as i32 - margin,
+        t.floor() as i32 - margin,
+        r.ceil() as i32 + margin + 1,
+        b.ceil() as i32 + margin + 1,
+        ellipse,
+    )
+}
+
+/// At rest, clip to a slightly expanded pill so transparent head-room and side slack
+/// remain click-through. Hovering / animating removes the clip for magnified icons.
+/// `HTTRANSPARENT` alone does not pass these clicks through this composition window.
+/// The region is only an input-shape approximation: the GPU material supplies the
+/// exact antialiased curve, so the GDI boundary must not double as its visible edge.
 unsafe fn set_region_full(hwnd: HWND, app: &mut App, full: bool) {
     if app.region_full == full {
         return;
     }
-    app.region_full = full;
     if full {
-        // NULL region = the whole window receives input again.
-        let _ = SetWindowRgn(hwnd, HRGN::default(), BOOL(1));
+        if SetWindowRgn(hwnd, HRGN::default(), BOOL(1)) != 0 {
+            app.region_full = true;
+        }
         return;
     }
-    let (l, t, r, b) = app.dock.frame().pill;
-    let ellipse = (44.0 * app.dock.dpi) as i32; // 2x the 22*dpi pill corner radius
-    let rgn = CreateRoundRectRgn(
-        l.floor() as i32,
-        t.floor() as i32,
-        r.ceil() as i32 + 1, // CreateRoundRectRgn's right/bottom are exclusive
-        b.ceil() as i32 + 1,
-        ellipse,
-        ellipse,
+    let (l, t, r, b, ellipse) = resting_region(
+        app.dock.frame().pill,
+        app.dock.theme.visual().pill_radius * app.dock.dpi,
+        app.dock.dpi,
     );
+    let rgn = CreateRoundRectRgn(l, t, r, b, ellipse, ellipse);
     // On success the system owns the region; on failure we still own it -> free it.
     if SetWindowRgn(hwnd, rgn, BOOL(1)) == 0 {
         let _ = DeleteObject(HGDIOBJ(rgn.0));
+    } else {
+        app.region_full = false;
     }
 }
 
@@ -623,24 +633,23 @@ fn handle_control_args() -> bool {
     }
 }
 
-unsafe fn acquire_instance_or_recover_orphan() -> Result<Option<single_instance::SingleInstance>> {
+unsafe fn acquire_instance_or_reveal_existing() -> Result<Option<single_instance::SingleInstance>> {
     if let Some(instance) = single_instance::SingleInstance::acquire()? {
         return Ok(Some(instance));
     }
-    if reveal_existing_instance() {
-        return Ok(None);
-    }
-
-    restore_stranded_system_state();
-    terminate_orphaned_instances();
     for _ in 0..20 {
+        if reveal_existing_instance() {
+            return Ok(None);
+        }
+        // The other instance may still be creating its window. Never guess that it
+        // is orphaned and kill every process with the same image name.
         if let Some(instance) = single_instance::SingleInstance::acquire()? {
             return Ok(Some(instance));
         }
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    show_orphan_recovery_failed();
+    show_existing_instance_unavailable();
     Ok(None)
 }
 
@@ -657,8 +666,8 @@ unsafe fn reveal_existing_instance() -> bool {
     true
 }
 
-unsafe fn show_orphan_recovery_failed() {
-    let text: Vec<u16> = "FeatherDock found a stale running instance without a dock window.\n\nThe taskbar and desktop icons were restored, but the stale process could not be cleared automatically. End the remaining FeatherDock.exe process in Task Manager, then start FeatherDock again."
+unsafe fn show_existing_instance_unavailable() {
+    let text: Vec<u16> = "检测到另一个 FeatherDock 实例，但暂时无法连接它的主窗口。它可能仍在启动或暂时无响应。\n\n请稍后再试。如需恢复任务栏或桌面图标，请显式运行 FeatherDock.exe --restore-system。"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -668,59 +677,6 @@ unsafe fn show_orphan_recovery_failed() {
         w!("FeatherDock"),
         MB_OK | MB_ICONWARNING,
     );
-}
-
-fn process_name_matches_current_exe(candidate_name: &str, current_exe: &std::path::Path) -> bool {
-    if candidate_name.is_empty() {
-        return false;
-    }
-    current_exe
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| candidate_name.eq_ignore_ascii_case(name))
-}
-
-fn process_entry_name(entry: &PROCESSENTRY32W) -> String {
-    let len = entry
-        .szExeFile
-        .iter()
-        .position(|ch| *ch == 0)
-        .unwrap_or(entry.szExeFile.len());
-    String::from_utf16_lossy(&entry.szExeFile[..len])
-}
-
-unsafe fn terminate_orphaned_instances() {
-    let Ok(current_exe) = std::env::current_exe() else {
-        return;
-    };
-    let current_pid = GetCurrentProcessId();
-    let Ok(snapshot) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
-        return;
-    };
-
-    let mut entry = PROCESSENTRY32W {
-        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
-        ..Default::default()
-    };
-    if Process32FirstW(snapshot, &mut entry).is_ok() {
-        loop {
-            let pid = entry.th32ProcessID;
-            let name = process_entry_name(&entry);
-            if pid != current_pid && process_name_matches_current_exe(&name, &current_exe) {
-                if let Ok(process) =
-                    OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, BOOL(0), pid)
-                {
-                    let _ = TerminateProcess(process, 1);
-                    let _ = WaitForSingleObject(process, 2_000);
-                    let _ = CloseHandle(process);
-                }
-            }
-            if Process32NextW(snapshot, &mut entry).is_err() {
-                break;
-            }
-        }
-    }
-    let _ = CloseHandle(snapshot);
 }
 
 unsafe fn request_graceful_quit() {
@@ -813,7 +769,7 @@ unsafe fn stop_watchdog(app: &mut App) {
 
 fn run() -> Result<()> {
     unsafe {
-        let Some(instance) = acquire_instance_or_recover_orphan()? else {
+        let Some(instance) = acquire_instance_or_reveal_existing()? else {
             return Ok(());
         };
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -980,6 +936,7 @@ fn run() -> Result<()> {
                 if !removed.is_empty() {
                     (*app_ptr).gpu.drop_icons(&removed);
                 }
+                let icons_loading = (*app_ptr).gpu.decode_pending_icons(&(*app_ptr).dock.items);
                 // Popup surfaces submit without their own vsync wait. The Dock's swapchain
                 // is the one frame clock, so all three surfaces advance exactly once per
                 // display refresh instead of serially blocking the UI thread.
@@ -997,8 +954,11 @@ fn run() -> Result<()> {
                 }
                 // Any future mouse move wakes the message loop and requests another
                 // frame. Once all easing settles, stop presenting duplicate frames even
-                // when the pointer is resting over the Dock.
-                if !animation_sources_active(moving, drawer_moving, control_moving) {
+                // when the pointer is resting over the Dock. Background icon extraction
+                // wakes this loop only when a result is ready; queued decodes stay bounded.
+                if !animation_sources_active(moving, drawer_moving, control_moving)
+                    && !icons_loading
+                {
                     // Exit animations are done — reclaim the width we held for the
                     // collapsing slots, shrinking the window back to fit the row.
                     if (*app_ptr).pending_relayout {
@@ -1054,16 +1014,28 @@ unsafe fn cleanup(app_ptr: *mut App) {
         // Stop the watchdog first (while it's still blocked on us) so it can't also fire
         // a redundant restore, then put the taskbar back ourselves. Never strand the user.
         stop_watchdog(&mut *app_ptr);
+        windows_list::remove_hooks(std::mem::take(&mut (*app_ptr).hooks));
+        // Dispatcher shutdown still pumps native messages. Destroy popups and
+        // detach the App pointer first so no queued callback can use freed state.
+        drawer::shutdown();
+        control_center::shutdown();
+        window_preview::hide();
+        settings_window::close();
+        let hwnd = dock_window();
+        if !hwnd.is_invalid() && GetWindowLongPtrW(hwnd, GWLP_USERDATA) == app_ptr as isize {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            let _ = DestroyWindow(hwnd);
+        }
         taskbar::restore();
         // Never leave the user with a blank desktop: put the icons back if we hid them.
         if (*app_ptr).settings.hide_desktop_icons {
             desktop_icons::set_hidden(false);
         }
-        windows_list::remove_hooks(std::mem::take(&mut (*app_ptr).hooks));
         (*app_ptr).tray.remove();
         drawer_icons::cleanup(); // per-dock icon cache temp dir
         drop(Box::from_raw(app_ptr));
     }
+    backdrop::shutdown();
 }
 
 /// (Re-)enter the hidden resting state: make the taskbar transparent + auto-hide
@@ -1206,6 +1178,7 @@ unsafe fn show_window_menu(owner: HWND, app: &mut App, windows: &[isize]) {
     };
     append_item(menu, ID_WIN_CLOSE, close_label);
     let _ = SetForegroundWindow(owner); // so the menu dismisses on click-away
+    let menu_style = menu_style::style(menu, app.dock.theme, owner);
     let cmd = TrackPopupMenu(
         menu,
         TPM_RIGHTBUTTON | TPM_RETURNCMD,
@@ -1215,6 +1188,7 @@ unsafe fn show_window_menu(owner: HWND, app: &mut App, windows: &[isize]) {
         owner,
         None,
     );
+    drop(menu_style);
     let _ = DestroyMenu(menu);
     match cmd.0 as usize {
         ID_WIN_CLOSE => windows.iter().for_each(|&w| windows_list::close_window(w)),
@@ -1269,6 +1243,7 @@ unsafe fn show_pinned_menu(owner: HWND, app: &mut App, path: &str, windows: &[is
     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
     append_item(menu, ID_PIN_REMOVE, "从 Dock 移除");
     let _ = SetForegroundWindow(owner);
+    let menu_style = menu_style::style(menu, app.dock.theme, owner);
     let cmd = TrackPopupMenu(
         menu,
         TPM_RIGHTBUTTON | TPM_RETURNCMD,
@@ -1278,6 +1253,7 @@ unsafe fn show_pinned_menu(owner: HWND, app: &mut App, path: &str, windows: &[is
         owner,
         None,
     );
+    drop(menu_style);
     let _ = DestroyMenu(menu);
     match cmd.0 as usize {
         ID_PIN_OPEN => {
@@ -1595,6 +1571,9 @@ unsafe fn update_running_preview(hwnd: HWND, app: &App, x: f32, y: f32) {
 
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
+        if let Some(result) = menu_style::handle_message(hwnd, msg, wparam, lparam) {
+            return result;
+        }
         let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App;
         if ptr.is_null() {
             return DefWindowProcW(hwnd, msg, wparam, lparam);
@@ -1614,6 +1593,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             return LRESULT(0);
         }
         match msg {
+            WM_DOCK_ICONS_READY => {
+                app.gpu.icons_ready(&app.dock.items, lparam.0);
+                app.animating = true;
+                LRESULT(0)
+            }
             WM_MOUSEMOVE => {
                 // While a fullscreen app owns the screen, never let a bottom-edge hover
                 // summon the dock — popping it topmost would kick an exclusive-fullscreen
@@ -1893,6 +1877,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 // fullscreen so we never kick a game out of exclusive mode).
                 if app.pending_rebuild && !fullscreen {
                     app.pending_rebuild = false;
+                    app.gpu.refresh_backdrop(hwnd);
+                    drawer::hide();
+                    control_center::hide();
                     if let Err(error) = reload_app(hwnd, app) {
                         show_error(hwnd, "刷新窗口列表失败", error);
                     }
@@ -1956,8 +1943,18 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 // applied the taskbar mode itself; re-read and ease to the new resting
                 // state. If it switched us to hidden, defeat the auto-hide entry slide
                 // and grow maximized windows into the freed work area.
+                let previous_theme = app.settings.theme;
                 app.settings = settings::load();
                 app.dock.theme = app.settings.theme;
+                if previous_theme != app.settings.theme {
+                    // Popups snapshot their owner's palette. Reopen them on the new
+                    // preset rather than leaving mixed materials on screen.
+                    drawer::hide();
+                    control_center::hide();
+                    window_preview::hide();
+                    settings_window::sync_theme(app.settings.theme);
+                    set_region_full(hwnd, app, true);
+                }
                 if app.settings.taskbar_mode == settings::TaskbarMode::Hidden
                     && app.taskbar_invoked_at.is_none()
                 {
@@ -2000,7 +1997,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 LRESULT(0)
             }
-            WM_DPICHANGED | WM_DISPLAYCHANGE | WM_SETTINGCHANGE => {
+            WM_DPICHANGED | WM_DISPLAYCHANGE | WM_SETTINGCHANGE | WM_THEMECHANGED => {
                 // A fullscreen game switching display mode broadcasts WM_DISPLAYCHANGE.
                 // Reacting now — re-stacking the dock topmost (reload_app) or reflowing
                 // windows — knocks the game out of exclusive fullscreen and bounces it to
@@ -2010,6 +2007,9 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     app.pending_rebuild = true;
                     return LRESULT(0);
                 }
+                app.gpu.refresh_backdrop(hwnd);
+                drawer::hide();
+                control_center::hide();
                 if let Err(error) = reload_app(hwnd, app) {
                     show_error(hwnd, "重新布局 Dock 失败", error);
                 }
@@ -2082,6 +2082,23 @@ mod tests {
     fn settled_hover_keeps_the_magnified_icon_hit_region() {
         assert!(settled_region_should_stay_full(true));
         assert!(!settled_region_should_stay_full(false));
+    }
+
+    #[test]
+    fn resting_region_does_not_cut_the_antialiased_stroke_at_any_dpi() {
+        for dpi in [1.0, 1.25, 1.5, 2.0] {
+            let pill = (10.2, 20.7, 130.4, 89.1);
+            let radius = 32.0 * dpi;
+            let (left, top, right, bottom, ellipse) = resting_region(pill, radius, dpi);
+            let margin = (1.5 * dpi).ceil().max(2.0) as i32;
+
+            assert!(margin as f32 >= dpi * 0.5 + 1.0);
+            assert_eq!(left, 10 - margin);
+            assert_eq!(top, 20 - margin);
+            assert_eq!(right, 131 + margin + 1);
+            assert_eq!(bottom, 90 + margin + 1);
+            assert_eq!(ellipse, (2.0 * (radius + margin as f32)).ceil() as i32);
+        }
     }
 
     #[test]
@@ -2167,16 +2184,31 @@ mod tests {
     }
 
     #[test]
-    fn orphan_cleanup_matches_only_current_exe_name() {
-        let current = std::path::Path::new(r"F:\agentic\featherdock\FeatherDock.exe");
+    fn instance_recovery_never_kills_by_image_name_or_restores_implicitly() {
+        let source = include_str!("main.rs");
+        let production = source
+            .rsplit_once("#[cfg(test)]")
+            .map(|(head, _)| head)
+            .expect("main production source");
+        assert!(!production.contains("TerminateProcess"));
+        let recovery = production
+            .split("unsafe fn acquire_instance_or_reveal_existing")
+            .nth(1)
+            .and_then(|tail| tail.split("unsafe fn dock_window").next())
+            .expect("instance recovery body");
+        assert!(!recovery.contains("restore_stranded_system_state"));
+    }
 
-        assert!(process_name_matches_current_exe("featherdock.exe", current));
-        assert!(process_name_matches_current_exe("FeatherDock.EXE", current));
-        assert!(!process_name_matches_current_exe(
-            "FeatherDockHelper.exe",
-            current
-        ));
-        assert!(!process_name_matches_current_exe("", current));
+    #[test]
+    fn existing_empty_pin_config_does_not_regenerate_defaults() {
+        let source = include_str!("main.rs");
+        let pinned = source
+            .split("fn pinned_items()")
+            .nth(1)
+            .and_then(|tail| tail.split("fn compose_items").next())
+            .expect("pinned config loader");
+        assert!(pinned.contains("Some(cfg) => Ok(apps::from_config(&cfg.items))"));
+        assert!(!pinned.contains("items.is_empty()"));
     }
 
     #[test]

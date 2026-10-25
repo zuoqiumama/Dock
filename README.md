@@ -20,7 +20,7 @@
   <img src="docs/images/dock.png" width="760" alt="FeatherDock 主条">
 </p>
 
-FeatherDock 是一个 Windows 上的 Dock，用 Rust 直接写在系统原生图形栈上（DirectComposition + Direct2D + D3D11），不用 Electron 或 WebView，也没有常驻的后台扫描进程。可执行文件六百多 KB，放着不动的时候几乎不占 CPU。
+FeatherDock 是一个 Windows 上的 Dock，用 Rust 直接写在系统原生图形栈上（DirectComposition + Direct2D + D3D11），不用 Electron 或 WebView，也没有常驻的后台扫描进程。界面静止时不持续重绘。
 
 常用的功能都在：图标悬停放大，正在运行的窗口按程序归组、图标下标一个小圆点，悬停能看实时缩略图。文件夹固定项可按需展开成 Stack 菜单，`Ctrl+Alt+Space` 可打开轻量命令面板。另外有一个把桌面程序分类整理的程序抽屉，和一个支持音频设备、网络、蓝牙、输入法、电量与时间的分页控制中心。
 
@@ -57,12 +57,16 @@ FeatherDock 是一个 Windows 上的 Dock，用 Rust 直接写在系统原生图
 - 命令面板：`Ctrl+Alt+Space` 搜索固定项、运行窗口和桌面程序
 - 控制中心：主音量滑块、输出/输入音频设备选择、Wi-Fi 刷新与连接、蓝牙设备状态、输入法切换，以及电量与时钟入口
 - 固定项自修复：WindowsApps 版本目录更新或唯一 exe 文件名变化后，启动时会在安全范围内修复失效路径
-- 主题预设：玻璃、紧凑、纯色、macOS、高对比五种预设，不引入重型皮肤系统
+- 主题预设：暖瓷玻璃、紧凑、纯色、macOS、高对比五种预设，不引入重型皮肤系统
 - 设置窗口：系统任务栏模式、Dock 显示模式、主题预设、全屏 / 最大化时收起、开机自启、常驻应用管理
 - 桌面模式：可隐藏 Windows 桌面图标，把桌面程序交给抽屉管理
 - 单文件发布：`build.ps1` 产出仓库根目录的 `FeatherDock.exe`
 
 ## Build And Run
+
+默认「暖瓷玻璃」使用象牙暖白底色、暖灰文字和薄荷状态提示：主 Dock 保持轻薄，抽屉和控制中心使用更厚的底材。支持的 Windows 11 系统通过 DWM HostBackdrop 在窗口背后做真正的背景模糊，按实际圆角和展开动画裁剪，不采屏、不增加常驻刷新计时器。系统关闭透明效果、高对比模式、远程会话或材质不可用时，自动使用更实的暖瓷底色。设置、原生右键菜单和缩略图外框采用同源实色，保证文字和原生控件清晰。
+
+现有 `theme = "glass"` 配置自动使用新外观；其它四种预设仍可在设置中选择。开发接手说明见 [docs/HANDOFF.md](docs/HANDOFF.md)。
 
 可执行文件不提交到仓库。运行构建脚本后，最终产物会收敛到仓库根目录的单个 `FeatherDock.exe`：
 

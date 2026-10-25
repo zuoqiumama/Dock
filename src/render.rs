@@ -1,12 +1,48 @@
 //! Direct2D drawing: the translucent pill + magnified icon tiles + emoji glyphs.
 //! Only transforms change per frame; geometry is vector so it stays crisp at any scale.
 
+use windows::core::Interface;
 use windows::Foundation::Numerics::Matrix3x2;
 use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 
 use crate::dock::{Dock, ItemRole, BASE_ICON, CORNER, ENTER_RISE};
+use crate::theme::ThemePreset;
+
+/// Reused GPU material brushes: no gradient resources are allocated per frame.
+pub struct MaterialBrushes {
+    sheen: ID2D1LinearGradientBrush,
+}
+
+impl MaterialBrushes {
+    pub unsafe fn new(dc: &ID2D1DeviceContext) -> windows::core::Result<Self> {
+        let target: ID2D1RenderTarget = dc.cast()?;
+        let stops = target.CreateGradientStopCollection(
+            &[
+                D2D1_GRADIENT_STOP {
+                    position: 0.0,
+                    color: color(1.0, 1.0, 1.0, 0.20),
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 1.0,
+                    color: color(1.0, 1.0, 1.0, 0.0),
+                },
+            ],
+            D2D1_GAMMA_2_2,
+            D2D1_EXTEND_MODE_CLAMP,
+        )?;
+        let sheen = dc.CreateLinearGradientBrush(
+            &D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                startPoint: D2D_POINT_2F { x: 0.0, y: 0.0 },
+                endPoint: D2D_POINT_2F { x: 0.0, y: 1.0 },
+            },
+            None,
+            &stops,
+        )?;
+        Ok(Self { sheen })
+    }
+}
 
 const IDENTITY: Matrix3x2 = Matrix3x2 {
     M11: 1.0,
@@ -46,6 +82,8 @@ pub unsafe fn draw(
     dc: &ID2D1DeviceContext,
     brush: &ID2D1SolidColorBrush,
     format: &IDWriteTextFormat,
+    materials: &MaterialBrushes,
+    backdrop_enabled: bool,
     dock: &Dock,
     icons: &[Option<ID2D1Bitmap1>],
 ) {
@@ -55,7 +93,7 @@ pub unsafe fn draw(
 
     dc.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
 
-    // --- dock pill (frosted dark, floating, rounded) ---
+    // --- floating material; icons keep their original colors ---
     let (l, t, r, b) = frame.pill;
     let pill = D2D1_ROUNDED_RECT {
         rect: D2D_RECT_F {
@@ -64,16 +102,21 @@ pub unsafe fn draw(
             right: r,
             bottom: b,
         },
-        radiusX: 22.0 * dock.dpi,
-        radiusY: 22.0 * dock.dpi,
+        radiusX: theme.pill_radius * dock.dpi,
+        radiusY: theme.pill_radius * dock.dpi,
     };
     brush.SetColor(&color(
         theme.pill_rgb.0,
         theme.pill_rgb.1,
         theme.pill_rgb.2,
-        theme.pill_alpha,
+        dock.theme.dock_alpha(backdrop_enabled),
     ));
     dc.FillRoundedRectangle(&pill, brush);
+    if dock.theme == ThemePreset::Glass {
+        materials.sheen.SetStartPoint(D2D_POINT_2F { x: l, y: t });
+        materials.sheen.SetEndPoint(D2D_POINT_2F { x: l, y: b });
+        dc.FillRoundedRectangle(&pill, &materials.sheen);
+    }
     brush.SetColor(&color(1.0, 1.0, 1.0, theme.border_alpha));
     dc.DrawRoundedRectangle(&pill, brush, 1.0 * dock.dpi, None);
 
@@ -101,6 +144,7 @@ pub unsafe fn draw(
                     base,
                     presence: p,
                 },
+                theme.divider_rgb,
                 theme.divider_alpha,
             );
             continue;
@@ -131,13 +175,13 @@ pub unsafe fn draw(
 
         // The Control button is drawn as a crisp "sliders" vector glyph.
         if item.role == ItemRole::Control {
-            draw_control(dc, brush, tile);
+            draw_control(dc, brush, tile, theme.control_rgb);
             continue;
         }
 
         // The Drawer button is drawn as a crisp 3x3 "app grid" vector glyph.
         if item.role == ItemRole::Drawer {
-            draw_drawer(dc, brush, tile);
+            draw_drawer(dc, brush, tile, theme.control_rgb);
             continue;
         }
 
@@ -227,7 +271,7 @@ struct IndicatorCtx<'a> {
 }
 
 /// A soft vertical line separating pinned apps from open windows.
-unsafe fn draw_divider(ctx: &IndicatorCtx, alpha: f32) {
+unsafe fn draw_divider(ctx: &IndicatorCtx, rgb: (f32, f32, f32), alpha: f32) {
     let half = (ctx.base * 0.022).max(1.0); // ~2px line, scales gently with DPI
                                             // Grow the line in from the baseline as the slot opens, so it doesn't pop.
     let height = ctx.base * 0.72 * ctx.presence;
@@ -242,7 +286,7 @@ unsafe fn draw_divider(ctx: &IndicatorCtx, alpha: f32) {
         radiusY: half,
     };
     ctx.brush
-        .SetColor(&color(1.0, 1.0, 1.0, alpha * ctx.presence));
+        .SetColor(&color(rgb.0, rgb.1, rgb.2, alpha * ctx.presence));
     ctx.dc.FillRoundedRectangle(&line, ctx.brush);
 }
 
@@ -276,7 +320,12 @@ unsafe fn draw_start(dc: &ID2D1DeviceContext, brush: &ID2D1SolidColorBrush, tile
 
 /// The Control button: two horizontal slider tracks with offset knobs (a "control
 /// center / sliders" feel), drawn as vectors so it stays crisp under magnification.
-unsafe fn draw_control(dc: &ID2D1DeviceContext, brush: &ID2D1SolidColorBrush, tile: D2D_RECT_F) {
+unsafe fn draw_control(
+    dc: &ID2D1DeviceContext,
+    brush: &ID2D1SolidColorBrush,
+    tile: D2D_RECT_F,
+    rgb: (f32, f32, f32),
+) {
     let size = tile.right - tile.left;
     let pad = size * 0.26;
     let left = tile.left + pad;
@@ -296,10 +345,10 @@ unsafe fn draw_control(dc: &ID2D1DeviceContext, brush: &ID2D1SolidColorBrush, ti
             radiusX: track_h,
             radiusY: track_h,
         };
-        brush.SetColor(&color(0.92, 0.94, 0.98, 0.85));
+        brush.SetColor(&color(rgb.0, rgb.1, rgb.2, 0.72));
         dc.FillRoundedRectangle(&track, brush);
         let knob_x = left + (right - left) * kx;
-        brush.SetColor(&color(1.0, 1.0, 1.0, 1.0));
+        brush.SetColor(&color(rgb.0, rgb.1, rgb.2, 1.0));
         dc.FillEllipse(
             &D2D1_ELLIPSE {
                 point: D2D_POINT_2F { x: knob_x, y },
@@ -313,12 +362,17 @@ unsafe fn draw_control(dc: &ID2D1DeviceContext, brush: &ID2D1SolidColorBrush, ti
 
 /// The Drawer button: a 3x3 grid of rounded squares (an "app drawer / Launchpad"
 /// feel), drawn as vectors so it stays crisp under magnification.
-unsafe fn draw_drawer(dc: &ID2D1DeviceContext, brush: &ID2D1SolidColorBrush, tile: D2D_RECT_F) {
+unsafe fn draw_drawer(
+    dc: &ID2D1DeviceContext,
+    brush: &ID2D1SolidColorBrush,
+    tile: D2D_RECT_F,
+    rgb: (f32, f32, f32),
+) {
     let size = tile.right - tile.left;
     let pad = size * 0.24;
     let cell = (size - 2.0 * pad) / 3.0;
     let dot = cell * 0.40; // half-extent of each rounded square
-    brush.SetColor(&color(0.92, 0.94, 0.98, 0.92));
+    brush.SetColor(&color(rgb.0, rgb.1, rgb.2, 0.92));
     for row in 0..3 {
         for col in 0..3 {
             let cx = tile.left + pad + cell * (col as f32 + 0.5);

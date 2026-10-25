@@ -96,10 +96,6 @@ pub struct Layout {
     pub content_h: f32,
 }
 
-fn inside(r: &Rect, x: f32, y: f32) -> bool {
-    x >= r.left && x <= r.right && y >= r.top && y <= r.bottom
-}
-
 fn rows_for(count: usize, cols: usize) -> usize {
     // Empty sections still reserve one row so there's something to drop into.
     if count == 0 {
@@ -160,11 +156,6 @@ pub fn compute(sections: &[Section], m: &Metrics) -> Layout {
         add_button,
         content_h: y + m.add_h,
     }
-}
-
-/// The cell index under a content-space point, if any.
-pub fn hit_cell(layout: &Layout, x: f32, y: f32) -> Option<usize> {
-    layout.cells.iter().position(|c| inside(&c.rect, x, y))
 }
 
 /// The (section index, insertion index) a content-space point maps to for a drop:

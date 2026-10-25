@@ -64,7 +64,7 @@ impl TaskbarMode {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Settings {
     pub dock_mode: DockMode,
     /// In Always mode, FULLY hide the dock while a fullscreen app (game/video) is in

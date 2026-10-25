@@ -9,17 +9,19 @@ use windows::Win32::Graphics::Dwm::{
     DWM_TNP_OPACITY, DWM_TNP_RECTDESTINATION, DWM_TNP_SOURCECLIENTAREAONLY, DWM_TNP_VISIBLE,
 };
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, CreateFontW, CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, Ellipse,
-    EndPaint, FillRect, GetMonitorInfoW, GetStockObject, InvalidateRect, LineTo, MonitorFromPoint,
-    MoveToEx, PtInRect, SelectObject, SetBkMode, SetTextColor, UpdateWindow, DT_CENTER,
-    DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST, NULL_PEN, PAINTSTRUCT, PS_SOLID, TRANSPARENT,
+    BeginPaint, CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteObject,
+    DrawTextW, Ellipse, EndPaint, FillRect, GetMonitorInfoW, GetStockObject, InvalidateRect,
+    LineTo, MonitorFromPoint, MoveToEx, PtInRect, RoundRect, SelectObject, SetBkMode, SetTextColor,
+    SetWindowRgn, UpdateWindow, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
+    HBRUSH, HDC, HFONT, HGDIOBJ, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN,
+    PAINTSTRUCT, PS_SOLID, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::dock::RunningWindowRef;
+use crate::theme::SurfaceTheme;
 use crate::windows_list;
 
 const MAX_COLUMNS: usize = 4;
@@ -58,6 +60,7 @@ struct PreviewLayout {
 
 struct PreviewState {
     owner: HWND, // the dock that summoned us, notified on user dismissal
+    material: SurfaceTheme,
     key: String,
     windows: Vec<RunningWindowRef>,
     layout: PreviewLayout,
@@ -100,6 +103,37 @@ fn scaled(value: i32, dpi: f32) -> i32 {
 
 fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
     COLORREF(r as u32 | ((g as u32) << 8) | ((b as u32) << 16))
+}
+
+fn material_color(value: (f32, f32, f32)) -> COLORREF {
+    let byte = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    rgb(byte(value.0), byte(value.1), byte(value.2))
+}
+
+fn mix_color(base: (f32, f32, f32), overlay: (f32, f32, f32), alpha: f32) -> COLORREF {
+    material_color((
+        base.0 + (overlay.0 - base.0) * alpha,
+        base.1 + (overlay.1 - base.1) * alpha,
+        base.2 + (overlay.2 - base.2) * alpha,
+    ))
+}
+
+unsafe fn apply_window_shape(hwnd: HWND, layout: &PreviewLayout, material: SurfaceTheme, dpi: f32) {
+    let diameter = (material.radius * dpi * 2.0).round() as i32;
+    let region = CreateRoundRectRgn(
+        0,
+        0,
+        layout.width + 1,
+        layout.height + 1,
+        diameter,
+        diameter,
+    );
+    if region.is_invalid() {
+        return;
+    }
+    if SetWindowRgn(hwnd, region, BOOL(1)) == 0 {
+        let _ = DeleteObject(HGDIOBJ(region.0));
+    }
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -254,13 +288,17 @@ pub unsafe fn show(
         hide();
         return;
     }
+    let material = crate::dock_theme(owner).surface();
 
     let existing_raw = PREVIEW_HWND.load(Ordering::Relaxed);
     if existing_raw != 0 {
         let existing = HWND(existing_raw as *mut c_void);
         if IsWindow(existing).as_bool() {
             if let Some(state) = state(existing) {
-                if state.key == group_key && same_windows(&state.windows, windows) {
+                if state.key == group_key
+                    && same_windows(&state.windows, windows)
+                    && state.material.rgb == material.rgb
+                {
                     return;
                 }
             }
@@ -313,15 +351,26 @@ pub unsafe fn show(
     );
     let state_ptr = Box::into_raw(Box::new(PreviewState {
         owner,
+        material,
         key: group_key.to_string(),
         windows: windows.to_vec(),
         layout,
         thumbnails: Vec::new(),
         visuals: Vec::new(),
         font,
-        bg: CreateSolidBrush(rgb(24, 24, 28)),
-        card: CreateSolidBrush(rgb(38, 38, 44)),
-        hover: CreateSolidBrush(rgb(52, 58, 68)),
+        // DWM thumbnails are native GDI windows. Use the popup palette's opaque
+        // surface here so titles remain readable without capturing the desktop.
+        bg: CreateSolidBrush(material_color(material.rgb)),
+        card: CreateSolidBrush(mix_color(
+            material.rgb,
+            material.hover_rgb,
+            material.hover_alpha * 0.25,
+        )),
+        hover: CreateSolidBrush(mix_color(
+            material.rgb,
+            material.accent_rgb,
+            material.selected_alpha,
+        )),
         hovered: None,
         hovered_close: None,
         tracking: false,
@@ -331,6 +380,7 @@ pub unsafe fn show(
     }));
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
     PREVIEW_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
+    apply_window_shape(hwnd, &(*state_ptr).layout, material, dpi);
     register_thumbnails(hwnd, &mut *state_ptr);
     let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     let _ = UpdateWindow(hwnd);
@@ -454,7 +504,7 @@ unsafe fn paint(hwnd: HWND, state: &PreviewState) {
     };
     FillRect(hdc, &outer, state.bg);
     let old = SelectObject(hdc, HGDIOBJ(state.font.0));
-    SetTextColor(hdc, rgb(238, 238, 242));
+    SetTextColor(hdc, material_color(state.material.text_rgb));
     SetBkMode(hdc, TRANSPARENT);
     let dpi = state.dpi;
     for index in 0..state.layout.items.len() {
@@ -490,6 +540,7 @@ unsafe fn paint(hwnd: HWND, state: &PreviewState) {
                 state.layout.items[index],
                 HWND(window.hwnd as *mut c_void),
                 dpi,
+                state.material,
             );
         }
     }
@@ -502,7 +553,7 @@ unsafe fn paint(hwnd: HWND, state: &PreviewState) {
             right: state.layout.width - scaled(PAD + 2, dpi),
             bottom: state.layout.height - scaled(2, dpi),
         };
-        SetTextColor(hdc, rgb(170, 174, 182));
+        SetTextColor(hdc, material_color(state.material.muted_rgb));
         let mut text = wide(&format!("还有 {overflow} 个窗口…"));
         DrawTextW(
             hdc,
@@ -511,11 +562,41 @@ unsafe fn paint(hwnd: HWND, state: &PreviewState) {
             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
         );
     }
+    let border = CreatePen(
+        PS_SOLID,
+        (dpi.round() as i32).max(1),
+        mix_color(
+            state.material.rgb,
+            state.material.border_rgb,
+            state.material.border_alpha,
+        ),
+    );
+    let old_pen = SelectObject(hdc, HGDIOBJ(border.0));
+    let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    let diameter = (state.material.radius * dpi * 2.0).round() as i32;
+    let _ = RoundRect(
+        hdc,
+        0,
+        0,
+        state.layout.width,
+        state.layout.height,
+        diameter,
+        diameter,
+    );
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+    let _ = DeleteObject(HGDIOBJ(border.0));
     let _ = SelectObject(hdc, old);
     let _ = EndPaint(hwnd, &ps);
 }
 
-unsafe fn draw_icon_fallback(hdc: HDC, bounds: RECT, source: HWND, dpi: f32) {
+unsafe fn draw_icon_fallback(
+    hdc: HDC,
+    bounds: RECT,
+    source: HWND,
+    dpi: f32,
+    material: SurfaceTheme,
+) {
     let width = bounds.right - bounds.left;
     let height = bounds.bottom - bounds.top;
     let icon_size = scaled(56, dpi).min(width).min(height).max(16);
@@ -537,7 +618,7 @@ unsafe fn draw_icon_fallback(hdc: HDC, bounds: RECT, source: HWND, dpi: f32) {
         }
     }
 
-    SetTextColor(hdc, rgb(166, 170, 180));
+    SetTextColor(hdc, material_color(material.muted_rgb));
     let mut label = wide("预览暂不可用");
     let mut label_rect = RECT {
         left: bounds.left + scaled(8, dpi),
@@ -551,7 +632,7 @@ unsafe fn draw_icon_fallback(hdc: HDC, bounds: RECT, source: HWND, dpi: f32) {
         &mut label_rect,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS,
     );
-    SetTextColor(hdc, rgb(238, 238, 242));
+    SetTextColor(hdc, material_color(material.text_rgb));
 }
 
 /// Draw a filled red circle with a white "×" — the per-window close button.
@@ -653,6 +734,7 @@ unsafe fn remove_window(hwnd: HWND, state: &mut PreviewState, index: usize) {
         SWP_NOACTIVATE,
     );
     state.layout = layout;
+    apply_window_shape(hwnd, &state.layout, state.material, state.dpi);
     state.hovered = None;
     state.hovered_close = None;
     register_thumbnails(hwnd, state);

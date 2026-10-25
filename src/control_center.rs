@@ -30,6 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::glass::Glass;
 use crate::sysctl::{self, AudioControl};
+use crate::theme::SurfaceTheme;
 
 // --- layout, in logical px @96dpi (multiplied by dpi for device px) ---
 const PANEL_W: f32 = 340.0;
@@ -40,7 +41,6 @@ const PANEL_BATTERY_H: f32 = 260.0;
 const PANEL_BLUETOOTH_H: f32 = 270.0;
 const PANEL_INPUT_H: f32 = 292.0;
 const PAD: f32 = 14.0;
-const RADIUS: f32 = 18.0;
 const VOL_TOP: f32 = 16.0;
 const VOL_H: f32 = 32.0;
 const GLYPH_W: f32 = 30.0;
@@ -78,7 +78,7 @@ const REOPEN_GUARD_MS: u32 = 220;
 const BUTTON_LABELS: [&str; 3] = ["网络", "蓝牙", "输入法"];
 
 static PANEL_HWND: AtomicIsize = AtomicIsize::new(0);
-static LAST_CLOSED_TICK: AtomicU32 = AtomicU32::new(0);
+static CLICK_AWAY_CLOSED_TICK: AtomicU32 = AtomicU32::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PanelView {
@@ -133,6 +133,7 @@ enum PanelAction {
 
 struct Panel {
     owner: HWND,
+    material: SurfaceTheme,
     glass: Glass,
     brush: ID2D1SolidColorBrush,
     emoji: IDWriteTextFormat,
@@ -228,6 +229,10 @@ fn rect(left: f32, top: f32, right: f32, bottom: f32) -> D2D_RECT_F {
 
 fn rgba(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
     D2D1_COLOR_F { r, g, b, a }
+}
+
+fn material_color(rgb: (f32, f32, f32), alpha: f32) -> D2D1_COLOR_F {
+    rgba(rgb.0, rgb.1, rgb.2, alpha)
 }
 
 fn in_rect(rc: &D2D_RECT_F, x: f32, y: f32) -> bool {
@@ -355,6 +360,42 @@ fn view_content_alpha(elapsed_secs: f32) -> f32 {
 
 fn view_content_offset_y(elapsed_secs: f32, direction: f32, dpi: f32) -> f32 {
     (1.0 - view_content_alpha(elapsed_secs)) * 8.0 * direction * dpi
+}
+
+fn open_panel_alpha(elapsed_secs: f32) -> f32 {
+    smoothstep(elapsed_secs / ANIM_SECS)
+}
+
+fn panel_translation_y(open_elapsed_secs: f32, dpi: f32) -> f32 {
+    (1.0 - open_panel_alpha(open_elapsed_secs)) * 8.0 * dpi
+}
+
+fn content_translation_y(
+    open_elapsed_secs: f32,
+    view_elapsed_secs: f32,
+    direction: f32,
+    dpi: f32,
+) -> f32 {
+    panel_translation_y(open_elapsed_secs, dpi)
+        + view_content_offset_y(view_elapsed_secs, direction, dpi)
+}
+
+fn content_pointer_y(
+    client_y: f32,
+    open_elapsed_secs: f32,
+    view_elapsed_secs: f32,
+    direction: f32,
+    dpi: f32,
+) -> f32 {
+    client_y - content_translation_y(open_elapsed_secs, view_elapsed_secs, direction, dpi)
+}
+
+fn click_away_targets_dock(inactive: bool, owner: HWND, next: HWND) -> bool {
+    inactive && !owner.is_invalid() && next == owner
+}
+
+fn suppress_dock_toggle(closed_tick: u32, now: u32) -> bool {
+    closed_tick != 0 && now.wrapping_sub(closed_tick) < REOPEN_GUARD_MS
 }
 
 fn visible_audio_row_count(count: usize) -> usize {
@@ -879,20 +920,31 @@ unsafe fn draw_panel_background(panel: &Panel, a: f32) {
         panel.width - 0.5 * dpi,
         panel.height - 0.5 * dpi,
     );
+    let panel_ty = (1.0 - a) * 8.0 * dpi;
+    let _ = panel.glass.update_backdrop(
+        (bg.left, bg.top + panel_ty, bg.right, bg.bottom + panel_ty),
+        panel.material.radius * dpi,
+        if panel.material.backdrop { a } else { 0.0 },
+    );
+    let background_alpha = if panel.material.backdrop && !panel.glass.has_backdrop() {
+        0.98
+    } else {
+        panel.material.alpha
+    };
     fill_round(
         dc,
         &panel.brush,
         bg,
-        RADIUS * dpi,
-        rgba(0.12, 0.12, 0.14, 0.88 * a),
+        panel.material.radius * dpi,
+        material_color(panel.material.rgb, background_alpha * a),
     );
     stroke_round(
         dc,
         &panel.brush,
         bg,
-        RADIUS * dpi,
+        panel.material.radius * dpi,
         1.0 * dpi,
-        rgba(1.0, 1.0, 1.0, 0.12 * a),
+        material_color(panel.material.border_rgb, panel.material.border_alpha * a),
     );
 }
 
@@ -912,7 +964,7 @@ unsafe fn draw_main(panel: &Panel, lay: &Layout, a: f32) {
         speaker,
         &panel.emoji,
         lay.vol_glyph,
-        rgba(1.0, 1.0, 1.0, 0.95 * a),
+        material_color(panel.material.text_rgb, a),
         true,
     );
     let bar = lay.vol_bar;
@@ -922,7 +974,7 @@ unsafe fn draw_main(panel: &Panel, lay: &Layout, a: f32) {
         &panel.brush,
         bar,
         bar_radius,
-        rgba(1.0, 1.0, 1.0, 0.16 * a),
+        material_color(panel.material.muted_rgb, 0.16 * a),
     );
     let shown = if muted { 0.0 } else { level };
     let fill_right = bar.left + shown * (bar.right - bar.left);
@@ -932,12 +984,14 @@ unsafe fn draw_main(panel: &Panel, lay: &Layout, a: f32) {
             &panel.brush,
             rect(bar.left, bar.top, fill_right, bar.bottom),
             bar_radius,
-            rgba(0.36, 0.64, 0.99, 0.95 * a),
+            material_color(panel.material.accent_rgb, 0.95 * a),
         );
     }
     let mid = (bar.top + bar.bottom) / 2.0;
     let knob = 7.0 * dpi;
-    panel.brush.SetColor(&rgba(1.0, 1.0, 1.0, 0.98 * a));
+    panel
+        .brush
+        .SetColor(&material_color(panel.material.accent_rgb, 0.98 * a));
     dc.FillEllipse(
         &D2D1_ELLIPSE {
             point: D2D_POINT_2F {
@@ -967,13 +1021,13 @@ unsafe fn draw_main(panel: &Panel, lay: &Layout, a: f32) {
             _ => PanelAction::ShowInputPanel,
         };
         let hot = panel.hovered == action;
-        let fill = if hot { 0.16 } else { 0.08 };
+        let fill = panel.material.hover_alpha * if hot { 1.0 } else { 0.4 };
         fill_round(
             dc,
             &panel.brush,
             rc,
             12.0 * dpi,
-            rgba(1.0, 1.0, 1.0, fill * a),
+            material_color(panel.material.hover_rgb, fill * a),
         );
         stroke_round(
             dc,
@@ -981,7 +1035,10 @@ unsafe fn draw_main(panel: &Panel, lay: &Layout, a: f32) {
             rc,
             12.0 * dpi,
             1.0 * dpi,
-            rgba(1.0, 1.0, 1.0, 0.10 * a),
+            material_color(
+                panel.material.border_rgb,
+                panel.material.border_alpha * 0.35 * a,
+            ),
         );
         draw_text(
             dc,
@@ -989,7 +1046,7 @@ unsafe fn draw_main(panel: &Panel, lay: &Layout, a: f32) {
             BUTTON_LABELS[i],
             &panel.label,
             rc,
-            rgba(0.95, 0.95, 0.97, 0.96 * a),
+            material_color(panel.material.text_rgb, a),
             false,
         );
     }
@@ -1000,7 +1057,7 @@ unsafe fn draw_main(panel: &Panel, lay: &Layout, a: f32) {
             &panel.brush,
             lay.battery_status,
             8.0 * dpi,
-            rgba(1.0, 1.0, 1.0, 0.08 * a),
+            material_color(panel.material.hover_rgb, panel.material.hover_alpha * a),
         );
     }
     if panel.hovered == PanelAction::OpenDateTimeSettings {
@@ -1009,7 +1066,7 @@ unsafe fn draw_main(panel: &Panel, lay: &Layout, a: f32) {
             &panel.brush,
             lay.clock_status,
             8.0 * dpi,
-            rgba(1.0, 1.0, 1.0, 0.08 * a),
+            material_color(panel.material.hover_rgb, panel.material.hover_alpha * a),
         );
     }
     draw_text(
@@ -1018,7 +1075,7 @@ unsafe fn draw_main(panel: &Panel, lay: &Layout, a: f32) {
         &battery_text(panel.battery),
         &panel.status_left,
         lay.status,
-        rgba(0.78, 0.80, 0.84, 0.92 * a),
+        material_color(panel.material.muted_rgb, a),
         false,
     );
     let (hm, md) = &panel.clock;
@@ -1028,7 +1085,7 @@ unsafe fn draw_main(panel: &Panel, lay: &Layout, a: f32) {
         &format!("{}   {}", hm, md),
         &panel.status_right,
         lay.status,
-        rgba(0.78, 0.80, 0.84, 0.92 * a),
+        material_color(panel.material.muted_rgb, a),
         false,
     );
 }
@@ -1042,7 +1099,10 @@ unsafe fn draw_header(panel: &Panel, lay: &Layout, title: &str, a: f32) {
         &panel.brush,
         lay.back,
         9.0 * dpi,
-        rgba(1.0, 1.0, 1.0, if hot { 0.14 } else { 0.07 } * a),
+        material_color(
+            panel.material.hover_rgb,
+            panel.material.hover_alpha * if hot { 1.0 } else { 0.5 } * a,
+        ),
     );
     draw_text(
         dc,
@@ -1050,7 +1110,7 @@ unsafe fn draw_header(panel: &Panel, lay: &Layout, title: &str, a: f32) {
         "<",
         &panel.label,
         lay.back,
-        rgba(0.95, 0.95, 0.97, 0.96 * a),
+        material_color(panel.material.text_rgb, a),
         false,
     );
     draw_text(
@@ -1064,7 +1124,7 @@ unsafe fn draw_header(panel: &Panel, lay: &Layout, title: &str, a: f32) {
             panel.width - PAD * dpi,
             lay.back.bottom,
         ),
-        rgba(0.96, 0.96, 0.98, 0.97 * a),
+        material_color(panel.material.text_rgb, a),
         false,
     );
 }
@@ -1076,7 +1136,7 @@ unsafe fn draw_section_title_rect(panel: &Panel, text: &str, rc: D2D_RECT_F, a: 
         text,
         &panel.small,
         rc,
-        rgba(0.62, 0.65, 0.70, 0.92 * a),
+        material_color(panel.material.muted_rgb, a),
         false,
     );
 }
@@ -1093,18 +1153,23 @@ unsafe fn draw_row(
     let dpi = panel.dpi;
     let dc = panel.glass.dc();
     let fill_color = if checked {
-        if hot {
-            rgba(0.18, 0.52, 0.34, 0.34 * a)
-        } else {
-            rgba(0.12, 0.42, 0.27, 0.25 * a)
-        }
+        material_color(
+            panel.material.accent_rgb,
+            (panel.material.selected_alpha + if hot { 0.07 } else { 0.0 }) * a,
+        )
     } else {
-        rgba(1.0, 1.0, 1.0, if hot { 0.15 } else { 0.08 } * a)
+        material_color(
+            panel.material.hover_rgb,
+            panel.material.hover_alpha * if hot { 1.0 } else { 0.4 } * a,
+        )
     };
     let stroke_color = if checked {
-        rgba(0.32, 0.78, 0.50, 0.42 * a)
+        material_color(panel.material.accent_rgb, 0.32 * a)
     } else {
-        rgba(1.0, 1.0, 1.0, 0.08 * a)
+        material_color(
+            panel.material.border_rgb,
+            panel.material.border_alpha * 0.3 * a,
+        )
     };
     fill_round(dc, &panel.brush, rc, 10.0 * dpi, fill_color);
     stroke_round(dc, &panel.brush, rc, 10.0 * dpi, 1.0 * dpi, stroke_color);
@@ -1118,7 +1183,7 @@ unsafe fn draw_row(
             title,
             &panel.small,
             rect(left, rc.top + 3.0 * dpi, text_right, rc.top + 19.0 * dpi),
-            rgba(0.95, 0.95, 0.97, 0.96 * a),
+            material_color(panel.material.text_rgb, a),
             false,
         );
         draw_text(
@@ -1127,7 +1192,7 @@ unsafe fn draw_row(
             subtitle,
             &panel.small,
             rect(left, rc.top + 18.0 * dpi, text_right, rc.bottom - 2.0 * dpi),
-            rgba(0.66, 0.69, 0.74, 0.92 * a),
+            material_color(panel.material.muted_rgb, a),
             false,
         );
     } else {
@@ -1137,7 +1202,7 @@ unsafe fn draw_row(
             title,
             &panel.small,
             rect(left, rc.top, text_right, rc.bottom),
-            rgba(0.95, 0.95, 0.97, 0.96 * a),
+            material_color(panel.material.text_rgb, a),
             false,
         );
     }
@@ -1153,7 +1218,14 @@ unsafe fn draw_row(
             rc.right - 8.0 * dpi,
             rc.bottom,
         ),
-        rgba(0.82, 0.86, 0.92, 0.88 * a),
+        material_color(
+            if checked {
+                panel.material.accent_rgb
+            } else {
+                panel.material.muted_rgb
+            },
+            a,
+        ),
         false,
     );
 }
@@ -1165,7 +1237,7 @@ unsafe fn draw_empty_row(panel: &Panel, rc: D2D_RECT_F, text: &str, a: f32) {
         text,
         &panel.small,
         rc,
-        rgba(0.62, 0.65, 0.70, 0.86 * a),
+        material_color(panel.material.muted_rgb, a),
         false,
     );
 }
@@ -1178,7 +1250,10 @@ unsafe fn draw_password_field(panel: &Panel, rc: D2D_RECT_F, active: bool, a: f3
         &panel.brush,
         rc,
         10.0 * dpi,
-        rgba(1.0, 1.0, 1.0, if active { 0.14 } else { 0.08 } * a),
+        material_color(
+            panel.material.hover_rgb,
+            panel.material.hover_alpha * if active { 0.65 } else { 0.35 } * a,
+        ),
     );
     stroke_round(
         dc,
@@ -1186,7 +1261,10 @@ unsafe fn draw_password_field(panel: &Panel, rc: D2D_RECT_F, active: bool, a: f3
         rc,
         10.0 * dpi,
         1.0 * dpi,
-        rgba(0.36, 0.64, 0.99, if active { 0.56 } else { 0.10 } * a),
+        material_color(
+            panel.material.accent_rgb,
+            if active { 0.56 } else { 0.10 } * a,
+        ),
     );
     let left = rc.left + 12.0 * dpi;
     let mid = rc.left + 70.0 * dpi;
@@ -1196,7 +1274,7 @@ unsafe fn draw_password_field(panel: &Panel, rc: D2D_RECT_F, active: bool, a: f3
         "密码",
         &panel.small,
         rect(left, rc.top, mid, rc.bottom),
-        rgba(0.72, 0.75, 0.80, 0.94 * a),
+        material_color(panel.material.muted_rgb, a),
         false,
     );
     let shown = if panel.wifi_password.is_empty() {
@@ -1210,7 +1288,7 @@ unsafe fn draw_password_field(panel: &Panel, rc: D2D_RECT_F, active: bool, a: f3
         &shown,
         &panel.small,
         rect(mid, rc.top, rc.right - 12.0 * dpi, rc.bottom),
-        rgba(0.95, 0.95, 0.97, 0.96 * a),
+        material_color(panel.material.text_rgb, a),
         false,
     );
 }
@@ -1320,15 +1398,15 @@ unsafe fn draw_network(panel: &Panel, lay: &Layout, a: f32) {
         &panel.brush,
         network_lay.refresh,
         9.0 * panel.dpi,
-        rgba(
-            1.0,
-            1.0,
-            1.0,
-            if panel.hovered == PanelAction::RefreshWifi {
-                0.14
-            } else {
-                0.07
-            } * a,
+        material_color(
+            panel.material.hover_rgb,
+            panel.material.hover_alpha
+                * if panel.hovered == PanelAction::RefreshWifi {
+                    1.0
+                } else {
+                    0.5
+                }
+                * a,
         ),
     );
     draw_text(
@@ -1337,7 +1415,7 @@ unsafe fn draw_network(panel: &Panel, lay: &Layout, a: f32) {
         "刷新",
         &panel.small,
         network_lay.refresh,
-        rgba(0.95, 0.95, 0.97, 0.96 * a),
+        material_color(panel.material.text_rgb, a),
         false,
     );
 
@@ -1408,7 +1486,7 @@ unsafe fn draw_network(panel: &Panel, lay: &Layout, a: f32) {
             status,
             &panel.small,
             network_lay.status,
-            rgba(0.62, 0.65, 0.70, 0.88 * a),
+            material_color(panel.material.muted_rgb, a),
             false,
         );
     }
@@ -1444,15 +1522,15 @@ unsafe fn draw_bluetooth(panel: &Panel, lay: &Layout, a: f32) {
         &panel.brush,
         bluetooth_lay.refresh,
         9.0 * panel.dpi,
-        rgba(
-            1.0,
-            1.0,
-            1.0,
-            if panel.hovered == PanelAction::RefreshBluetooth {
-                0.14
-            } else {
-                0.07
-            } * a,
+        material_color(
+            panel.material.hover_rgb,
+            panel.material.hover_alpha
+                * if panel.hovered == PanelAction::RefreshBluetooth {
+                    1.0
+                } else {
+                    0.5
+                }
+                * a,
         ),
     );
     draw_text(
@@ -1461,7 +1539,7 @@ unsafe fn draw_bluetooth(panel: &Panel, lay: &Layout, a: f32) {
         "Refresh",
         &panel.small,
         bluetooth_lay.refresh,
-        rgba(0.95, 0.95, 0.97, 0.96 * a),
+        material_color(panel.material.text_rgb, a),
         false,
     );
 
@@ -1515,7 +1593,7 @@ unsafe fn draw_bluetooth(panel: &Panel, lay: &Layout, a: f32) {
             status,
             &panel.small,
             bluetooth_lay.status,
-            rgba(0.62, 0.65, 0.70, 0.88 * a),
+            material_color(panel.material.muted_rgb, a),
             false,
         );
     }
@@ -1577,7 +1655,7 @@ unsafe fn draw_input(panel: &Panel, lay: &Layout, a: f32) {
             status,
             &panel.small,
             input_lay.status,
-            rgba(0.62, 0.65, 0.70, 0.88 * a),
+            material_color(panel.material.muted_rgb, a),
             false,
         );
     }
@@ -1611,7 +1689,7 @@ unsafe fn draw_battery(panel: &Panel, lay: &Layout, a: f32) {
         &battery_text(panel.battery),
         &panel.title,
         rect(PAD * dpi, 54.0 * dpi, panel.width - PAD * dpi, 78.0 * dpi),
-        rgba(0.95, 0.95, 0.97, 0.96 * a),
+        material_color(panel.material.text_rgb, a),
         false,
     );
     draw_row(
@@ -1635,7 +1713,8 @@ unsafe fn draw_battery(panel: &Panel, lay: &Layout, a: f32) {
 }
 
 unsafe fn render(panel: &Panel) {
-    let open_a = smoothstep(panel.anim_start.elapsed().as_secs_f32() / ANIM_SECS);
+    let open_elapsed = panel.anim_start.elapsed().as_secs_f32();
+    let open_a = open_panel_alpha(open_elapsed);
     let view_elapsed = panel.view_anim_start.elapsed().as_secs_f32();
     let view_a = view_content_alpha(view_elapsed);
     let dpi = panel.dpi;
@@ -1644,7 +1723,7 @@ unsafe fn render(panel: &Panel) {
 
     dc.BeginDraw();
     dc.Clear(Some(&rgba(0.0, 0.0, 0.0, 0.0)));
-    let panel_ty = (1.0 - open_a) * 8.0 * dpi;
+    let panel_ty = panel_translation_y(open_elapsed, dpi);
     dc.SetTransform(&Matrix3x2 {
         M11: 1.0,
         M12: 0.0,
@@ -1655,7 +1734,7 @@ unsafe fn render(panel: &Panel) {
     });
 
     draw_panel_background(panel, open_a);
-    let content_ty = panel_ty + view_content_offset_y(view_elapsed, panel.view_direction, dpi);
+    let content_ty = content_translation_y(open_elapsed, view_elapsed, panel.view_direction, dpi);
     dc.SetTransform(&Matrix3x2 {
         M11: 1.0,
         M12: 0.0,
@@ -1759,6 +1838,13 @@ unsafe fn handle_release(hwnd: HWND, panel: &mut Panel, x: f32, y: f32) {
 
 fn action_at(panel: &Panel, x: f32, y: f32) -> PanelAction {
     let lay = layout(panel.width, panel.height, panel.dpi);
+    let y = content_pointer_y(
+        y,
+        panel.anim_start.elapsed().as_secs_f32(),
+        panel.view_anim_start.elapsed().as_secs_f32(),
+        panel.view_direction,
+        panel.dpi,
+    );
     match panel.view {
         PanelView::Main => main_action_at(&lay, x, y),
         PanelView::Audio => audio_action_at(
@@ -2200,6 +2286,7 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
         .unwrap_or((0.0, false));
     let panel = Box::into_raw(Box::new(Panel {
         owner: dock_hwnd,
+        material: crate::dock_theme(dock_hwnd).surface(),
         glass,
         brush,
         emoji,
@@ -2298,6 +2385,33 @@ unsafe fn resources(
     Ok((brush, emoji, title, label, small, status_left, status_right))
 }
 
+/// Request normal window closure without destroying state inside the caller.
+pub unsafe fn hide() {
+    let raw = PANEL_HWND.load(Ordering::Relaxed);
+    if raw != 0 {
+        let hwnd = HWND(raw as *mut c_void);
+        if IsWindow(hwnd).as_bool() {
+            let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
+/// Release the popup's GPU resources before the owner enters exit cleanup.
+pub unsafe fn shutdown() {
+    let raw = PANEL_HWND.swap(0, Ordering::Relaxed);
+    if raw == 0 {
+        return;
+    }
+    let hwnd = HWND(raw as *mut c_void);
+    if IsWindow(hwnd).as_bool() {
+        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Panel;
+        if !ptr.is_null() {
+            (*ptr).owner = HWND::default();
+        }
+        let _ = DestroyWindow(hwnd);
+    }
+}
+
 /// Toggle the control center anchored above a dock button. Closes it if open;
 /// otherwise opens it (unless we *just* closed it via click-away, to avoid flicker).
 pub unsafe fn toggle(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
@@ -2309,10 +2423,12 @@ pub unsafe fn toggle(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
             return;
         }
     }
-    let since = GetTickCount().wrapping_sub(LAST_CLOSED_TICK.load(Ordering::Relaxed));
-    if since < REOPEN_GUARD_MS {
+    let closed_tick = CLICK_AWAY_CLOSED_TICK.load(Ordering::Relaxed);
+    if suppress_dock_toggle(closed_tick, GetTickCount()) {
+        CLICK_AWAY_CLOSED_TICK.store(0, Ordering::Relaxed);
         return;
     }
+    CLICK_AWAY_CLOSED_TICK.store(0, Ordering::Relaxed);
     open(dock_hwnd, anchor_cx, anchor_top);
 }
 
@@ -2371,8 +2487,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_ACTIVATE => {
-                // Lost activation (clicked another window) -> dismiss. WA_INACTIVE == 0.
-                if (wparam.0 & 0xFFFF) == 0 {
+                let inactive = (wparam.0 & 0xFFFF) == 0;
+                if inactive {
+                    if !ptr.is_null() {
+                        let next = HWND(lparam.0 as *mut c_void);
+                        let tick = if click_away_targets_dock(inactive, (*ptr).owner, next) {
+                            GetTickCount()
+                        } else {
+                            0
+                        };
+                        CLICK_AWAY_CLOSED_TICK.store(tick, Ordering::Relaxed);
+                    }
                     let _ = DestroyWindow(hwnd);
                 }
                 LRESULT(0)
@@ -2407,13 +2532,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_DESTROY => {
                 let _ = KillTimer(hwnd, WIFI_REFRESH_TIMER);
-                LAST_CLOSED_TICK.store(GetTickCount(), Ordering::Relaxed);
                 PANEL_HWND.store(0, Ordering::Relaxed);
+                LRESULT(0)
+            }
+            WM_NCDESTROY => {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 if !ptr.is_null() {
                     drop(Box::from_raw(ptr));
-                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 }
-                LRESULT(0)
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
@@ -2544,6 +2671,45 @@ mod tests {
         assert!(view_content_alpha(0.0) < view_content_alpha(ANIM_SECS / 2.0));
         assert_eq!(view_content_alpha(ANIM_SECS), 1.0);
         assert!(view_content_offset_y(0.0, 1.0, 1.0) > view_content_offset_y(ANIM_SECS, 1.0, 1.0));
+    }
+
+    #[test]
+    fn animated_content_hit_testing_uses_the_rendered_position() {
+        let (width, height) = panel_size(PanelView::Main, 1.5);
+        let lay = layout(width, height, 1.5);
+        let open_elapsed = ANIM_SECS * 0.4;
+        let view_elapsed = ANIM_SECS * 0.3;
+        let translation = content_translation_y(open_elapsed, view_elapsed, 1.0, 1.5);
+        let visual_x = lay.audio_button.left + 4.0;
+        let visual_y = lay.audio_button.top + 4.0 + translation;
+        let content_y = content_pointer_y(visual_y, open_elapsed, view_elapsed, 1.0, 1.5);
+
+        assert!((content_y - (lay.audio_button.top + 4.0)).abs() < 1e-4);
+        assert_eq!(
+            main_action_at(&lay, visual_x, content_y),
+            PanelAction::ShowAudioPanel
+        );
+        assert_eq!(content_translation_y(ANIM_SECS, ANIM_SECS, 1.0, 1.5), 0.0);
+    }
+
+    #[test]
+    fn reopen_guard_is_limited_to_dock_click_away_and_handles_tick_wrap() {
+        let owner = HWND(std::ptr::dangling_mut::<c_void>());
+        let other = HWND(std::ptr::dangling_mut::<c_void>().wrapping_add(1));
+        assert!(click_away_targets_dock(true, owner, owner));
+        assert!(!click_away_targets_dock(false, owner, owner));
+        assert!(!click_away_targets_dock(true, owner, other));
+        assert!(suppress_dock_toggle(100, 100 + REOPEN_GUARD_MS - 1));
+        assert!(!suppress_dock_toggle(100, 100 + REOPEN_GUARD_MS));
+        assert!(!suppress_dock_toggle(0, 1));
+        assert!(suppress_dock_toggle(u32::MAX - 10, 20));
+
+        let destroy = include_str!("control_center.rs")
+            .split("WM_DESTROY => {")
+            .nth(1)
+            .and_then(|tail| tail.split("WM_NCDESTROY").next())
+            .expect("control-center destroy handler");
+        assert!(!destroy.contains("CLICK_AWAY_CLOSED_TICK.store"));
     }
 
     #[test]

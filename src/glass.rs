@@ -1,7 +1,9 @@
 //! A standalone translucent GPU surface for popup panels — the same
 //! D3D11 + DXGI-composition + DirectComposition + Direct2D stack the dock uses, so
-//! a panel composites as a frosted, click-through-free glass layer at near-zero idle
-//! cost. Kept separate from `graphics::Gpu` (which owns the dock's icon pipeline) so
+//! a panel composites without CPU copies or a repaint timer. On supported systems
+//! a clipped DWM host backdrop below this surface supplies actual background blur;
+//! otherwise the panel keeps its ordinary alpha fill. Kept separate from
+//! `graphics::Gpu` (which owns the dock's icon pipeline) so
 //! the panel can be built and torn down on demand without touching the dock.
 
 use windows::core::*;
@@ -22,6 +24,7 @@ const POPUP_PRESENT_SYNC_INTERVAL: u32 = 0;
 /// `_d3d` is kept alive because the swapchain (and any shared device) must outlive
 /// the surface; the name keeps rustc quiet about the otherwise-unused field.
 pub struct Glass {
+    backdrop: Option<crate::backdrop::Backdrop>,
     _d3d: ID3D11Device,
     dc: ID2D1DeviceContext,
     swapchain: IDXGISwapChain1,
@@ -90,6 +93,7 @@ impl Glass {
         bind_target(&dc, &swapchain)?;
 
         Ok(Glass {
+            backdrop: crate::backdrop::Backdrop::try_new(hwnd),
             _d3d: d3d,
             dc,
             swapchain,
@@ -103,6 +107,26 @@ impl Glass {
     /// `present()`.
     pub fn dc(&self) -> &ID2D1DeviceContext {
         &self.dc
+    }
+
+    pub fn has_backdrop(&self) -> bool {
+        self.backdrop
+            .as_ref()
+            .is_some_and(crate::backdrop::Backdrop::is_usable)
+    }
+
+    /// Keep the backdrop inside the material's animated bounds and fade it with
+    /// the foreground. Bounds are left/top/right/bottom in device pixels.
+    pub fn update_backdrop(
+        &self,
+        bounds: (f32, f32, f32, f32),
+        radius: f32,
+        opacity: f32,
+    ) -> Result<()> {
+        if let Some(backdrop) = &self.backdrop {
+            backdrop.update(bounds, radius, opacity)?;
+        }
+        Ok(())
     }
 
     #[allow(dead_code)] // reusable surface API; the fixed-size panel doesn't resize

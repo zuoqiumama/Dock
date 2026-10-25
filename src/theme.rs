@@ -16,6 +16,32 @@ pub struct VisualTheme {
     pub divider_alpha: f32,
     pub dot_rgb: (f32, f32, f32),
     pub dot_alpha: f32,
+    pub control_rgb: (f32, f32, f32),
+    pub divider_rgb: (f32, f32, f32),
+    pub pill_radius: f32,
+}
+
+/// Shared material for the drawer, control center, settings and native menus.
+/// Values are straight RGB; the composition pipeline handles premultiplication.
+#[derive(Clone, Copy, Debug)]
+pub struct SurfaceTheme {
+    pub backdrop: bool,
+    pub rgb: (f32, f32, f32),
+    pub alpha: f32,
+    pub text_rgb: (f32, f32, f32),
+    pub muted_rgb: (f32, f32, f32),
+    pub accent_rgb: (f32, f32, f32),
+    pub border_rgb: (f32, f32, f32),
+    pub border_alpha: f32,
+    pub hover_rgb: (f32, f32, f32),
+    pub hover_alpha: f32,
+    pub selected_alpha: f32,
+    pub divider_alpha: f32,
+    pub radius: f32,
+}
+
+pub const fn rgb8(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
 }
 
 impl ThemePreset {
@@ -39,7 +65,7 @@ impl ThemePreset {
 
     pub fn label(self) -> &'static str {
         match self {
-            ThemePreset::Glass => "玻璃",
+            ThemePreset::Glass => "暖瓷玻璃",
             ThemePreset::Compact => "紧凑",
             ThemePreset::Solid => "纯色",
             ThemePreset::Macos => "macOS",
@@ -49,7 +75,7 @@ impl ThemePreset {
 
     pub fn parse(value: &str) -> Option<ThemePreset> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "glass" | "default" => Some(ThemePreset::Glass),
+            "glass" | "default" | "warm-glass" => Some(ThemePreset::Glass),
             "compact" => Some(ThemePreset::Compact),
             "solid" => Some(ThemePreset::Solid),
             "macos" | "mac" => Some(ThemePreset::Macos),
@@ -61,12 +87,15 @@ impl ThemePreset {
     pub fn visual(self) -> VisualTheme {
         match self {
             ThemePreset::Glass => VisualTheme {
-                pill_rgb: (0.10, 0.12, 0.18),
-                pill_alpha: 0.54,
-                border_alpha: 0.18,
-                divider_alpha: 0.22,
-                dot_rgb: (0.74, 0.86, 1.0),
-                dot_alpha: 0.82,
+                pill_rgb: rgb8(255, 251, 246),
+                pill_alpha: 0.48,
+                border_alpha: 0.74,
+                divider_alpha: 0.16,
+                dot_rgb: rgb8(56, 84, 68),
+                dot_alpha: 1.0,
+                control_rgb: rgb8(56, 54, 51),
+                divider_rgb: rgb8(107, 102, 94),
+                pill_radius: 32.0,
             },
             ThemePreset::Compact => VisualTheme {
                 pill_rgb: (0.02, 0.02, 0.03),
@@ -75,6 +104,9 @@ impl ThemePreset {
                 divider_alpha: 0.12,
                 dot_rgb: (0.58, 0.96, 0.72),
                 dot_alpha: 0.92,
+                control_rgb: (0.92, 0.94, 0.98),
+                divider_rgb: (1.0, 1.0, 1.0),
+                pill_radius: 22.0,
             },
             ThemePreset::Solid => VisualTheme {
                 pill_rgb: (0.18, 0.18, 0.17),
@@ -83,6 +115,9 @@ impl ThemePreset {
                 divider_alpha: 0.22,
                 dot_rgb: (0.98, 0.72, 0.44),
                 dot_alpha: 0.95,
+                control_rgb: (0.92, 0.94, 0.98),
+                divider_rgb: (1.0, 1.0, 1.0),
+                pill_radius: 22.0,
             },
             ThemePreset::Macos => VisualTheme {
                 pill_rgb: (0.72, 0.74, 0.78),
@@ -91,6 +126,9 @@ impl ThemePreset {
                 divider_alpha: 0.30,
                 dot_rgb: (0.04, 0.05, 0.07),
                 dot_alpha: 0.78,
+                control_rgb: (0.12, 0.14, 0.16),
+                divider_rgb: (0.12, 0.14, 0.16),
+                pill_radius: 22.0,
             },
             ThemePreset::Contrast => VisualTheme {
                 pill_rgb: (0.0, 0.0, 0.0),
@@ -99,7 +137,56 @@ impl ThemePreset {
                 divider_alpha: 0.58,
                 dot_rgb: (1.0, 0.86, 0.18),
                 dot_alpha: 1.0,
+                control_rgb: (1.0, 1.0, 1.0),
+                divider_rgb: (1.0, 1.0, 1.0),
+                pill_radius: 22.0,
             },
+        }
+    }
+
+    pub fn dock_alpha(self, backdrop_enabled: bool) -> f32 {
+        if self == Self::Glass && !backdrop_enabled {
+            0.92
+        } else {
+            self.visual().pill_alpha
+        }
+    }
+
+    pub fn surface(self) -> SurfaceTheme {
+        let visual = self.visual();
+        let light = matches!(self, Self::Glass | Self::Macos);
+        SurfaceTheme {
+            backdrop: self == Self::Glass,
+            rgb: visual.pill_rgb,
+            alpha: if self == Self::Glass { 0.88 } else { 0.97 },
+            text_rgb: if light {
+                rgb8(56, 54, 51)
+            } else {
+                rgb8(242, 242, 242)
+            },
+            muted_rgb: if light {
+                rgb8(107, 102, 94)
+            } else {
+                rgb8(190, 192, 196)
+            },
+            accent_rgb: if self == Self::Glass {
+                rgb8(104, 136, 121)
+            } else if light {
+                rgb8(52, 89, 116)
+            } else {
+                visual.dot_rgb
+            },
+            border_rgb: (1.0, 1.0, 1.0),
+            border_alpha: visual.border_alpha,
+            hover_rgb: if light {
+                (1.0, 1.0, 1.0)
+            } else {
+                rgb8(150, 161, 176)
+            },
+            hover_alpha: if light { 0.42 } else { 0.16 },
+            selected_alpha: if light { 0.14 } else { 0.26 },
+            divider_alpha: if light { 0.12 } else { 0.18 },
+            radius: if self == Self::Glass { 32.0 } else { 18.0 },
         }
     }
 }
@@ -124,6 +211,18 @@ mod tests {
         let compact = ThemePreset::Compact.visual();
         assert!(compact.pill_alpha >= glass.pill_alpha);
         assert!(compact.border_alpha <= glass.border_alpha);
+    }
+
+    #[test]
+    fn glass_dock_is_more_transparent_without_weakening_fallbacks() {
+        let glass = ThemePreset::Glass;
+        assert_eq!(glass.visual().pill_alpha, 0.48);
+        assert_eq!(glass.dock_alpha(true), 0.48);
+        assert_eq!(glass.dock_alpha(false), 0.92);
+        assert_eq!(glass.surface().alpha, 0.88);
+        for preset in ThemePreset::ALL.into_iter().filter(|p| *p != glass) {
+            assert_eq!(preset.dock_alpha(false), preset.visual().pill_alpha);
+        }
     }
 
     #[test]

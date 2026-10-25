@@ -11,6 +11,11 @@ license = "MIT"
 # MinGW assembler, so we use 0.58 which ships PREBUILT import libs (windows-targets)
 # and needs no dlltool/as. See .cargo/config.toml for the matching linker setup.
 windows = { version = "0.58", features = [
+    "implement",
+    "Graphics_Effects",
+    "System",
+    "UI_Composition",
+    "UI_Composition_Desktop",
     "Win32_Foundation",
     "Win32_Graphics_Direct2D",
     "Win32_Graphics_Direct2D_Common",
@@ -30,6 +35,9 @@ windows = { version = "0.58", features = [
     "Win32_UI_Shell_Common",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_System_Com",
+    "Win32_System_WinRT",
+    "Win32_System_WinRT_Composition",
+    "Win32_System_WinRT_Graphics_Direct2D",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_LibraryLoader",
@@ -49,6 +57,7 @@ windows = { version = "0.58", features = [
     "Win32_NetworkManagement_WiFi",
     "Foundation_Numerics",
 ] }
+windows-core = "0.58"
 
 # Smallest possible release binary — aligns with the "extreme low footprint" goal.
 [profile.release]
