@@ -58,6 +58,10 @@ FeatherDock 是一个 Windows 上的 Dock，用 Rust 直接写在系统原生图
 - 控制中心：主音量滑块、输出/输入音频设备选择、Wi-Fi 刷新与连接、蓝牙设备状态、输入法切换，以及电量与时钟入口
 - 固定项自修复：WindowsApps 版本目录更新或唯一 exe 文件名变化后，启动时会在安全范围内修复失效路径
 - 主题预设：暖瓷玻璃、紧凑、纯色、macOS、高对比五种预设，不引入重型皮肤系统
+- 自适应布局：主条宽度受屏幕约束，超出的应用可从“更多应用”打开；抽屉列数和缩略图布局随工作区调整
+- 常用操作：固定项拖拽排序、前台状态、多窗口数量、Shift+单击新实例，以及拖文件到固定应用后选择打开或固定
+- 中文搜索：全拼、首字母、启动入口去重与最近使用排序；抽屉也可直接输入搜索并通过键盘选择
+- 布局设置：图标大小、悬停放大、透明度、预览延迟、屏幕选择、搜索热键、减少动画及重叠避让，支持预览和取消恢复
 - 设置窗口：系统任务栏模式、Dock 显示模式、主题预设、全屏 / 最大化时收起、开机自启、常驻应用管理
 - 桌面模式：可隐藏 Windows 桌面图标，把桌面程序交给抽屉管理
 - 单文件发布：`build.ps1` 产出仓库根目录的 `FeatherDock.exe`
@@ -66,7 +70,7 @@ FeatherDock 是一个 Windows 上的 Dock，用 Rust 直接写在系统原生图
 
 默认「暖瓷玻璃」使用象牙暖白底色、暖灰文字和薄荷状态提示：主 Dock 保持轻薄，抽屉和控制中心使用更厚的底材。支持的 Windows 11 系统通过 DWM HostBackdrop 在窗口背后做真正的背景模糊，按实际圆角和展开动画裁剪，不采屏、不增加常驻刷新计时器。系统关闭透明效果、高对比模式、远程会话或材质不可用时，自动使用更实的暖瓷底色。设置、原生右键菜单和缩略图外框采用同源实色，保证文字和原生控件清晰。
 
-现有 `theme = "glass"` 配置自动使用新外观；其它四种预设仍可在设置中选择。开发接手说明见 [docs/HANDOFF.md](docs/HANDOFF.md)。
+现有 `theme = "glass"` 配置自动使用新外观；其它四种预设仍可在设置中选择。项目需求与 Agent 协作规则见 [AGENTS.md](AGENTS.md)，下一步计划见 [PLAN.md](PLAN.md)，最新审查与验证结果见 [REVIEW.md](REVIEW.md)。
 
 可执行文件不提交到仓库。运行构建脚本后，最终产物会收敛到仓库根目录的单个 `FeatherDock.exe`：
 
@@ -75,6 +79,7 @@ FeatherDock 是一个 Windows 上的 Dock，用 Rust 直接写在系统原生图
 .\build.cmd -Run     # 构建后立即启动
 .\build.cmd -Clean   # 先 cargo clean，再从零构建
 .\build.cmd -Verify  # 格式、Clippy、测试通过后再构建 release
+.\build.cmd -Verify -Stage # 只将新版暂存到 outputs/pending，不替换或启动当前版本
 ```
 
 规则很简单：需要分发或日常运行时，只运行根目录的 `FeatherDock.exe`。`target\` 下的 exe 只是 cargo 构建缓存。
@@ -88,6 +93,8 @@ Dock 常用交互：
 - 悬停运行窗口可显示 DWM 缩略图预览。
 - 点击文件夹固定项会展开 Stack 菜单；菜单打开时才读取该目录。
 - 按 `Ctrl+Alt+Space` 打开命令面板，搜索固定项、运行窗口和桌面程序。
+- 设置中的“布局与快捷键…”可修改或禁用搜索热键；全屏应用期间热键不会打开搜索。
+- 固定项可直接拖拽排序；Shift+单击启动新实例。拖文件到固定应用上可选择用它打开、固定新项目，或使用支持的图片替换图标。
 - 左侧 Start 按钮打开 Windows 开始菜单，右侧 Control 按钮打开 FeatherDock 控制中心。
 - 右键最右侧 Control（滑杆）按钮可直接打开设置；也可运行 `FeatherDock.exe --settings`。
 - 控制中心支持主页面与音频、网络、蓝牙、输入法、电量子页面；页面切换保留玻璃背景和短动画，网络状态刷新使用独立的短时刷新计时器。
@@ -152,6 +159,11 @@ Dock 行为设置：
 - `drawer_enabled = true | false`
 - `hide_desktop_icons = true | false`
 - `theme = "glass" | "compact" | "solid" | "macos" | "contrast"`
+- `icon_size = 24..80`、`magnification = 100..220`（百分比）、`bottom_gap = 0..32`
+- `opacity = 10..100`（玻璃底色不透明度）、`preview_delay_ms = 0..1500`
+- `monitor = 0`（跟随主屏）或 Windows 显示器编号；断开时自动回退主屏
+- `search_hotkey = 0..3`（禁用、Ctrl+Alt+Space、Alt+Space、Ctrl+Alt+Q）
+- `follow_system = false`、`reduce_motion = false`、`intellihide = false`
 
 程序抽屉自定义：
 
@@ -249,6 +261,8 @@ EXE 旁的 `outputs\`。每个实例使用独立目录，正常退出时清理�
 | Path | Purpose |
 | --- | --- |
 | `src/main.rs` | Win32 window、DPI、消息循环、输入、托盘和全局状态 |
+| `src/agent_state.rs` | Agent 识别、任务事件、状态聚合、顺序与生命周期 |
+| `src/agent_popup.rs` | Agent 会话详情卡、滚动和点击跳转 |
 | `src/dock.rs` | Dock 布局、放大曲线、自动隐藏和动画 easing |
 | `src/render.rs` | Direct2D 绘制圆角底座、图标、Start / Control / Drawer glyph |
 | `src/graphics.rs` | D3D11、DXGI、Direct2D、DirectComposition、图标 bitmap |
@@ -272,6 +286,7 @@ EXE 旁的 `outputs\`。每个实例使用独立目录，正常退出时清理�
 | `src/watchdog.rs` | 进程异常退出后的任务栏和桌面图标恢复守护 |
 | `src/icons.rs` | WIC 图片缩略图、Shell 图标和 PIDL 图标提取 |
 | `assets/` | 应用图标和 Windows resource 资源 |
+| `AGENTS.md` / `PLAN.md` / `REVIEW.md` | 需求与协作规则、下一步计划、最新审查结果三个固定入口 |
 | `docs/images/` | README 截图 |
 | `build.ps1` | 唯一的发布构建脚本，产出根目录单个 `FeatherDock.exe` |
 
@@ -290,4 +305,4 @@ Windows CI 会执行：
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). Third-party license notices are in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

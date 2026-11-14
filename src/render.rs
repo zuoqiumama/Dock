@@ -7,12 +7,15 @@ use windows::Win32::Graphics::Direct2D::Common::*;
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 
-use crate::dock::{Dock, ItemRole, BASE_ICON, CORNER, ENTER_RISE};
-use crate::theme::ThemePreset;
+use crate::agent_state::AgentState;
+use crate::dock::{Dock, ItemRole, CORNER, ENTER_RISE};
+use crate::theme::{AgentTheme, ThemePreset};
 
 /// Reused GPU material brushes: no gradient resources are allocated per frame.
 pub struct MaterialBrushes {
     sheen: ID2D1LinearGradientBrush,
+    shimmer: ID2D1LinearGradientBrush,
+    badge: IDWriteTextFormat,
 }
 
 impl MaterialBrushes {
@@ -40,7 +43,57 @@ impl MaterialBrushes {
             None,
             &stops,
         )?;
-        Ok(Self { sheen })
+        let shimmer_stops = target.CreateGradientStopCollection(
+            &[
+                D2D1_GRADIENT_STOP {
+                    position: 0.0,
+                    color: color(0.88, 0.97, 0.93, 0.0),
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 0.36,
+                    color: color(0.88, 0.97, 0.93, 0.0),
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 0.50,
+                    color: color(0.88, 0.97, 0.93, 0.14),
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 0.64,
+                    color: color(0.88, 0.97, 0.93, 0.0),
+                },
+                D2D1_GRADIENT_STOP {
+                    position: 1.0,
+                    color: color(0.88, 0.97, 0.93, 0.0),
+                },
+            ],
+            D2D1_GAMMA_2_2,
+            D2D1_EXTEND_MODE_CLAMP,
+        )?;
+        let shimmer = dc.CreateLinearGradientBrush(
+            &D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                startPoint: D2D_POINT_2F { x: 0.0, y: 0.0 },
+                endPoint: D2D_POINT_2F { x: 1.0, y: 1.0 },
+            },
+            None,
+            &shimmer_stops,
+        )?;
+        let factory: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+        let badge = factory.CreateTextFormat(
+            windows::core::w!("Segoe UI"),
+            None,
+            DWRITE_FONT_WEIGHT_SEMI_BOLD,
+            DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL,
+            11.0,
+            windows::core::w!(""),
+        )?;
+        badge.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+        badge.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+        Ok(Self {
+            sheen,
+            shimmer,
+            badge,
+        })
     }
 }
 
@@ -88,7 +141,7 @@ pub unsafe fn draw(
     icons: &[Option<ID2D1Bitmap1>],
 ) {
     let frame = dock.frame();
-    let base = BASE_ICON * dock.dpi;
+    let base = dock.base_icon();
     let theme = dock.theme.visual();
 
     dc.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
@@ -109,7 +162,11 @@ pub unsafe fn draw(
         theme.pill_rgb.0,
         theme.pill_rgb.1,
         theme.pill_rgb.2,
-        dock.theme.dock_alpha(backdrop_enabled),
+        if dock.theme == ThemePreset::Glass && backdrop_enabled {
+            dock.preferences.opacity as f32 / 100.0
+        } else {
+            dock.theme.dock_alpha(backdrop_enabled)
+        },
     ));
     dc.FillRoundedRectangle(&pill, brush);
     if dock.theme == ThemePreset::Glass {
@@ -119,6 +176,8 @@ pub unsafe fn draw(
     }
     brush.SetColor(&color(1.0, 1.0, 1.0, theme.border_alpha));
     dc.DrawRoundedRectangle(&pill, brush, 1.0 * dock.dpi, None);
+    let palette = dock.theme.agent_palette();
+    draw_agent_zone_capsule(dc, brush, &frame, dock, base, theme.pill_radius, &palette);
 
     // --- icons: one scale transform each, then a vector tile + emoji ---
     for ic in &frame.icons {
@@ -132,21 +191,26 @@ pub unsafe fn draw(
             continue;
         }
 
-        // The divider is a static separator: draw a line, fading with presence.
-        if item.role == ItemRole::Divider {
+        // Dividers are static separators: draw single or double line, fading with presence.
+        if item.role.is_divider() {
             dc.SetTransform(&IDENTITY);
-            draw_divider(
-                &IndicatorCtx {
-                    dc,
-                    brush,
-                    cx: ic.cx,
-                    baseline: frame.baseline,
-                    base,
-                    presence: p,
-                },
-                theme.divider_rgb,
-                theme.divider_alpha,
-            );
+            let ctx = IndicatorCtx {
+                dc,
+                brush,
+                cx: ic.cx,
+                baseline: frame.baseline,
+                base,
+                presence: p,
+            };
+            if item.role == ItemRole::AgentDivider {
+                draw_agent_divider(
+                    &ctx,
+                    palette.capsule_rgb,
+                    (palette.capsule_border_alpha * 1.45).clamp(0.16, 0.45),
+                );
+            } else {
+                draw_divider(&ctx, theme.divider_rgb, theme.divider_alpha);
+            }
             continue;
         }
 
@@ -185,6 +249,28 @@ pub unsafe fn draw(
             continue;
         }
 
+        if item.role == ItemRole::Overflow {
+            brush.SetColor(&color(
+                theme.control_rgb.0,
+                theme.control_rgb.1,
+                theme.control_rgb.2,
+                p,
+            ));
+            for offset in [-0.22, 0.0, 0.22] {
+                dc.FillEllipse(
+                    &D2D1_ELLIPSE {
+                        point: D2D_POINT_2F {
+                            x: ic.cx + base * offset,
+                            y: frame.baseline - base * 0.45,
+                        },
+                        radiusX: base * 0.045,
+                        radiusY: base * 0.045,
+                    },
+                    brush,
+                );
+            }
+            continue;
+        }
         match icons.get(ic.idx).and_then(|o| o.as_ref()) {
             // Real application icon: draw the bitmap (transform scales it crisply).
             Some(bmp) => {
@@ -220,11 +306,26 @@ pub unsafe fn draw(
                 );
             }
         }
+        if item
+            .agent
+            .as_ref()
+            .is_some_and(|a| a.state == AgentState::Running)
+        {
+            draw_agent_shimmer(
+                dc,
+                brush,
+                materials,
+                tile,
+                base,
+                p,
+                dock.shimmer_phase,
+                &palette,
+            );
+        }
     }
 
-    // Running indicators: a small dot under any app that has open windows — both
-    // pinned apps that are running (merged) and the right-side open windows. Drawn
-    // unscaled (IDENTITY) so it stays a subtle, constant-size cue under the icon.
+    // Running indicators: a small dot under any active icon — regular running apps,
+    // open Agents, and background Agents. Semantic Agent colors come from `palette`.
     dc.SetTransform(&IDENTITY);
     let running_dot = RunningDotStyle {
         rgb: theme.dot_rgb,
@@ -235,6 +336,38 @@ pub unsafe fn draw(
         if indicator_presence <= 0.02 {
             continue;
         }
+        let item = &dock.items[ic.idx];
+        let (style, radius_scale) = match item.agent.as_ref().map(|a| a.state) {
+            Some(AgentState::Waiting) => (
+                RunningDotStyle {
+                    rgb: palette.waiting_rgb,
+                    alpha: 1.0,
+                },
+                1.18,
+            ),
+            Some(AgentState::Error) => (
+                RunningDotStyle {
+                    rgb: palette.error_rgb,
+                    alpha: 1.0,
+                },
+                1.08,
+            ),
+            Some(AgentState::Running) => (
+                RunningDotStyle {
+                    rgb: palette.running_rgb,
+                    alpha: 0.95,
+                },
+                1.0,
+            ),
+            Some(AgentState::Done) => (
+                RunningDotStyle {
+                    rgb: palette.done_rgb,
+                    alpha: 0.92,
+                },
+                1.0,
+            ),
+            _ => (running_dot, 1.0),
+        };
         let rise = (1.0 - ic.presence) * ENTER_RISE * base;
         draw_running_dot(
             &IndicatorCtx {
@@ -245,10 +378,152 @@ pub unsafe fn draw(
                 base,
                 presence: indicator_presence,
             },
-            running_dot,
+            style,
             ic.bounce_y,
             rise,
+            radius_scale,
         );
+    }
+    if let Some(x) = dock.insertion_x {
+        brush.SetColor(&color(
+            theme.dot_rgb.0,
+            theme.dot_rgb.1,
+            theme.dot_rgb.2,
+            0.9,
+        ));
+        dc.DrawLine(
+            D2D_POINT_2F {
+                x,
+                y: frame.baseline - base,
+            },
+            D2D_POINT_2F {
+                x,
+                y: frame.baseline,
+            },
+            brush,
+            2.0 * dock.dpi,
+            None,
+        );
+    }
+    for ic in &frame.icons {
+        let item = &dock.items[ic.idx];
+        if dock
+            .foreground
+            .is_some_and(|fg| item.windows.iter().any(|w| w.hwnd == fg))
+        {
+            let y = frame.baseline + base * 0.09 - ic.bounce_y;
+            brush.SetColor(&color(
+                theme.dot_rgb.0,
+                theme.dot_rgb.1,
+                theme.dot_rgb.2,
+                ic.presence,
+            ));
+            dc.FillRoundedRectangle(
+                &D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: ic.cx - base * 0.11,
+                        right: ic.cx + base * 0.11,
+                        top: y - base * 0.035,
+                        bottom: y + base * 0.035,
+                    },
+                    radiusX: base * 0.035,
+                    radiusY: base * 0.035,
+                },
+                brush,
+            );
+        }
+        let badge_spec = if let Some(agent) = &item.agent {
+            agent.badge.as_ref().map(|text| {
+                let (fill, fg) = match agent.state {
+                    AgentState::Waiting => (palette.waiting_rgb, palette.alert_text_rgb),
+                    AgentState::Error => (palette.error_rgb, palette.alert_text_rgb),
+                    _ if dock.theme == ThemePreset::Contrast => {
+                        ((0.08, 0.08, 0.08), palette.badge_text_rgb)
+                    }
+                    _ if matches!(dock.theme, ThemePreset::Glass | ThemePreset::Macos) => (
+                        (
+                            (palette.capsule_rgb.0 * 0.35 + 0.65).min(0.95),
+                            (palette.capsule_rgb.1 * 0.35 + 0.65).min(0.95),
+                            (palette.capsule_rgb.2 * 0.35 + 0.65).min(0.95),
+                        ),
+                        palette.badge_text_rgb,
+                    ),
+                    _ => (
+                        (
+                            palette.capsule_rgb.0 * 0.42,
+                            palette.capsule_rgb.1 * 0.42,
+                            palette.capsule_rgb.2 * 0.42,
+                        ),
+                        palette.badge_text_rgb,
+                    ),
+                };
+                (text.clone(), fill, fg)
+            })
+        } else if item.windows.len() > 1 {
+            Some((
+                item.windows.len().to_string(),
+                theme.pill_rgb,
+                theme.control_rgb,
+            ))
+        } else {
+            None
+        };
+        if let Some((badge_text, fill_rgb, fg_rgb)) = badge_spec {
+            let char_count = badge_text.chars().count();
+            let width_factor = match char_count {
+                0 | 1 => 0.34,
+                2 => 0.44,
+                _ => 0.52,
+            };
+            let right = ic.cx + base * 0.52;
+            let bounds = D2D_RECT_F {
+                left: right - base * width_factor,
+                top: frame.baseline - base * 0.98,
+                right,
+                bottom: frame.baseline - base * 0.65,
+            };
+            let rr = D2D1_ROUNDED_RECT {
+                rect: bounds,
+                radiusX: base * 0.12,
+                radiusY: base * 0.12,
+            };
+            brush.SetColor(&color(
+                fill_rgb.0,
+                fill_rgb.1,
+                fill_rgb.2,
+                0.96 * ic.presence,
+            ));
+            dc.FillRoundedRectangle(&rr, brush);
+            brush.SetColor(&color(1.0, 1.0, 1.0, 0.22 * ic.presence));
+            dc.DrawRoundedRectangle(&rr, brush, (0.75 * dock.dpi).max(0.75), None);
+            brush.SetColor(&color(fg_rgb.0, fg_rgb.1, fg_rgb.2, ic.presence));
+            let text: Vec<u16> = badge_text.encode_utf16().collect();
+            let height = (bounds.bottom - bounds.top).max(1.0);
+            let scale = height / 18.0;
+            let draw_w = (bounds.right - bounds.left) / scale;
+            dc.SetTransform(&Matrix3x2 {
+                M11: scale,
+                M12: 0.0,
+                M21: 0.0,
+                M22: scale,
+                M31: bounds.left,
+                M32: bounds.top,
+            });
+            dc.DrawText(
+                &text,
+                &materials.badge,
+                &D2D_RECT_F {
+                    left: 0.0,
+                    top: 0.0,
+                    right: draw_w,
+                    bottom: 18.0,
+                },
+                brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                DWRITE_MEASURING_MODE_NATURAL,
+            );
+            dc.SetTransform(&IDENTITY);
+        }
     }
     dc.SetTransform(&IDENTITY);
 }
@@ -288,6 +563,139 @@ unsafe fn draw_divider(ctx: &IndicatorCtx, rgb: (f32, f32, f32), alpha: f32) {
     ctx.brush
         .SetColor(&color(rgb.0, rgb.1, rgb.2, alpha * ctx.presence));
     ctx.dc.FillRoundedRectangle(&line, ctx.brush);
+}
+
+/// A subtle double-line vertical separator framing the Agent Zone.
+unsafe fn draw_agent_divider(ctx: &IndicatorCtx, rgb: (f32, f32, f32), alpha: f32) {
+    let half = (ctx.base * 0.017).max(0.9);
+    let offset = (ctx.base * 0.055).max(2.2);
+    let height = ctx.base * 0.56 * ctx.presence;
+    let bottom = ctx.baseline - ctx.base * 0.16;
+    let top = bottom - height;
+    ctx.brush
+        .SetColor(&color(rgb.0, rgb.1, rgb.2, alpha * ctx.presence));
+    for sign in [-1.0_f32, 1.0_f32] {
+        let cx = ctx.cx + sign * offset;
+        let line = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: cx - half,
+                top,
+                right: cx + half,
+                bottom,
+            },
+            radiusX: half,
+            radiusY: half,
+        };
+        ctx.dc.FillRoundedRectangle(&line, ctx.brush);
+    }
+}
+
+/// Subtle translucent micro-capsule rendered behind Agent Zone icons inside the dock pill.
+unsafe fn draw_agent_zone_capsule(
+    dc: &ID2D1DeviceContext,
+    brush: &ID2D1SolidColorBrush,
+    frame: &crate::dock::Frame,
+    dock: &Dock,
+    base: f32,
+    pill_radius: f32,
+    palette: &AgentTheme,
+) {
+    let mut min_left = f32::INFINITY;
+    let mut max_right = f32::NEG_INFINITY;
+    for ic in &frame.icons {
+        if ic.presence <= 0.05 || !dock.items[ic.idx].is_agent() {
+            continue;
+        }
+        let half_w = 0.5 * base * ic.scale * ic.presence;
+        min_left = min_left.min(ic.cx - half_w);
+        max_right = max_right.max(ic.cx + half_w);
+    }
+    if min_left >= max_right {
+        return;
+    }
+    let (pl, pt, pr, pb) = frame.pill;
+    let layout_dpi = dock.layout_dpi();
+    let pad_x = 5.0 * layout_dpi;
+    let pad_y = 3.5 * layout_dpi;
+    let left = (min_left - pad_x).max(pl + 3.0 * layout_dpi);
+    let right = (max_right + pad_x).min(pr - 3.0 * layout_dpi);
+    let top = pt + pad_y;
+    let bottom = pb - pad_y;
+    if right <= left || bottom <= top {
+        return;
+    }
+    let radius = ((bottom - top) * 0.34).min((pill_radius - 2.0).max(6.0) * layout_dpi);
+    let zone = D2D1_ROUNDED_RECT {
+        rect: D2D_RECT_F {
+            left,
+            top,
+            right,
+            bottom,
+        },
+        radiusX: radius,
+        radiusY: radius,
+    };
+    brush.SetColor(&color(
+        palette.capsule_rgb.0,
+        palette.capsule_rgb.1,
+        palette.capsule_rgb.2,
+        palette.capsule_alpha,
+    ));
+    dc.FillRoundedRectangle(&zone, brush);
+    brush.SetColor(&color(
+        palette.capsule_rgb.0,
+        palette.capsule_rgb.1,
+        palette.capsule_rgb.2,
+        palette.capsule_border_alpha,
+    ));
+    dc.DrawRoundedRectangle(&zone, brush, 0.9 * layout_dpi, None);
+}
+
+/// Restrained diagonal shimmer + thin mint rim drawn on `Running` Agent icons.
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_agent_shimmer(
+    dc: &ID2D1DeviceContext,
+    brush: &ID2D1SolidColorBrush,
+    materials: &MaterialBrushes,
+    tile: D2D_RECT_F,
+    base: f32,
+    presence: f32,
+    shimmer_phase: Option<f32>,
+    palette: &AgentTheme,
+) {
+    let rr = D2D1_ROUNDED_RECT {
+        rect: tile,
+        radiusX: base * CORNER,
+        radiusY: base * CORNER,
+    };
+    let mut phase_boost = 0.0f32;
+    if let Some(phase) = shimmer_phase {
+        phase_boost = (phase * std::f32::consts::PI).sin().max(0.0);
+        let sweep = -0.35 + 1.70 * phase;
+        materials.shimmer.SetStartPoint(D2D_POINT_2F {
+            x: tile.left + (sweep - 0.50) * base,
+            y: tile.top + (sweep - 0.50) * base,
+        });
+        materials.shimmer.SetEndPoint(D2D_POINT_2F {
+            x: tile.left + (sweep + 0.50) * base,
+            y: tile.top + (sweep + 0.50) * base,
+        });
+        materials.shimmer.SetOpacity(presence);
+        dc.FillRoundedRectangle(&rr, &materials.shimmer);
+    }
+    let blend = 0.45 * phase_boost;
+    let rim = (
+        palette.running_rgb.0 + (palette.shimmer_rgb.0 - palette.running_rgb.0) * blend,
+        palette.running_rgb.1 + (palette.shimmer_rgb.1 - palette.running_rgb.1) * blend,
+        palette.running_rgb.2 + (palette.shimmer_rgb.2 - palette.running_rgb.2) * blend,
+    );
+    brush.SetColor(&color(
+        rim.0,
+        rim.1,
+        rim.2,
+        (0.30 + 0.22 * phase_boost) * presence,
+    ));
+    dc.DrawRoundedRectangle(&rr, brush, (base * 0.026).max(1.0), None);
 }
 
 /// The Start button: a 2x2 grid of rounded panes (Windows-logo feel), drawn as
@@ -395,8 +803,14 @@ unsafe fn draw_drawer(
 /// A small "running" dot centered under an icon, in the pill's bottom padding.
 /// The dot follows the icon's bounce and enter-rise offsets so it stays visually
 /// attached to the icon instead of being left behind during click/birth animations.
-unsafe fn draw_running_dot(ctx: &IndicatorCtx, style: RunningDotStyle, bounce_y: f32, rise: f32) {
-    let radius = (ctx.base * 0.045).max(2.0);
+unsafe fn draw_running_dot(
+    ctx: &IndicatorCtx,
+    style: RunningDotStyle,
+    bounce_y: f32,
+    rise: f32,
+    radius_scale: f32,
+) {
+    let radius = (ctx.base * 0.045 * radius_scale).max(2.0);
     // Icon moves up by bounce_y and down by rise; the dot tracks it identically.
     let y = ctx.baseline + ctx.base * 0.09 - bounce_y + rise;
     ctx.brush.SetColor(&color(

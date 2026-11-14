@@ -17,10 +17,12 @@ use crate::dock::DockItem;
 #[derive(Default)]
 pub struct ItemSpec {
     pub label: Option<String>,
-    pub path: Option<String>, // file, folder, shortcut, or application path
-    pub exe: Option<String>,  // full path to launch + pull icon from
-    pub app: Option<String>,  // "App Paths" name, e.g. chrome.exe (resolved at load)
-    pub icon: Option<String>, // optional separate icon source path
+    pub path: Option<String>,  // file, folder, shortcut, or application path
+    pub exe: Option<String>,   // full path to launch + pull icon from
+    pub app: Option<String>,   // "App Paths" name, e.g. chrome.exe (resolved at load)
+    pub icon: Option<String>,  // optional separate icon source path
+    pub kind: Option<String>,  // optional role hint, e.g. "agent"
+    pub agent: Option<String>, // optional bound agent id, e.g. "antigravity" | "codex" | "dsh"
 }
 
 pub struct Config {
@@ -31,7 +33,8 @@ const HEADER: &str = "\
 # FeatherDock config - edit then restart the dock.
 # One [[item]] per icon. Provide `path` (file, folder, shortcut, or application)
 # OR `app` (resolved via Windows \"App Paths\", e.g. chrome.exe).
-# Legacy `exe` is still accepted. `label` and `icon` are optional.
+# Legacy `exe` is still accepted. `label`, `icon`, `kind`, and `agent` are optional.
+# Set `kind = \"agent\"` (and optional `agent = \"codex\"`) to place a pinned app in the Agent zone.
 # Backslashes in double-quoted paths must be doubled, e.g. \"C:\\\\Tools\\\\app.exe\".
 ";
 
@@ -302,6 +305,15 @@ fn registry_appx_package_names() -> Vec<String> {
 }
 
 fn add_item_at(path: &Path, label: &str, item_path_value: &Path) -> io::Result<bool> {
+    add_item_with_agent_at(path, label, item_path_value, None)
+}
+
+fn add_item_with_agent_at(
+    path: &Path,
+    label: &str,
+    item_path_value: &Path,
+    agent_id: Option<&str>,
+) -> io::Result<bool> {
     // A missing config just means "no items yet". Any other read error — invalid
     // UTF-8, permission denied, transient I/O — must NOT fall back to a default
     // header, or the atomic write below would replace the user's unreadable file
@@ -330,6 +342,12 @@ fn add_item_at(path: &Path, label: &str, item_path_value: &Path) -> io::Result<b
         quote(label),
         quote(&item_path_value.to_string_lossy())
     ));
+    if let Some(agent_id) = agent_id {
+        content.push_str(&format!(
+            "kind = \"agent\"\nagent = \"{}\"\n",
+            quote(agent_id)
+        ));
+    }
     atomic::write(path, content.as_bytes())?;
     Ok(true)
 }
@@ -343,21 +361,34 @@ fn migrate_legacy(legacy: &Path, target: &Path) -> io::Result<bool> {
     Ok(true)
 }
 
-/// Read the config if it exists. `None` means "no config — use built-in defaults".
-pub fn load() -> io::Result<Option<Config>> {
-    let path = config_path();
-    migrate_legacy(&legacy_config_path(), &path)?;
-    match fs::read_to_string(&path) {
-        Ok(text) => {
-            let mut config = parse(&text);
-            if repair_config_paths(&mut config) {
-                let _ = write_config(&path, &config);
-            }
-            Ok(Some(config))
-        }
+fn load_from(path: &Path) -> io::Result<Option<Config>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(parse(&text))),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+/// Read the config without migrating or rewriting it.
+pub fn load() -> io::Result<Option<Config>> {
+    load_from(&config_path())
+}
+
+/// Read the config and apply legacy migration and launch-path repairs.
+pub fn load_with_maintenance() -> io::Result<Option<Config>> {
+    let path = config_path();
+    load_with_maintenance_from(&legacy_config_path(), &path)
+}
+
+fn load_with_maintenance_from(legacy: &Path, path: &Path) -> io::Result<Option<Config>> {
+    migrate_legacy(legacy, path)?;
+    let Some(mut config) = load_from(path)? else {
+        return Ok(None);
+    };
+    if repair_config_paths(&mut config) {
+        let _ = write_config(path, &config);
+    }
+    Ok(Some(config))
 }
 
 /// Write a starter config reflecting the resolved default apps, so it's editable.
@@ -370,6 +401,12 @@ pub fn write_default(items: &[DockItem]) -> io::Result<()> {
         s.push_str("\n[[item]]\n");
         s.push_str(&format!("label = \"{}\"\n", quote(&it.label)));
         s.push_str(&format!("path = \"{}\"\n", quote(path)));
+        if let Some(agent) = &it.agent {
+            s.push_str(&format!(
+                "kind = \"agent\"\nagent = \"{}\"\n",
+                quote(&agent.agent_id)
+            ));
+        }
     }
     atomic::write(&config_path(), s.as_bytes())
 }
@@ -413,6 +450,65 @@ fn remove_item_at(path: &Path, item_path_value: &str) -> io::Result<bool> {
 /// without it. Removing by position — rather than by launch path — is what lets the
 /// settings UI delete an entry written as `app = "chrome.exe"`, whose stored spec carries
 /// no `path`/`exe` for a path match to hit. Out-of-range index is a no-op.
+pub fn reorder_items(source: &str, target: &str, after: bool) -> io::Result<bool> {
+    let path = config_path();
+    let Some(mut config) = load()? else {
+        return Ok(false);
+    };
+    if !move_spec(&mut config, source, target, after) {
+        return Ok(false);
+    }
+    write_config(&path, &config)?;
+    Ok(true)
+}
+
+pub fn set_item_icon(source: &str, icon: &str) -> io::Result<bool> {
+    let Some(mut config) = load()? else {
+        return Ok(false);
+    };
+    let source_key = path_key(Path::new(source));
+    let Some(item) = config.items.iter_mut().find(|i| {
+        crate::apps::resolve_launch_path(i).is_some_and(|p| path_key(Path::new(&p)) == source_key)
+    }) else {
+        return Ok(false);
+    };
+    item.icon = Some(icon.to_string());
+    write_config(&config_path(), &config)?;
+    Ok(true)
+}
+
+fn move_spec(config: &mut Config, source: &str, target: &str, after: bool) -> bool {
+    let key =
+        |spec: &ItemSpec| crate::apps::resolve_launch_path(spec).map(|p| path_key(Path::new(&p)));
+    let source_key = path_key(Path::new(source));
+    let target_key = path_key(Path::new(target));
+    if source_key == target_key {
+        return false;
+    }
+    let Some(from) = config
+        .items
+        .iter()
+        .position(|i| key(i).as_ref() == Some(&source_key))
+    else {
+        return false;
+    };
+    if !config
+        .items
+        .iter()
+        .any(|i| key(i).as_ref() == Some(&target_key))
+    {
+        return false;
+    }
+    let item = config.items.remove(from);
+    let to = config
+        .items
+        .iter()
+        .position(|i| key(i).as_ref() == Some(&target_key))
+        .unwrap();
+    config.items.insert(to + usize::from(after), item);
+    true
+}
+
 pub fn remove_item_at_index(index: usize) -> io::Result<bool> {
     remove_item_at_index_in(&config_path(), index)
 }
@@ -458,6 +554,12 @@ fn write_spec(out: &mut String, spec: &ItemSpec) {
     if let Some(value) = &spec.icon {
         out.push_str(&format!("icon = \"{}\"\n", quote(value)));
     }
+    if let Some(value) = &spec.kind {
+        out.push_str(&format!("kind = \"{}\"\n", quote(value)));
+    }
+    if let Some(value) = &spec.agent {
+        out.push_str(&format!("agent = \"{}\"\n", quote(value)));
+    }
 }
 
 /// Append a new `[[item]]` to the config file (creating it with a header if needed).
@@ -469,6 +571,23 @@ pub fn add_item(label: &str, item_path_value: &str) -> io::Result<bool> {
         ));
     }
     add_item_at(&config_path(), label, Path::new(item_path_value))
+}
+
+/// Append a new Agent `[[item]]` (`kind = "agent"`) to the config file.
+#[allow(dead_code)]
+pub fn add_agent_item(label: &str, item_path_value: &str, agent_id: &str) -> io::Result<bool> {
+    if !Path::new(item_path_value).exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("path does not exist: {item_path_value}"),
+        ));
+    }
+    add_item_with_agent_at(
+        &config_path(),
+        label,
+        Path::new(item_path_value),
+        Some(agent_id),
+    )
 }
 
 pub fn parse(text: &str) -> Config {
@@ -498,6 +617,8 @@ pub fn parse(text: &str) -> Config {
                 "exe" => it.exe = Some(val),
                 "app" => it.app = Some(val),
                 "icon" => it.icon = Some(val),
+                "kind" => it.kind = Some(val),
+                "agent" => it.agent = Some(val),
                 _ => {}
             }
         }
@@ -769,6 +890,33 @@ path = "C:\\Tools\\app.exe"
     }
 
     #[test]
+    fn readonly_load_preserves_repair_candidates_until_maintenance() {
+        let dir = temp_dir("readonly-maintenance");
+        fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("featherdock.toml");
+        let repaired = dir.join("current.exe");
+        let missing = dir.join("stale.exe");
+        fs::write(&repaired, b"app").unwrap();
+        fs::write(
+            &config,
+            format!("[[item]]\npath = '{}'\n", missing.to_string_lossy()),
+        )
+        .unwrap();
+        let original = fs::read(&config).unwrap();
+
+        let loaded = load_from(&config).unwrap().unwrap();
+        assert_eq!(loaded.items[0].path.as_deref(), missing.to_str());
+        assert_eq!(fs::read(&config).unwrap(), original);
+
+        let maintained = load_with_maintenance_from(&config, &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(maintained.items[0].path.as_deref(), repaired.to_str());
+        assert_ne!(fs::read(&config).unwrap(), original);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn migrates_legacy_config_without_overwriting_existing_target() {
         let dir = temp_dir("migration");
         fs::create_dir_all(&dir).unwrap();
@@ -782,5 +930,76 @@ path = "C:\\Tools\\app.exe"
         assert!(!migrate_legacy(&legacy, &target).unwrap());
         assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
         fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod reorder_regression_tests {
+    use super::*;
+    #[test]
+    fn reordering_preserves_icons_and_places_on_either_side() {
+        let mut cfg=parse("[[item]]\npath = 'C:\\A.exe'\nicon = 'C:\\A.ico'\n[[item]]\npath = 'C:\\B.exe'\n[[item]]\npath = 'C:\\C.exe'\n");
+        assert!(move_spec(&mut cfg, r"C:\A.exe", r"C:\C.exe", true));
+        assert_eq!(cfg.items[2].icon.as_deref(), Some(r"C:\A.ico"));
+        assert!(move_spec(&mut cfg, r"C:\A.exe", r"C:\B.exe", false));
+        assert_eq!(cfg.items[0].path.as_deref(), Some(r"C:\A.exe"));
+    }
+    #[test]
+    fn invalid_or_identical_drop_does_not_remove_an_item() {
+        let mut cfg = parse("[[item]]\npath = 'C:\\A.exe'\n");
+        assert!(!move_spec(&mut cfg, r"C:\A.exe", r"C:\Missing.exe", false));
+        assert_eq!(cfg.items.len(), 1);
+        assert!(!move_spec(&mut cfg, r"C:\A.exe", r"C:\A.exe", true));
+        assert_eq!(cfg.items.len(), 1);
+    }
+
+    #[test]
+    fn parses_and_rewrites_agent_fields_preserving_legacy_configs() {
+        let mut cfg = parse(
+            r#"
+[[item]]
+label = "Chrome"
+app = "chrome.exe"
+
+[[item]]
+label = "Codex"
+path = "C:\Tools\Codex.exe"
+kind = "agent"
+agent = "codex"
+"#,
+        );
+        assert_eq!(cfg.items.len(), 2);
+        assert!(cfg.items[0].kind.is_none());
+        assert!(cfg.items[0].agent.is_none());
+        assert_eq!(cfg.items[1].kind.as_deref(), Some("agent"));
+        assert_eq!(cfg.items[1].agent.as_deref(), Some("codex"));
+
+        let mut serialized = String::from(HEADER);
+        for spec in &cfg.items {
+            write_spec(&mut serialized, spec);
+        }
+        let reparsed = parse(&serialized);
+        assert_eq!(reparsed.items[1].kind.as_deref(), Some("agent"));
+        assert_eq!(reparsed.items[1].agent.as_deref(), Some("codex"));
+
+        cfg.items.swap(0, 1);
+        assert_eq!(cfg.items[0].agent.as_deref(), Some("codex"));
+
+        let dir = std::env::temp_dir().join(format!(
+            "featherdock-cfg-agent-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("items.toml");
+        let exe = dir.join("Codex.exe");
+        assert!(add_item_with_agent_at(&path, "Codex", &exe, Some("codex")).unwrap());
+        let saved = parse(&fs::read_to_string(&path).unwrap());
+        assert_eq!(saved.items.len(), 1);
+        assert_eq!(saved.items[0].kind.as_deref(), Some("agent"));
+        assert_eq!(saved.items[0].agent.as_deref(), Some("codex"));
+        let _ = fs::remove_dir_all(&dir);
     }
 }

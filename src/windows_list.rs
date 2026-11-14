@@ -46,6 +46,7 @@ pub struct RunningWindow {
     pub hwnd: isize,
     pub title: String,
     pub exe_path: Option<String>,
+    pub app_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,6 +93,7 @@ unsafe extern "system" fn enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
                 hwnd: hwnd.0 as isize,
                 title,
                 exe_path,
+                app_id: crate::app_identity::window_id(hwnd),
             });
         }
     }
@@ -117,11 +119,13 @@ unsafe fn exe_path_for_window_cached(
 pub fn group_by_application(running: &[RunningWindow]) -> Vec<RunningGroup> {
     let mut groups: Vec<RunningGroup> = Vec::new();
     for window in running {
-        let key = window
-            .exe_path
-            .as_deref()
-            .map(normalize_app_key)
-            .unwrap_or_else(|| format!("hwnd:{}", window.hwnd));
+        let key = window.app_id.clone().unwrap_or_else(|| {
+            window
+                .exe_path
+                .as_deref()
+                .map(normalize_app_key)
+                .unwrap_or_else(|| format!("hwnd:{}", window.hwnd))
+        });
         if let Some(group) = groups.iter_mut().find(|group| group.key == key) {
             group.windows.push(window.clone());
             continue;
@@ -148,7 +152,7 @@ pub fn group_by_application(running: &[RunningWindow]) -> Vec<RunningGroup> {
 }
 
 fn normalize_app_key(path: &str) -> String {
-    path.trim().trim_matches('"').to_ascii_lowercase()
+    crate::app_identity::normalize(path)
 }
 
 fn app_label_from_path(path: &str) -> String {
@@ -256,29 +260,16 @@ unsafe fn window_title(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..written as usize])
 }
 
-/// Icon for a running window: ask the window (WM_GETICON), then fall back to its
-/// window-class icon. The returned HICON is owned by the target app — do NOT free.
+/// Non-blocking window-class icon. The returned HICON belongs to the target app;
+/// do not free it or send a synchronous WM_GETICON while painting.
 pub unsafe fn window_icon(hwnd: HWND) -> Option<HICON> {
-    for kind in [ICON_BIG, ICON_SMALL2, ICON_SMALL] {
-        let mut result: usize = 0;
-        let ok = SendMessageTimeoutW(
-            hwnd,
-            WM_GETICON,
-            WPARAM(kind as usize),
-            LPARAM(0),
-            SMTO_ABORTIFHUNG,
-            120,
-            Some(&mut result),
-        );
-        if ok.0 != 0 && result != 0 {
-            return Some(HICON(result as *mut c_void));
-        }
-    }
-    let class_icon = GetClassLongPtrW(hwnd, GET_CLASS_LONG_INDEX(GCLP_HICON));
-    if class_icon != 0 {
-        Some(HICON(class_icon as *mut c_void))
-    } else {
+    // Window-class metadata is local; never send a synchronous WM_GETICON to
+    // another application from a decode or paint callback.
+    let icon = GetClassLongPtrW(hwnd, GET_CLASS_LONG_INDEX(GCLP_HICON));
+    if icon == 0 {
         None
+    } else {
+        Some(HICON(icon as *mut c_void))
     }
 }
 
@@ -352,25 +343,34 @@ pub unsafe fn is_fullscreen_present(dock_monitor: HMONITOR) -> bool {
     if GetWindowRect(foreground, &mut rect).is_err() {
         return false;
     }
-    let covers_monitor = rect.left <= info.rcMonitor.left
-        && rect.top <= info.rcMonitor.top
-        && rect.right >= info.rcMonitor.right
-        && rect.bottom >= info.rcMonitor.bottom;
     // Hiding the taskbar frees the work area, so a normal *maximized* window now spans
     // the whole monitor too — but it isn't fullscreen and must NOT retract an always-
     // resident dock. A maximized window keeps its title-bar caption; true fullscreen
     // apps (games, video) are borderless. Only borderless monitor-fillers count.
     let style = GetWindowLongPtrW(foreground, GWL_STYLE) as u32;
     let has_caption = (style & WS_CAPTION.0) == WS_CAPTION.0;
-    fullscreen_should_retract_dock(covers_monitor, has_caption)
+    fullscreen_should_retract_dock(&rect, &info.rcMonitor, has_caption)
 }
 
 /// A foreground window retracts an always-resident dock only when it is *true*
 /// fullscreen: it fills the monitor AND is borderless (no title-bar caption). A normal
 /// maximized window fills the monitor now that the work area is freed, but keeps its
 /// caption, so it must not hide the dock.
-fn fullscreen_should_retract_dock(covers_monitor: bool, has_caption: bool) -> bool {
-    covers_monitor && !has_caption
+fn fullscreen_should_retract_dock(rect: &RECT, monitor: &RECT, has_caption: bool) -> bool {
+    // Steam Big Picture's SDL window can leave a single physical pixel at the bottom
+    // (observed: 3840x2159 on a 3840x2160 monitor). Exact coverage misses it. Keep this
+    // tolerance in physical pixels, independent of DPI, so ordinary work-area windows
+    // still fail the fullscreen check. Captioned maximized windows remain excluded.
+    const EDGE_TOLERANCE: i32 = 1;
+    !has_caption
+        && rect.right > rect.left
+        && rect.bottom > rect.top
+        && monitor.right > monitor.left
+        && monitor.bottom > monitor.top
+        && rect.left <= monitor.left.saturating_add(EDGE_TOLERANCE)
+        && rect.top <= monitor.top.saturating_add(EDGE_TOLERANCE)
+        && rect.right >= monitor.right.saturating_sub(EDGE_TOLERANCE)
+        && rect.bottom >= monitor.bottom.saturating_sub(EDGE_TOLERANCE)
 }
 
 /// True if a normal *maximized* window — zoomed AND with a title-bar caption — is in
@@ -615,6 +615,7 @@ mod tests {
             hwnd,
             title: title.to_string(),
             exe_path: exe_path.map(str::to_string),
+            app_id: None,
         }
     }
 
@@ -645,14 +646,124 @@ mod tests {
 
     #[test]
     fn only_borderless_monitor_fillers_retract_the_dock() {
+        let monitor = RECT {
+            left: 0,
+            top: 0,
+            right: 3840,
+            bottom: 2160,
+        };
         // Borderless app filling the screen (game / video) -> fullscreen, retract.
-        assert!(fullscreen_should_retract_dock(true, false));
+        assert!(fullscreen_should_retract_dock(&monitor, &monitor, false));
         // Maximized normal window: fills the monitor (freed work area) but has a
         // caption -> NOT fullscreen, keep the always-resident dock.
-        assert!(!fullscreen_should_retract_dock(true, true));
-        // Anything not covering the whole monitor never counts.
-        assert!(!fullscreen_should_retract_dock(false, false));
-        assert!(!fullscreen_should_retract_dock(false, true));
+        assert!(!fullscreen_should_retract_dock(&monitor, &monitor, true));
+        let windowed = RECT {
+            right: 1920,
+            bottom: 1080,
+            ..monitor
+        };
+        assert!(!fullscreen_should_retract_dock(&windowed, &monitor, false));
+        assert!(!fullscreen_should_retract_dock(&windowed, &monitor, true));
+    }
+
+    #[test]
+    fn steam_big_picture_one_pixel_bottom_gap_retracts_the_dock() {
+        // Actual SDL_app geometry from Steam Big Picture at 150% desktop scaling.
+        let monitor = RECT {
+            left: 0,
+            top: 0,
+            right: 3840,
+            bottom: 2160,
+        };
+        let steam = RECT {
+            bottom: 2159,
+            ..monitor
+        };
+        assert!(fullscreen_should_retract_dock(&steam, &monitor, false));
+        assert!(!fullscreen_should_retract_dock(&steam, &monitor, true));
+    }
+
+    #[test]
+    fn fullscreen_tolerates_one_physical_pixel_on_each_monitor_edge() {
+        for monitor in [
+            RECT {
+                left: 0,
+                top: 0,
+                right: 1920,
+                bottom: 1080,
+            },
+            RECT {
+                left: -3840,
+                top: -2160,
+                right: 0,
+                bottom: 0,
+            },
+            RECT {
+                left: 1920,
+                top: 100,
+                right: 4480,
+                bottom: 1540,
+            },
+        ] {
+            let inset = RECT {
+                left: monitor.left + 1,
+                top: monitor.top + 1,
+                right: monitor.right - 1,
+                bottom: monitor.bottom - 1,
+            };
+            assert!(fullscreen_should_retract_dock(&inset, &monitor, false));
+            let oversized = RECT {
+                left: monitor.left - 8,
+                top: monitor.top - 8,
+                right: monitor.right + 8,
+                bottom: monitor.bottom + 8,
+            };
+            assert!(fullscreen_should_retract_dock(&oversized, &monitor, false));
+            assert!(!fullscreen_should_retract_dock(&oversized, &monitor, true));
+            // Do not turn a taskbar gap or a nearly maximized window into fullscreen.
+            for gap in [2, 48, 72] {
+                for window in [
+                    RECT {
+                        left: monitor.left + gap,
+                        ..monitor
+                    },
+                    RECT {
+                        top: monitor.top + gap,
+                        ..monitor
+                    },
+                    RECT {
+                        right: monitor.right - gap,
+                        ..monitor
+                    },
+                    RECT {
+                        bottom: monitor.bottom - gap,
+                        ..monitor
+                    },
+                ] {
+                    assert!(!fullscreen_should_retract_dock(&window, &monitor, false));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fullscreen_rejects_invalid_bounds() {
+        let monitor = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        assert!(!fullscreen_should_retract_dock(
+            &RECT::default(),
+            &monitor,
+            false
+        ));
+        assert!(!fullscreen_should_retract_dock(
+            &monitor,
+            &RECT::default(),
+            false
+        ));
     }
 
     #[test]

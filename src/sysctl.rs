@@ -1037,6 +1037,14 @@ pub fn battery() -> Battery {
     }
 }
 
+/// True when Windows Energy Saver (Battery Saver) is active (`SystemStatusFlag != 0`).
+pub fn battery_saver_active() -> bool {
+    unsafe {
+        let mut status = SYSTEM_POWER_STATUS::default();
+        GetSystemPowerStatus(&mut status).is_ok() && status.SystemStatusFlag != 0
+    }
+}
+
 /// Local wall-clock, formatted as ("16:58", "6月24日") for the status line.
 pub fn clock() -> (String, String) {
     unsafe {

@@ -8,12 +8,13 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+#[derive(Clone)]
 pub struct Category {
     pub name: String,
     pub items: Vec<String>, // entry keys, in the user's drag order
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Categories {
     pub categories: Vec<Category>,
     pub hidden: Vec<String>, // entry keys the user removed from the drawer
@@ -106,7 +107,18 @@ pub fn load() -> Categories {
     let Ok(text) = fs::read_to_string(config_path()) else {
         return Categories::default();
     };
-    parse(&text)
+    let mut categories = parse(&text);
+    for key in categories.hidden.iter_mut().chain(
+        categories
+            .categories
+            .iter_mut()
+            .flat_map(|c| c.items.iter_mut()),
+    ) {
+        if let Some(canonical) = crate::desktop_scan::canonical_virtual_key(key) {
+            *key = canonical.into();
+        }
+    }
+    categories
 }
 
 /// Persist the categories (creating the folder/file as needed).

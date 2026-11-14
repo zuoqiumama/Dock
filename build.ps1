@@ -26,6 +26,10 @@
     Run the full pre-release gate BEFORE building: cargo fmt --check, clippy
     (-D warnings), and the test suite. Any failure aborts before the release build.
 
+.PARAMETER Stage
+    Write the executable to outputs\pending\FeatherDock.exe instead of replacing
+    the canonical root executable. Cannot be combined with -Run.
+
 .EXAMPLE
     .\build.ps1
 .EXAMPLE
@@ -34,21 +38,30 @@
     .\build.ps1 -Clean -Run
 .EXAMPLE
     .\build.ps1 -Verify
+.EXAMPLE
+    .\build.ps1 -Verify -Stage
 #>
 [CmdletBinding()]
 param(
     [switch]$Clean,
     [switch]$Run,
-    [switch]$Verify
+    [switch]$Verify,
+    [switch]$Stage
 )
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 Set-Location -LiteralPath $root
+if ($Stage -and $Run) { throw '-Stage cannot be combined with -Run.' }
 & (Join-Path $root 'scripts\dev-env.ps1') -Quiet
 
 # The single canonical executable. This is the only exe you should ever launch.
 $FinalExe   = Join-Path $root 'FeatherDock.exe'
+if ($Stage) {
+    $stageDirectory = Join-Path $root 'outputs\pending'
+    [void](New-Item -ItemType Directory -Path $stageDirectory -Force)
+    $FinalExe = Join-Path $stageDirectory 'FeatherDock.exe'
+}
 $TargetDir = if ($env:CARGO_TARGET_DIR) {
     if ([System.IO.Path]::IsPathRooted($env:CARGO_TARGET_DIR)) {
         [System.IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
@@ -122,28 +135,32 @@ if (-not $built) {
     throw "Build reported success but no release featherdock.exe was found under '$TargetDir'."
 }
 
-# Place the one canonical exe at the repo root, then wipe all the strays.
+# Publish to the selected root or staging destination; non-staged builds clean strays.
 Copy-Item -LiteralPath $built.FullName -Destination $FinalExe -Force
 # Sandboxed workspaces can inherit a Low mandatory label onto newly built EXEs.
 # Windows then starts even an Explorer-launched Dock at Low integrity, which
 # blocks normal user-cache writes and communication with Explorer's tray. Give
 # only the shipped executable the normal desktop-app level; no elevation needed.
 $artifactAclTool = Join-Path $env:SystemRoot 'System32\icacls.exe'
-& $artifactAclTool $FinalExe /setintegritylevel M /q
+$artifactAclOutput = & $artifactAclTool $FinalExe /setintegritylevel M /q 2>&1
 if ($LASTEXITCODE -ne 0) {
-    throw 'Could not set Medium integrity on FeatherDock.exe; the build was not published successfully.'
+    throw "Could not set Medium integrity on FeatherDock.exe: $artifactAclOutput"
 }
-Remove-StrayExes
+if (-not $Stage) { Remove-StrayExes }
 
 # Kill the legacy release\ folder if it ever reappears (old publish location).
-if (Test-Path -LiteralPath $LegacyDir) {
+if (-not $Stage -and (Test-Path -LiteralPath $LegacyDir)) {
     Remove-Item -LiteralPath $LegacyDir -Recurse -Force
     Write-Host "==> removed legacy release\ folder" -ForegroundColor DarkYellow
 }
 
 $sizeKiB = [math]::Round((Get-Item -LiteralPath $FinalExe).Length / 1KB)
 Write-Host ''
-Write-Host '  Build complete. The ONE executable to run:' -ForegroundColor Green
+if ($Stage) {
+    Write-Host '  Verified build staged; the running Dock and root executable were not changed:' -ForegroundColor Green
+} else {
+    Write-Host '  Build complete. The ONE executable to run:' -ForegroundColor Green
+}
 Write-Host "    $FinalExe  ($sizeKiB KiB)" -ForegroundColor Green
 Write-Host ''
 

@@ -142,9 +142,19 @@ fn wide(s: &str) -> Vec<u16> {
 
 /// Lay out `count` thumbnail cells (already capped to `MAX_THUMBS` by the caller). When
 /// `overflow` > 0 the panel is made one strip taller for the "+N more" footer.
+#[cfg(test)]
 fn preview_layout(count: usize, overflow: usize, dpi: f32) -> PreviewLayout {
+    preview_layout_columns(count, overflow, dpi, MAX_COLUMNS)
+}
+
+fn preview_layout_columns(
+    count: usize,
+    overflow: usize,
+    dpi: f32,
+    max_columns: usize,
+) -> PreviewLayout {
     let count = count.max(1);
-    let columns = count.min(MAX_COLUMNS);
+    let columns = count.min(max_columns.max(1));
     let rows = count.div_ceil(columns);
     let thumb_w = scaled(THUMB_W, dpi);
     let thumb_h = scaled(THUMB_H, dpi);
@@ -231,6 +241,28 @@ unsafe fn state(hwnd: HWND) -> Option<&'static mut PreviewState> {
     (!ptr.is_null()).then(|| &mut *ptr)
 }
 
+pub unsafe fn update_titles(group_key: &str, windows: &[RunningWindowRef]) -> bool {
+    let raw = PREVIEW_HWND.load(Ordering::Relaxed);
+    if raw == 0 {
+        return false;
+    }
+    let hwnd = HWND(raw as *mut c_void);
+    if !IsWindow(hwnd).as_bool() {
+        return false;
+    }
+    let Some(state) = state(hwnd) else {
+        return false;
+    };
+    if state.key != group_key || !same_windows(&state.windows, windows) {
+        return false;
+    }
+    if state.windows != windows {
+        state.windows = windows.to_vec();
+        let _ = InvalidateRect(hwnd, None, BOOL(0));
+    }
+    true
+}
+
 unsafe fn register_class() -> Option<HINSTANCE> {
     let instance: HINSTANCE = GetModuleHandleW(None).ok()?.into();
     if !CLASS_REGISTERED.swap(true, Ordering::Relaxed) {
@@ -251,6 +283,43 @@ unsafe fn register_class() -> Option<HINSTANCE> {
     Some(instance)
 }
 
+unsafe fn layout_for_monitor(
+    count: usize,
+    anchor_x: i32,
+    anchor_y: i32,
+    dpi: f32,
+) -> (PreviewLayout, f32) {
+    let area = crate::geometry::work_area(anchor_x, anchor_y);
+    let width = (area.right - area.left - 16).max(1) as f32;
+    let height = (area.bottom - area.top - 32).max(1) as f32;
+    let columns = crate::geometry::columns(
+        width,
+        scaled(PAD, dpi) as f32,
+        scaled(THUMB_W, dpi) as f32,
+        scaled(GAP, dpi) as f32,
+        MAX_COLUMNS,
+    );
+    let initial = preview_layout_columns(
+        count.min(MAX_THUMBS),
+        count.saturating_sub(MAX_THUMBS),
+        dpi,
+        columns,
+    );
+    let effective = dpi
+        * (width / initial.width as f32)
+            .min(height / initial.height as f32)
+            .min(1.0);
+    (
+        preview_layout_columns(
+            count.min(MAX_THUMBS),
+            count.saturating_sub(MAX_THUMBS),
+            effective,
+            columns,
+        ),
+        effective,
+    )
+}
+
 unsafe fn preview_origin(anchor_x: i32, anchor_y: i32, layout: &PreviewLayout) -> (i32, i32) {
     let point = POINT {
         x: anchor_x,
@@ -265,14 +334,18 @@ unsafe fn preview_origin(anchor_x: i32, anchor_y: i32, layout: &PreviewLayout) -
     let mut x = anchor_x - layout.width / 2;
     let mut y = anchor_y - layout.height - 12;
     if GetMonitorInfoW(monitor, &mut info).as_bool() {
-        x = x.clamp(
-            info.rcWork.left + margin,
-            info.rcWork.right - layout.width - margin,
-        );
+        x = crate::geometry::fit_axis(x, layout.width, info.rcWork.left, info.rcWork.right, margin);
         if y < info.rcWork.top + margin {
             y = anchor_y + 12;
         }
     }
+    y = crate::geometry::fit_axis(
+        y,
+        layout.height,
+        info.rcWork.top,
+        info.rcWork.bottom,
+        margin,
+    );
     (x, y)
 }
 
@@ -311,9 +384,7 @@ pub unsafe fn show(
     };
     // Cap the live thumbnails; the full window set is still kept in state so the rest slide
     // into view as visible ones are closed.
-    let shown = windows.len().min(MAX_THUMBS);
-    let overflow = windows.len() - shown;
-    let layout = preview_layout(shown, overflow, dpi);
+    let (layout, dpi) = layout_for_monitor(windows.len(), anchor_x, anchor_y, dpi);
     let (x, y) = preview_origin(anchor_x, anchor_y, &layout);
     let Ok(hwnd) = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -720,9 +791,13 @@ unsafe fn remove_window(hwnd: HWND, state: &mut PreviewState, index: usize) {
         return;
     }
     // A hidden overflow window (if any) promotes into the freed cell.
-    let shown = state.windows.len().min(MAX_THUMBS);
-    let overflow = state.windows.len() - shown;
-    let layout = preview_layout(shown, overflow, state.dpi);
+    let (layout, dpi) = layout_for_monitor(
+        state.windows.len(),
+        state.anchor_x,
+        state.anchor_y,
+        state.dpi,
+    );
+    state.dpi = dpi;
     let (x, y) = preview_origin(state.anchor_x, state.anchor_y, &layout);
     let _ = SetWindowPos(
         hwnd,
@@ -787,6 +862,40 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 if let Some(state) = state(hwnd) {
                     let x = (lparam.0 & 0xFFFF) as i16 as i32;
                     let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+                    if state.windows.len() > state.layout.items.len()
+                        && y >= state.layout.height - scaled(FOOTER_H, state.dpi)
+                    {
+                        let windows = state.windows.clone();
+                        let owner = state.owner;
+                        let Ok(menu) = CreatePopupMenu() else {
+                            return LRESULT(0);
+                        };
+                        for (index, window) in windows.iter().enumerate() {
+                            let title = wide(&window.title.replace('&', "&&"));
+                            let _ = AppendMenuW(menu, MF_STRING, index + 1, PCWSTR(title.as_ptr()));
+                        }
+                        let mut cursor = POINT::default();
+                        let _ = GetCursorPos(&mut cursor);
+                        let _ = SetForegroundWindow(owner);
+                        let guard = crate::menu_style::style(menu, crate::dock_theme(owner), owner);
+                        let selected = TrackPopupMenu(
+                            menu,
+                            TPM_RETURNCMD | TPM_NONOTIFY,
+                            cursor.x,
+                            cursor.y,
+                            0,
+                            owner,
+                            None,
+                        )
+                        .0 as usize;
+                        drop(guard);
+                        let _ = DestroyMenu(menu);
+                        if let Some(window) = selected.checked_sub(1).and_then(|i| windows.get(i)) {
+                            windows_list::activate(window.hwnd);
+                        }
+                        hide();
+                        return LRESULT(0);
+                    }
                     // A click on a card's red × closes just that window and keeps the
                     // preview open for the rest (the whole row never closes at once).
                     if let Some(index) = close_hit_test(state, x, y) {

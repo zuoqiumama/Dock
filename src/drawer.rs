@@ -13,7 +13,8 @@ use core::ffi::c_void;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 use std::time::Instant;
 
 use windows::core::*;
@@ -67,7 +68,6 @@ struct PanelMotion {
 
 impl PanelMotion {
     const HIDDEN: Self = Self { alpha: 0.0, e: 0.0 };
-    #[cfg(test)]
     const VISIBLE: Self = Self { alpha: 1.0, e: 1.0 };
 }
 
@@ -80,7 +80,7 @@ struct ReopenGuard {
 // --- layout, in logical px @96dpi (multiplied by dpi for device px) ---
 const LPAD: f32 = 14.0; // left/right padding
 const BPAD: f32 = 14.0; // bottom padding
-const HEADER_H: f32 = 32.0; // title row above the grid
+const HEADER_H: f32 = 66.0; // title row above the grid
 const COLS: usize = 5;
 const CELL_W: f32 = 92.0;
 const CELL_H: f32 = 94.0;
@@ -108,7 +108,7 @@ const ICON_DECODE_BATCH: usize = 6;
 const TIMER_ICON_LOAD: usize = 3;
 const TIMER_ICON_LOAD_MS: u32 = 30;
 /// Posted by the background extraction thread once its batch is on disk.
-const WM_APP_ICONS_READY: u32 = WM_APP + 0x25;
+pub(crate) const WM_APP_ICONS_READY: u32 = WM_APP + 0x25;
 
 const ID_CTX_OPEN: usize = 3101;
 const ID_CTX_PIN: usize = 3102;
@@ -120,6 +120,11 @@ const ID_CTX_REFRESH: usize = 3107;
 const ID_CTX_CATEGORY_BASE: usize = 3200;
 
 static PANEL_HWND: AtomicIsize = AtomicIsize::new(0);
+static RENDER_ERROR_POSTED: AtomicBool = AtomicBool::new(false);
+
+pub fn owns_window(hwnd: HWND) -> bool {
+    PANEL_HWND.load(Ordering::Relaxed) == hwnd.0 as isize && unsafe { IsWindow(hwnd).as_bool() }
+}
 
 thread_local! {
     static CLICK_AWAY_GUARD: RefCell<Option<ReopenGuard>> = const { RefCell::new(None) };
@@ -129,9 +134,9 @@ thread_local! {
     // valid across open/close cycles (deleting them on close was what made every
     // icon fall back to its glyph tile on the second open).
     static PRELOADED_ICONS: RefCell<HashMap<String, PathBuf>> = RefCell::new(HashMap::new());
-    // Decoded GPU bitmaps, keyed by entry key. Decoded ONCE (at startup by
-    // `warm_cache`, or on first use) on the dock's shared Direct2D device, then
-    // reused by every drawer open — opening the drawer uploads nothing.
+    // Decoded GPU bitmaps, keyed by entry key. Decoded once on the dock's shared
+    // Direct2D device, then reused by every drawer open — opening the drawer uploads
+    // nothing for entries already in this cache.
     static BITMAP_CACHE: RefCell<HashMap<String, ID2D1Bitmap1>> = RefCell::new(HashMap::new());
     // Entry keys whose icon extraction failed (helper crash, timeout, or the
     // shell returned no icon). Skipped on later opens so a broken `.lnk` target
@@ -152,7 +157,65 @@ struct Entry {
     color: (f32, f32, f32), // fallback tile color
 }
 
+struct LaunchTarget {
+    path: Option<String>,
+    pidl: Option<Pidl>,
+    key: String,
+}
+
+impl Entry {
+    fn launch_target(&self) -> LaunchTarget {
+        LaunchTarget {
+            path: self.path.clone(),
+            pidl: self.pidl.as_ref().and_then(Pidl::try_clone),
+            key: self.key.clone(),
+        }
+    }
+}
+
+enum DrawerAction {
+    None,
+    Rename(usize),
+    Launch(LaunchTarget),
+}
+
+/// Weak identity survives a nested message loop without keeping a destroyed
+/// Drawer alive. HWND reuse cannot resume an operation against another drawer.
+struct DrawerSession {
+    hwnd: HWND,
+    lifetime: Weak<()>,
+}
+
+impl DrawerSession {
+    fn identifies(&self, lifetime: &Rc<()>) -> bool {
+        Weak::ptr_eq(&self.lifetime, &Rc::downgrade(lifetime))
+    }
+
+    unsafe fn capture(hwnd: HWND) -> Option<Self> {
+        if PANEL_HWND.load(Ordering::Relaxed) != hwnd.0 as isize {
+            return None;
+        }
+        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Drawer;
+        ptr.as_ref().map(|panel| Self {
+            hwnd,
+            lifetime: Rc::downgrade(&panel.lifetime),
+        })
+    }
+
+    // Callers must end this borrow before a menu, input dialog or shell launch.
+    unsafe fn state(&mut self) -> Option<&mut Drawer> {
+        self.lifetime.upgrade()?;
+        if PANEL_HWND.load(Ordering::Relaxed) != self.hwnd.0 as isize {
+            return None;
+        }
+        let ptr = GetWindowLongPtrW(self.hwnd, GWLP_USERDATA) as *mut Drawer;
+        ptr.as_mut()
+            .filter(|panel| self.identifies(&panel.lifetime))
+    }
+}
+
 struct Drawer {
+    lifetime: Rc<()>,
     owner: HWND,
     material: SurfaceTheme,
     glass: Glass,
@@ -164,6 +227,12 @@ struct Drawer {
     glyph: IDWriteTextFormat,
     entries: Vec<Entry>,
     categories: Categories,
+    saved_categories: Categories,
+    notice: Option<String>,
+    query: String,
+    pending_high_surrogate: Option<u16>,
+    ime_composing: bool,
+    focused: Option<usize>,
     sections: Vec<Section>,
     layout: Layout,
     dpi: f32,
@@ -176,12 +245,16 @@ struct Drawer {
     hovered: i32, // hovered cell index (into layout.cells), -1 = none
     drag: Option<DragState>,
     editing: bool, // a rename/new-category popup is open → don't dismiss on deactivate
+    menu_open: bool,
     closing: bool,
+    desktop_refresh_pending: bool,
+    reduced_motion: bool,
     anim_start: Instant,
     motion_from: PanelMotion,
     cascade_suppressed: bool,
     pending_icons: Vec<usize>, // entry indices still waiting for a GPU bitmap
-    extracting: bool,          // a background icon-extraction batch is in flight
+    icon_results: Option<std::sync::mpsc::Receiver<Vec<(String, PathBuf)>>>,
+    extracting: bool,             // a background icon-extraction batch is in flight
     extraction_keys: Vec<String>, // keys sent to the background batch (failed ones are skipped later)
 }
 
@@ -360,9 +433,9 @@ fn metrics(width: f32, dpi: f32) -> drawer_layout::Metrics {
     let s = |v: f32| v * dpi;
     drawer_layout::Metrics {
         width,
-        cols: COLS,
+        cols: crate::geometry::columns(width, s(LPAD), s(CELL_W), s(GAP_X), COLS),
         lpad: s(LPAD),
-        cell_w: s(CELL_W),
+        cell_w: s(CELL_W).min((width - s(LPAD) * 2.0).max(1.0)),
         cell_h: s(CELL_H),
         gap_x: s(GAP_X),
         gap_y: s(GAP_Y),
@@ -376,13 +449,86 @@ fn to_d2d(r: drawer_layout::Rect) -> D2D_RECT_F {
     rect(r.left, r.top, r.right, r.bottom)
 }
 
+fn focused_cell_key<'a>(
+    entry_keys: &'a [String],
+    cells: &[drawer_layout::Cell],
+    focused: Option<usize>,
+) -> Option<&'a str> {
+    let entry = cells.get(focused?)?.entry;
+    entry_keys.get(entry).map(String::as_str)
+}
+
+fn focused_cell_for_key(
+    entry_keys: &[String],
+    cells: &[drawer_layout::Cell],
+    focused_key: Option<&str>,
+) -> Option<usize> {
+    let focused_key = focused_key?;
+    cells.iter().position(|cell| {
+        entry_keys
+            .get(cell.entry)
+            .is_some_and(|key| key.as_str() == focused_key)
+    })
+}
+
+const MAX_QUERY_CHARS: usize = 128;
+
+fn append_query_char(query: &mut String, ch: char) -> bool {
+    if query.chars().count() >= MAX_QUERY_CHARS {
+        return false;
+    }
+    query.push(ch);
+    true
+}
+
+fn push_query_utf16(query: &mut String, pending_high: &mut Option<u16>, unit: u16) -> bool {
+    match unit {
+        0xD800..=0xDBFF => {
+            let previous = pending_high.replace(unit);
+            if previous.is_some() {
+                append_query_char(query, '\u{FFFD}')
+            } else {
+                false
+            }
+        }
+        0xDC00..=0xDFFF => {
+            if let Some(high) = pending_high.take() {
+                let code = 0x10000 + (((high as u32 - 0xD800) << 10) | (unit as u32 - 0xDC00));
+                append_query_char(query, char::from_u32(code).unwrap_or('\u{FFFD}'))
+            } else {
+                append_query_char(query, '\u{FFFD}')
+            }
+        }
+        _ => {
+            let mut changed = false;
+            if pending_high.take().is_some() {
+                changed |= append_query_char(query, '\u{FFFD}');
+            }
+            changed |= append_query_char(query, char::from_u32(unit as u32).unwrap_or('\u{FFFD}'));
+            changed
+        }
+    }
+}
+
+fn ime_owns_key(composing: bool, key: u32) -> bool {
+    composing && matches!(key, 0x08 | 0x0d | 0x1b | 0x25..=0x28)
+}
+
 impl Drawer {
     fn grid_top(&self) -> f32 {
         HEADER_H * self.dpi
     }
 
     fn motion_at(&self, elapsed: f32) -> PanelMotion {
-        transition_from(self.motion_from, self.closing, elapsed)
+        if self.reduced_motion {
+            if self.closing {
+                PanelMotion::HIDDEN
+            } else {
+                PanelMotion::VISIBLE
+            }
+        } else {
+            transition_from(self.motion_from, self.closing, elapsed)
+        }
     }
 
     fn motion(&self) -> PanelMotion {
@@ -398,7 +544,7 @@ impl Drawer {
     /// whole drawer — section headers, tiles and the add button — assembles as a single
     /// top-to-bottom wave. Closing and reopened panels keep the content assembled.
     fn row_progress(&self, elapsed: f32, content_top: f32) -> f32 {
-        if self.closing || self.cascade_suppressed {
+        if self.reduced_motion || self.closing || self.cascade_suppressed {
             return 1.0;
         }
         let frac = ((content_top - self.scroll) / self.viewport_h.max(1.0)).clamp(0.0, 1.0);
@@ -408,11 +554,26 @@ impl Drawer {
     }
 
     /// Recompute the sections + geometry from the current entries and categories,
-    /// keeping the scroll position valid. Call after any edit (drag, add, rename…).
+    /// keeping the scroll position and the focused entry's stable key valid.
     fn relayout(&mut self) {
         let keys: Vec<String> = self.entries.iter().map(|e| e.key.clone()).collect();
+        let focused_key =
+            focused_cell_key(&keys, &self.layout.cells, self.focused).map(str::to_owned);
+        self.relayout_with_focus(keys, focused_key);
+    }
+
+    fn relayout_with_focus(&mut self, keys: Vec<String>, focused_key: Option<String>) {
         self.sections = drawer_layout::sectionize(&keys, &self.categories);
+        if !self.query.is_empty() {
+            for section in &mut self.sections {
+                section.entries.retain(|index| {
+                    crate::search::matches(&self.entries[*index].label, "", &self.query)
+                });
+            }
+            self.sections.retain(|section| !section.entries.is_empty());
+        }
         self.layout = drawer_layout::compute(&self.sections, &metrics(self.width, self.dpi));
+        self.focused = focused_cell_for_key(&keys, &self.layout.cells, focused_key.as_deref());
         self.max_scroll = (self.layout.content_h - self.viewport_h).max(0.0);
         self.scroll = self.scroll.clamp(0.0, self.max_scroll);
     }
@@ -504,7 +665,7 @@ fn header_action_rects(header: D2D_RECT_F, dpi: f32) -> (D2D_RECT_F, D2D_RECT_F)
 /// Build the drawer's entries from the cached desktop-program scan, attaching a fallback
 /// glyph/color for entries whose real icon cannot be extracted.
 unsafe fn build_entries(categories: &Categories) -> Vec<Entry> {
-    let mut entries: Vec<Entry> = desktop_scan::scan_programs_cached()
+    let mut entries: Vec<Entry> = desktop_scan::snapshot()
         .into_iter()
         .filter(|d| !categories.is_hidden(&d.key))
         .map(|d| {
@@ -521,6 +682,16 @@ unsafe fn build_entries(categories: &Categories) -> Vec<Entry> {
             }
         })
         .collect();
+    BITMAP_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .retain(|key, _| entries.iter().any(|entry| &entry.key == key))
+    });
+    PRELOADED_ICONS.with(|cache| {
+        cache
+            .borrow_mut()
+            .retain(|key, _| entries.iter().any(|entry| &entry.key == key))
+    });
     attach_preloaded_icons(&mut entries);
     entries
 }
@@ -532,37 +703,6 @@ fn attach_preloaded_icons(entries: &mut [Entry]) {
             entry.preloaded_icon = cache.get(&entry.key).cloned();
         }
     });
-}
-
-/// Batch-extract icons for every path entry that lacks a cached BMP — in a helper
-/// process, so a crashing third-party shell extension can never take the dock down.
-/// Virtual (PIDL) entries get no icon at all; the drawer falls back to a glyph tile.
-/// Synchronous: used at startup by `warm_cache`, before any window exists. The
-/// interactive open path instead extracts in the background (see `schedule_icon_load`).
-unsafe fn preload_missing_icons(entries: &mut [Entry]) {
-    let jobs = missing_extraction_jobs(entries);
-    if jobs.is_empty() {
-        return;
-    }
-    let results = crate::drawer_icons::extract(&jobs);
-    mark_failed_jobs(
-        &jobs.iter().map(|(key, _)| key.clone()).collect::<Vec<_>>(),
-        &results,
-    );
-    if results.is_empty() {
-        return;
-    }
-    PRELOADED_ICONS.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        for (key, png) in &results {
-            cache.insert(key.clone(), png.clone());
-        }
-    });
-    for entry in entries.iter_mut() {
-        if let Some((_, png)) = results.iter().find(|(k, _)| *k == entry.key) {
-            entry.preloaded_icon = Some(png.clone());
-        }
-    }
 }
 
 /// The `(key, path)` jobs for entries that still need an icon extracted — skipping
@@ -577,8 +717,11 @@ fn missing_extraction_jobs(entries: &[Entry]) -> Vec<(String, String)> {
             }
             entry
                 .path
-                .as_deref()
-                .map(|path| (entry.key.clone(), path.to_string()))
+                .clone()
+                .or_else(|| {
+                    crate::desktop_scan::virtual_icon_source(&entry.key).map(str::to_string)
+                })
+                .map(|source| (entry.key.clone(), source))
         })
         .filter(|(key, _)| !failed.contains(key))
         .collect()
@@ -596,38 +739,6 @@ fn mark_failed_jobs(job_keys: &[String], results: &[(String, PathBuf)]) {
     }
 }
 
-/// Warm the drawer's shell scan + icon extraction during dock startup, before the
-/// user opens it. Icon extraction runs out-of-process (`drawer_icons`), so a shell
-/// extension fault here only costs the icons, never the dock.
-///
-/// `dc` is the dock's Direct2D context (on the shared device): every cached BMP is
-/// ALSO decoded into `BITMAP_CACHE` right here, so the first drawer open reuses
-/// ready-made GPU bitmaps and uploads nothing.
-pub unsafe fn warm_cache(dc: &ID2D1DeviceContext) {
-    let categories = categories::load();
-    let mut entries = build_entries(&categories);
-    preload_missing_icons(&mut entries);
-    decode_into_cache(dc, &entries);
-}
-
-/// Decode every entry's cached BMP into `BITMAP_CACHE` (idempotent; existing keys
-/// are kept). Runs at startup and after a GPU reset, never on the drawer open path.
-unsafe fn decode_into_cache(dc: &ID2D1DeviceContext, entries: &[Entry]) {
-    for entry in entries {
-        let Some(bmp) = entry.preloaded_icon.as_deref() else {
-            continue;
-        };
-        let key = entry.key.clone();
-        let cached = BITMAP_CACHE.with(|c| c.borrow().contains_key(&key));
-        if cached {
-            continue;
-        }
-        if let Some(icon) = crate::drawer_icons::load_icon_bitmap(dc, bmp) {
-            BITMAP_CACHE.with(|c| c.borrow_mut().insert(key, icon));
-        }
-    }
-}
-
 /// The entry's GPU bitmap from the shared-device cache, if one was decoded earlier.
 /// Cloning a COM interface is an AddRef — the drawer and the cache share it.
 fn cached_icon(key: &str) -> Option<ID2D1Bitmap1> {
@@ -640,13 +751,41 @@ pub fn invalidate_icon_cache() {
     BITMAP_CACHE.with(|c| c.borrow_mut().clear());
 }
 
-/// Re-decode the cached BMPs onto a (fresh) device, after a GPU reset. Uses the
-/// fast cached desktop scan and never re-extracts — missing icons fall back to
-/// the batched background path on the next drawer open.
-pub unsafe fn reload_icon_cache(dc: &ID2D1DeviceContext) {
-    let categories = categories::load();
-    let entries = build_entries(&categories);
-    decode_into_cache(dc, &entries);
+fn take_desktop_refresh_pending(
+    pending: &mut bool,
+    editing: bool,
+    menu_open: bool,
+    dragging: bool,
+    closing: bool,
+) -> bool {
+    if !*pending || editing || menu_open || dragging || closing {
+        return false;
+    }
+    *pending = false;
+    true
+}
+
+unsafe fn apply_pending_desktop_refresh(hwnd: HWND, panel: &mut Drawer) {
+    if take_desktop_refresh_pending(
+        &mut panel.desktop_refresh_pending,
+        panel.editing,
+        panel.menu_open,
+        panel.drag.is_some(),
+        panel.closing,
+    ) {
+        reload_entries(hwnd, panel, false);
+    }
+}
+
+pub unsafe fn desktop_ready() {
+    let hwnd = HWND(PANEL_HWND.load(Ordering::Relaxed) as *mut core::ffi::c_void);
+    if IsWindow(hwnd).as_bool() {
+        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Drawer;
+        if !ptr.is_null() {
+            (*ptr).desktop_refresh_pending = true;
+            apply_pending_desktop_refresh(hwnd, &mut *ptr);
+        }
+    }
 }
 
 /// Decode one small batch of pending cached BMPs into GPU bitmaps. The drawer is
@@ -677,10 +816,9 @@ unsafe fn decode_pending_batch(
 
 /// Start loading icons without blocking the open:
 ///
-/// * Entries that already have a cached BMP (the common case — `warm_cache` filled
-///   them at startup) are queued for batched decode on a short timer, so the first
-///   frame is cheap and icons pop in over a few ticks instead of stalling the
-///   `ShowWindow`.
+/// * Entries that already have a cached BMP are queued for batched decode on a short
+///   timer, so the first frame is cheap and icons pop in over a few ticks instead of
+///   stalling the `ShowWindow`.
 /// * Entries with no cached BMP yet are extracted in a background helper process;
 ///   when its results arrive (`WM_APP_ICONS_READY`) they join the same decode
 ///   queue. A hung/crashed helper costs icons, never the open.
@@ -697,34 +835,44 @@ unsafe fn schedule_icon_load(hwnd: HWND, panel: &mut Drawer) {
     }
     panel.extracting = true;
     panel.extraction_keys = jobs.iter().map(|(key, _)| key.clone()).collect();
+    let (send, receive) = std::sync::mpsc::channel();
+    panel.icon_results = Some(receive);
     let owner = hwnd.0 as isize;
     std::thread::spawn(move || {
-        // `extract` never panics and caps its wait, so the thread always posts
-        // (or frees its payload if the drawer window is already gone).
         let results = crate::drawer_icons::extract(&jobs);
-        let payload = Box::into_raw(Box::new(results));
-        let ok = unsafe {
-            PostMessageW(
-                HWND(owner as *mut c_void),
-                WM_APP_ICONS_READY,
-                WPARAM(0),
-                LPARAM(payload as isize),
-            )
-        }
-        .is_ok();
-        if !ok {
-            drop(unsafe { Box::from_raw(payload) });
+        if send.send(results).is_ok() {
+            unsafe {
+                let _ = PostMessageW(
+                    HWND(owner as *mut c_void),
+                    WM_APP_ICONS_READY,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
         }
     });
 }
 
 unsafe fn reload_entries(hwnd: HWND, panel: &mut Drawer, refresh_scan: bool) {
     if refresh_scan {
-        desktop_scan::invalidate_cache();
+        desktop_scan::refresh_async(panel.owner, true);
         // A fresh scan deserves fresh icon attempts.
         FAILED_EXTRACT.with(|set| set.borrow_mut().clear());
     }
+    let old_keys: Vec<String> = panel
+        .entries
+        .iter()
+        .map(|entry| entry.key.clone())
+        .collect();
+    let focused_key =
+        focused_cell_key(&old_keys, &panel.layout.cells, panel.focused).map(str::to_owned);
     panel.entries = build_entries(&panel.categories);
+    let keys: Vec<String> = panel
+        .entries
+        .iter()
+        .map(|entry| entry.key.clone())
+        .collect();
+    panel.desktop_refresh_pending = false;
     // Re-seed the decode queue with whatever icons are already cached on disk.
     panel.pending_icons = panel
         .entries
@@ -733,11 +881,13 @@ unsafe fn reload_entries(hwnd: HWND, panel: &mut Drawer, refresh_scan: bool) {
         .filter(|(_, entry)| entry.preloaded_icon.is_some())
         .map(|(i, _)| i)
         .collect();
-    panel.extraction_keys.clear();
-    panel.extracting = false;
+    panel.pending_icons.reverse();
+    if !panel.extracting {
+        panel.extraction_keys.clear();
+    }
     panel.hovered = -1;
     panel.drag = None;
-    panel.relayout();
+    panel.relayout_with_focus(keys, focused_key);
     render(panel);
     schedule_icon_load(hwnd, panel);
 }
@@ -948,11 +1098,14 @@ unsafe fn render(panel: &Drawer) {
     );
 
     // --- header title ---
-    let header = rect(s(LPAD), s(8.0), panel.width - s(LPAD), panel.grid_top());
+    let header = rect(s(LPAD), s(8.0), panel.width - s(LPAD), s(31.0));
     let title = if panel.entries.is_empty() {
         "桌面".to_string()
     } else {
-        format!("桌面 · {} 个程序", panel.entries.len())
+        panel
+            .notice
+            .clone()
+            .unwrap_or_else(|| format!("桌面 · {} 个程序", panel.entries.len()))
     };
     draw_text(
         dc,
@@ -964,6 +1117,33 @@ unsafe fn render(panel: &Drawer) {
         false,
     );
 
+    let query_rect = rect(s(LPAD), s(34.0), panel.width - s(LPAD), s(61.0));
+    let search_text = if panel.query.is_empty() {
+        "搜索应用，支持拼音 / 首字母"
+    } else {
+        &panel.query
+    };
+    panel.brush.SetColor(&material_color(
+        panel.material.hover_rgb,
+        panel.material.hover_alpha * a,
+    ));
+    dc.FillRoundedRectangle(
+        &D2D1_ROUNDED_RECT {
+            rect: query_rect,
+            radiusX: s(8.0),
+            radiusY: s(8.0),
+        },
+        &panel.brush,
+    );
+    draw_text(
+        dc,
+        &panel.brush,
+        search_text,
+        &panel.section,
+        query_rect,
+        material_color(panel.material.muted_rgb, a),
+        false,
+    );
     if panel.entries.is_empty() {
         let empty = rect(
             s(LPAD),
@@ -981,7 +1161,16 @@ unsafe fn render(panel: &Drawer) {
             false,
         );
         dc.SetTransform(&Matrix3x2::identity());
-        let _ = panel.glass.present();
+        if let Err(error) = panel.glass.present() {
+            let source = HWND(PANEL_HWND.load(Ordering::Relaxed) as *mut c_void);
+            crate::glass::report_present_error(
+                panel.owner,
+                source,
+                "应用抽屉 GPU 呈现失败",
+                error,
+                &RENDER_ERROR_POSTED,
+            );
+        }
         return;
     }
 
@@ -1092,7 +1281,8 @@ unsafe fn render(panel: &Drawer) {
             .drag
             .as_ref()
             .is_some_and(|d| d.active && d.entry == cell.entry);
-        let hovered = panel.hovered == i as i32 && panel.drag.is_none();
+        let hovered =
+            (panel.hovered == i as i32 || panel.focused == Some(i)) && panel.drag.is_none();
         let cell_p = panel.row_progress(elapsed, cell.rect.top);
         draw_cell(
             panel,
@@ -1195,7 +1385,16 @@ unsafe fn render(panel: &Drawer) {
     }
 
     dc.SetTransform(&Matrix3x2::identity());
-    let _ = panel.glass.present();
+    if let Err(error) = panel.glass.present() {
+        let source = HWND(PANEL_HWND.load(Ordering::Relaxed) as *mut c_void);
+        crate::glass::report_present_error(
+            panel.owner,
+            source,
+            "应用抽屉 GPU 呈现失败",
+            error,
+            &RENDER_ERROR_POSTED,
+        );
+    }
 }
 
 unsafe fn wake_owner(panel: &Drawer) {
@@ -1230,7 +1429,11 @@ unsafe fn start_close(_hwnd: HWND, panel: &mut Drawer) {
     panel.hovered = -1;
     panel.drag = None;
     let _ = ReleaseCapture();
-    panel.anim_start = Instant::now();
+    panel.anim_start = if panel.reduced_motion {
+        Instant::now() - std::time::Duration::from_secs(1)
+    } else {
+        Instant::now()
+    };
     render(panel);
     wake_owner(panel);
 }
@@ -1241,7 +1444,12 @@ unsafe fn reopen(hwnd: HWND, panel: &mut Drawer) {
     }
     panel.motion_from = panel.motion();
     panel.closing = false;
-    panel.anim_start = Instant::now();
+    panel.anim_start = if panel.reduced_motion {
+        Instant::now() - std::time::Duration::from_secs(1)
+    } else {
+        Instant::now()
+    };
+    apply_pending_desktop_refresh(hwnd, panel);
     render(panel);
     let _ = SetForegroundWindow(hwnd);
     wake_owner(panel);
@@ -1291,7 +1499,7 @@ unsafe fn on_move(panel: &mut Drawer, x: f32, y: f32) {
     if let Some(drag) = panel.drag.as_mut() {
         drag.cur_x = x;
         drag.cur_y = y;
-        if !drag.active {
+        if !drag.active && panel.query.is_empty() {
             let (dx, dy) = (x - drag.start_x, y - drag.start_y);
             if (dx * dx + dy * dy).sqrt() > DRAG_THRESHOLD * panel.dpi {
                 drag.active = true;
@@ -1315,13 +1523,33 @@ unsafe fn on_move(panel: &mut Drawer, x: f32, y: f32) {
 }
 
 /// Create a new category (a generic name) and immediately open its rename prompt.
-unsafe fn add_category(hwnd: HWND, panel: &mut Drawer) {
+unsafe fn persist_categories(panel: &mut Drawer) -> bool {
+    match categories::save(&panel.categories) {
+        Ok(()) => {
+            panel.saved_categories = panel.categories.clone();
+            panel.notice = None;
+            true
+        }
+        Err(error) => {
+            panel.categories = panel.saved_categories.clone();
+            panel.notice = Some("保存失败，已恢复上次分类".into());
+            crate::error_log::write("保存抽屉分类失败", &error);
+            false
+        }
+    }
+}
+
+unsafe fn add_category(panel: &mut Drawer) -> DrawerAction {
     let n = panel.categories.categories.len() + 1;
     let idx = panel.categories.add(&format!("新分类 {n}"));
-    let _ = categories::save(&panel.categories);
+    if !persist_categories(panel) {
+        panel.relayout();
+        render(panel);
+        return DrawerAction::None;
+    }
     panel.relayout();
     render(panel);
-    begin_rename(hwnd, idx);
+    DrawerAction::Rename(idx)
 }
 
 unsafe fn append_menu_item(menu: HMENU, id: usize, text: &str, enabled: bool) {
@@ -1378,11 +1606,25 @@ unsafe fn hide_entry(panel: &mut Drawer, entry: usize) {
     };
     let key = item.key.clone();
     panel.categories.hide_item(&key);
-    if let Err(error) = categories::save(&panel.categories) {
-        crate::error_log::write("保存抽屉隐藏项失败", &error);
+    if !persist_categories(panel) {
+        panel.relayout();
+        render(panel);
+        return;
     }
+    let old_keys: Vec<String> = panel
+        .entries
+        .iter()
+        .map(|entry| entry.key.clone())
+        .collect();
+    let focused_key =
+        focused_cell_key(&old_keys, &panel.layout.cells, panel.focused).map(str::to_owned);
     panel.entries.remove(entry);
-    panel.relayout();
+    let keys: Vec<String> = panel
+        .entries
+        .iter()
+        .map(|entry| entry.key.clone())
+        .collect();
+    panel.relayout_with_focus(keys, focused_key);
     render(panel);
 }
 
@@ -1392,69 +1634,88 @@ unsafe fn move_entry_to_category(panel: &mut Drawer, entry: usize, target: Optio
     };
     let key = item.key.clone();
     panel.categories.move_item(&key, target, usize::MAX);
-    if let Err(error) = categories::save(&panel.categories) {
-        crate::error_log::write("保存抽屉分类失败", &error);
+    if !persist_categories(panel) {
+        panel.relayout();
+        render(panel);
+        return;
     }
     panel.relayout();
     render(panel);
 }
 
-unsafe fn move_entry_to_new_category(hwnd: HWND, panel: &mut Drawer, entry: usize) {
+unsafe fn move_entry_to_new_category(panel: &mut Drawer, entry: usize) -> DrawerAction {
     let Some(item) = panel.entries.get(entry) else {
-        return;
+        return DrawerAction::None;
     };
     let key = item.key.clone();
     let n = panel.categories.categories.len() + 1;
     let idx = panel.categories.add(&format!("新分类 {n}"));
     panel.categories.move_item(&key, Some(idx), 0);
-    if let Err(error) = categories::save(&panel.categories) {
-        crate::error_log::write("保存抽屉新分类失败", &error);
+    if !persist_categories(panel) {
+        panel.relayout();
+        render(panel);
+        return DrawerAction::None;
     }
     panel.relayout();
     render(panel);
-    begin_rename(hwnd, idx);
+    DrawerAction::Rename(idx)
 }
 
-unsafe fn show_entry_menu(hwnd: HWND, panel: &mut Drawer, entry: usize) {
-    let Some(item) = panel.entries.get(entry) else {
-        return;
-    };
-    let can_pin_path = item.path.as_deref();
-    let already_pinned = can_pin_path.is_some_and(path_is_pinned);
-    let Ok(menu) = CreatePopupMenu() else {
-        return;
-    };
-    append_menu_item(menu, ID_CTX_OPEN, "打开", true);
-    append_menu_item(
-        menu,
-        ID_CTX_PIN,
-        if already_pinned {
-            "已固定到 Dock"
-        } else {
-            "固定到 Dock"
-        },
-        can_pin_path.is_some() && !already_pinned,
-    );
-    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-    append_menu_item(menu, ID_CTX_HIDE, "移除该程序", true);
+fn entry_index_for_key(entries: &[Entry], key: &str) -> Option<usize> {
+    entries.iter().position(|entry| entry.key == key)
+}
 
-    if let Ok(cat_menu) = CreatePopupMenu() {
-        append_menu_item(cat_menu, ID_CTX_UNCATEGORIZED, "未分类", true);
-        if !panel.categories.categories.is_empty() {
+unsafe fn show_entry_menu(session: &mut DrawerSession, entry_key: &str) {
+    let hwnd = session.hwnd;
+    let (menu, owner) = {
+        let Some(panel) = session.state().filter(|panel| !panel.closing) else {
+            return;
+        };
+        let Some(entry) = entry_index_for_key(&panel.entries, entry_key) else {
+            return;
+        };
+        let Some(item) = panel.entries.get(entry) else {
+            return;
+        };
+        let can_pin_path = item.path.as_deref();
+        let already_pinned = can_pin_path.is_some_and(path_is_pinned);
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
+        };
+        append_menu_item(menu, ID_CTX_OPEN, "打开", true);
+        append_menu_item(
+            menu,
+            ID_CTX_PIN,
+            if already_pinned {
+                "已固定到 Dock"
+            } else {
+                "固定到 Dock"
+            },
+            can_pin_path.is_some() && !already_pinned,
+        );
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        append_menu_item(menu, ID_CTX_HIDE, "移除该程序", true);
+
+        if let Ok(cat_menu) = CreatePopupMenu() {
+            append_menu_item(cat_menu, ID_CTX_UNCATEGORIZED, "未分类", true);
+            if !panel.categories.categories.is_empty() {
+                let _ = AppendMenuW(cat_menu, MF_SEPARATOR, 0, PCWSTR::null());
+            }
+            for (ci, cat) in panel.categories.categories.iter().enumerate() {
+                append_menu_item(cat_menu, ID_CTX_CATEGORY_BASE + ci, &cat.name, true);
+            }
             let _ = AppendMenuW(cat_menu, MF_SEPARATOR, 0, PCWSTR::null());
+            append_menu_item(cat_menu, ID_CTX_NEW_CATEGORY, "新建分类...", true);
+            append_submenu(menu, cat_menu, "放入分类");
         }
-        for (ci, cat) in panel.categories.categories.iter().enumerate() {
-            append_menu_item(cat_menu, ID_CTX_CATEGORY_BASE + ci, &cat.name, true);
-        }
-        let _ = AppendMenuW(cat_menu, MF_SEPARATOR, 0, PCWSTR::null());
-        append_menu_item(cat_menu, ID_CTX_NEW_CATEGORY, "新建分类...", true);
-        append_submenu(menu, cat_menu, "放入分类");
-    }
+        panel.menu_open = true;
+        (menu, panel.owner)
+    };
 
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     let _ = SetForegroundWindow(hwnd);
-    let menu_style = crate::menu_style::style(menu, crate::dock_theme(panel.owner), hwnd);
+    let menu_style = crate::menu_style::style(menu, crate::dock_theme(owner), hwnd);
     let cmd = TrackPopupMenu(
         menu,
         TPM_RIGHTBUTTON | TPM_RETURNCMD,
@@ -1467,48 +1728,69 @@ unsafe fn show_entry_menu(hwnd: HWND, panel: &mut Drawer, entry: usize) {
     drop(menu_style);
     let _ = DestroyMenu(menu);
 
-    match cmd.0 as usize {
-        ID_CTX_OPEN => {
-            if let Some(item) = panel.entries.get(entry) {
-                desktop_scan::launch(
-                    item.path.as_deref(),
-                    item.pidl.as_ref().map(|p| p.as_ptr()),
-                    Some(&item.key),
-                );
-                start_close(hwnd, panel);
-            }
+    let action = {
+        let Some(panel) = session.state() else { return };
+        panel.menu_open = false;
+        if panel.closing {
+            return;
         }
-        ID_CTX_PIN => pin_entry_to_dock(panel, entry),
-        ID_CTX_HIDE => hide_entry(panel, entry),
-        ID_CTX_UNCATEGORIZED => move_entry_to_category(panel, entry, None),
-        ID_CTX_NEW_CATEGORY => move_entry_to_new_category(hwnd, panel, entry),
-        id if id >= ID_CTX_CATEGORY_BASE => {
-            let category = id - ID_CTX_CATEGORY_BASE;
-            if category < panel.categories.categories.len() {
-                move_entry_to_category(panel, entry, Some(category));
+        let Some(entry) = entry_index_for_key(&panel.entries, entry_key) else {
+            apply_pending_desktop_refresh(hwnd, panel);
+            return;
+        };
+        match cmd.0 as usize {
+            ID_CTX_OPEN => DrawerAction::Launch(panel.entries[entry].launch_target()),
+            ID_CTX_PIN => {
+                pin_entry_to_dock(panel, entry);
+                DrawerAction::None
             }
+            ID_CTX_HIDE => {
+                hide_entry(panel, entry);
+                DrawerAction::None
+            }
+            ID_CTX_UNCATEGORIZED => {
+                move_entry_to_category(panel, entry, None);
+                DrawerAction::None
+            }
+            ID_CTX_NEW_CATEGORY => move_entry_to_new_category(panel, entry),
+            id if id >= ID_CTX_CATEGORY_BASE => {
+                let category = id - ID_CTX_CATEGORY_BASE;
+                if category < panel.categories.categories.len() {
+                    move_entry_to_category(panel, entry, Some(category));
+                }
+                DrawerAction::None
+            }
+            _ => DrawerAction::None,
         }
-        _ => {}
-    }
+    };
+    dispatch_action(session, action);
 }
 
-unsafe fn show_background_menu(hwnd: HWND, panel: &mut Drawer) {
-    let Ok(menu) = CreatePopupMenu() else {
-        return;
+unsafe fn show_background_menu(session: &mut DrawerSession) {
+    let hwnd = session.hwnd;
+    let (menu, owner) = {
+        let Some(panel) = session.state().filter(|panel| !panel.closing) else {
+            return;
+        };
+        let Ok(menu) = CreatePopupMenu() else {
+            return;
+        };
+        append_menu_item(menu, ID_CTX_NEW_CATEGORY, "新建分类", true);
+        append_menu_item(
+            menu,
+            ID_CTX_RESTORE,
+            "恢复已移除项目",
+            !panel.categories.hidden.is_empty(),
+        );
+        append_menu_item(menu, ID_CTX_REFRESH, "刷新程序列表", true);
+        panel.menu_open = true;
+        (menu, panel.owner)
     };
-    append_menu_item(menu, ID_CTX_NEW_CATEGORY, "新建分类", true);
-    append_menu_item(
-        menu,
-        ID_CTX_RESTORE,
-        "恢复已移除项目",
-        !panel.categories.hidden.is_empty(),
-    );
-    append_menu_item(menu, ID_CTX_REFRESH, "刷新程序列表", true);
 
     let mut pt = POINT::default();
     let _ = GetCursorPos(&mut pt);
     let _ = SetForegroundWindow(hwnd);
-    let menu_style = crate::menu_style::style(menu, crate::dock_theme(panel.owner), hwnd);
+    let menu_style = crate::menu_style::style(menu, crate::dock_theme(owner), hwnd);
     let cmd = TrackPopupMenu(
         menu,
         TPM_RIGHTBUTTON | TPM_RETURNCMD,
@@ -1521,18 +1803,32 @@ unsafe fn show_background_menu(hwnd: HWND, panel: &mut Drawer) {
     drop(menu_style);
     let _ = DestroyMenu(menu);
 
-    match cmd.0 as usize {
-        ID_CTX_NEW_CATEGORY => add_category(hwnd, panel),
-        ID_CTX_RESTORE => {
-            panel.categories.restore_hidden();
-            if let Err(error) = categories::save(&panel.categories) {
-                crate::error_log::write("恢复抽屉隐藏项失败", &error);
-            }
-            reload_entries(hwnd, panel, false);
+    let action = {
+        let Some(panel) = session.state() else { return };
+        panel.menu_open = false;
+        if panel.closing {
+            return;
         }
-        ID_CTX_REFRESH => reload_entries(hwnd, panel, true),
-        _ => {}
-    }
+        match cmd.0 as usize {
+            ID_CTX_NEW_CATEGORY => add_category(panel),
+            ID_CTX_RESTORE => {
+                panel.categories.restore_hidden();
+                if !persist_categories(panel) {
+                    panel.relayout();
+                    render(panel);
+                } else {
+                    reload_entries(hwnd, panel, false);
+                }
+                DrawerAction::None
+            }
+            ID_CTX_REFRESH => {
+                reload_entries(hwnd, panel, true);
+                DrawerAction::None
+            }
+            _ => DrawerAction::None,
+        }
+    };
+    dispatch_action(session, action);
 }
 
 /// Commit a dropped tile into the section + slot under the cursor (None = uncategorized).
@@ -1556,58 +1852,91 @@ unsafe fn commit_drop(panel: &mut Drawer, entry: usize, x: f32, y: f32) {
         SectionKind::Uncategorized => None,
     };
     panel.categories.move_item(&key, target, index);
-    let _ = categories::save(&panel.categories);
+    if !persist_categories(panel) {
+        panel.relayout();
+        render(panel);
+        return;
+    }
     panel.relayout();
 }
 
 /// Delete a category; its members fall back to "未分类" (non-destructive).
 unsafe fn delete_category(panel: &mut Drawer, category: usize) {
     panel.categories.remove(category);
-    let _ = categories::save(&panel.categories);
+    if !persist_categories(panel) {
+        panel.relayout();
+        render(panel);
+        return;
+    }
     panel.relayout();
     render(panel);
 }
 
 /// Open the rename prompt for a category. The drawer is disabled (truly modal) and
-/// flagged `editing` so it won't dismiss itself while the popup has focus. Uses the raw
-/// window pointer so no `&mut Drawer` is held across the popup's nested message loop.
-unsafe fn begin_rename(hwnd: HWND, category: usize) {
-    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Drawer;
-    if ptr.is_null() {
-        return;
-    }
+/// flagged `editing` so it won't dismiss itself while the popup has focus. Only a
+/// weak session identity crosses the popup's nested message loop.
+unsafe fn begin_rename(session: &mut DrawerSession, category: usize) {
+    let hwnd = session.hwnd;
     // Short-lived borrow to read the current name + flag editing — released before the
     // popup's modal loop runs, so no `&mut Drawer` is held across it.
     let initial = {
-        let panel = &mut *ptr;
+        let Some(panel) = session.state().filter(|panel| !panel.closing) else {
+            return;
+        };
+        let Some(category) = panel.categories.categories.get(category) else {
+            return;
+        };
+        let initial = category.name.clone();
         panel.editing = true;
-        panel
-            .categories
-            .categories
-            .get(category)
-            .map(|c| c.name.clone())
-            .unwrap_or_default()
+        initial
     };
     let _ = EnableWindow(hwnd, false);
 
     let result = crate::drawer_input::prompt(hwnd, "分类名称", &initial);
 
-    let _ = EnableWindow(hwnd, true);
-    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Drawer;
-    if ptr.is_null() {
+    // The nested loop may have destroyed the owner or even reused its HWND.
+    if session.state().is_none() {
         return;
     }
-    let panel = &mut *ptr;
+    let _ = EnableWindow(hwnd, true);
+    let Some(panel) = session.state() else { return };
     panel.editing = false;
     if let Some(name) = result {
         if !name.is_empty() {
             panel.categories.rename(category, &name);
-            let _ = categories::save(&panel.categories);
+            let _ = persist_categories(panel);
             panel.relayout();
         }
     }
+    apply_pending_desktop_refresh(hwnd, panel);
     let _ = SetForegroundWindow(hwnd);
     render(panel);
+}
+
+/// Invoke modal/system code only after the originating Drawer borrow ended.
+/// Every continuation obtains the original live state again through the session.
+unsafe fn dispatch_action(session: &mut DrawerSession, action: DrawerAction) {
+    let hwnd = session.hwnd;
+    if session.state().is_none() {
+        return;
+    }
+    match action {
+        DrawerAction::None => {}
+        DrawerAction::Rename(category) => begin_rename(session, category),
+        DrawerAction::Launch(target) => {
+            desktop_scan::launch(
+                target.path.as_deref(),
+                target.pidl.as_ref().map(Pidl::as_ptr),
+                Some(&target.key),
+            );
+            if let Some(panel) = session.state() {
+                start_close(hwnd, panel);
+            }
+        }
+    }
+    if let Some(panel) = session.state() {
+        apply_pending_desktop_refresh(hwnd, panel);
+    }
 }
 
 unsafe fn handle_scroll(panel: &mut Drawer, delta: f32) {
@@ -1619,9 +1948,9 @@ unsafe fn handle_scroll(panel: &mut Drawer, delta: f32) {
     render(panel);
 }
 
-unsafe fn on_up(hwnd: HWND, panel: &mut Drawer, x: f32, y: f32) {
+unsafe fn on_up(hwnd: HWND, panel: &mut Drawer, x: f32, y: f32) -> DrawerAction {
     if panel.closing {
-        return;
+        return DrawerAction::None;
     }
     if let Some(drag) = panel.drag.take() {
         let _ = ReleaseCapture();
@@ -1631,34 +1960,29 @@ unsafe fn on_up(hwnd: HWND, panel: &mut Drawer, x: f32, y: f32) {
             render(panel);
         } else {
             // Never moved → a plain click: launch the tile and dismiss.
-            let entry = &panel.entries[drag.entry];
-            desktop_scan::launch(
-                entry.path.as_deref(),
-                entry.pidl.as_ref().map(|p| p.as_ptr()),
-                Some(&entry.key),
-            );
-            start_close(hwnd, panel);
+            return DrawerAction::Launch(panel.entries[drag.entry].launch_target());
         }
-        return;
-    }
-    let elapsed = panel.anim_start.elapsed().as_secs_f32();
-    let motion = panel.motion_at(elapsed);
-    // Not a tile press: category rename/delete controls, then the "new category" button.
-    if let Some((ci, action)) = panel.hit_header_action(x, y, motion, elapsed) {
-        match action {
-            HeaderAction::Delete => delete_category(panel, ci),
-            HeaderAction::Rename => begin_rename(hwnd, ci),
+    } else {
+        let elapsed = panel.anim_start.elapsed().as_secs_f32();
+        let motion = panel.motion_at(elapsed);
+        // Not a tile press: category rename/delete controls, then the "new category" button.
+        if let Some((ci, action)) = panel.hit_header_action(x, y, motion, elapsed) {
+            match action {
+                HeaderAction::Delete => delete_category(panel, ci),
+                HeaderAction::Rename => return DrawerAction::Rename(ci),
+            }
+        } else if panel.hit_add_button(x, y, motion, elapsed) {
+            return add_category(panel);
         }
-        return;
     }
-    if panel.hit_add_button(x, y, motion, elapsed) {
-        add_category(hwnd, panel);
-    }
+    apply_pending_desktop_refresh(hwnd, panel);
+    DrawerAction::None
 }
 
 /// Open the drawer anchored above the dock button, sized to fit the desktop programs
 /// and clamped to the work area above the dock (rows scroll if there are too many).
 unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
+    RENDER_ERROR_POSTED.store(false, Ordering::Relaxed);
     let instance: HINSTANCE = match GetModuleHandleW(None) {
         Ok(module) => module.into(),
         Err(_) => return,
@@ -1677,9 +2001,15 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
     let dpi = (GetDpiForWindow(dock_hwnd).max(96) as f32) / 96.0;
     let s = |v: f32| v * dpi;
 
+    desktop_scan::refresh_async(dock_hwnd, false);
     let categories = categories::load();
     let mut entries = build_entries(&categories);
-    let width = s(LPAD) * 2.0 + COLS as f32 * s(CELL_W) + (COLS as f32 - 1.0) * s(GAP_X);
+    let work = crate::geometry::work_area(anchor_cx, anchor_top);
+    let available = (work.right - work.left - (16.0 * dpi) as i32).max(1) as f32;
+    let cols = crate::geometry::columns(available, s(LPAD), s(CELL_W), s(GAP_X), COLS);
+    let width =
+        (s(LPAD) * 2.0 + cols as f32 * s(CELL_W) + cols.saturating_sub(1) as f32 * s(GAP_X))
+            .min(available);
 
     // Lay the categorized content out (pure geometry) to learn its full height.
     let keys: Vec<String> = entries.iter().map(|e| e.key.clone()).collect();
@@ -1708,18 +2038,19 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
     let avail_above = (anchor_top as f32 - work_top - margin - s(10.0)).max(s(120.0));
 
     let grid_top = s(HEADER_H);
-    let max_view = (avail_above - grid_top - s(BPAD)).max(s(120.0));
+    let available_height = (work.bottom - work.top - margin as i32 * 2).max(1) as f32;
+    let max_view = (avail_above.min(available_height) - grid_top - s(BPAD)).max(1.0);
     let viewport_h = content_h.min(max_view);
     let max_scroll = (content_h - viewport_h).max(0.0);
-    let height = grid_top + viewport_h + s(BPAD);
+    let height = (grid_top + viewport_h + s(BPAD)).min(available_height);
 
     // Place above the anchor, centered, clamped to the monitor work area.
     let mut x = anchor_cx - (width / 2.0) as i32;
     let mut y = anchor_top - height as i32 - s(10.0) as i32;
     if GetMonitorInfoW(monitor, &mut info).as_bool() {
         let m = margin as i32;
-        x = x.clamp(info.rcWork.left + m, info.rcWork.right - width as i32 - m);
-        y = y.max(info.rcWork.top + m);
+        x = crate::geometry::fit_axis(x, width as i32, info.rcWork.left, info.rcWork.right, m);
+        y = crate::geometry::fit_axis(y, height as i32, info.rcWork.top, info.rcWork.bottom, m);
     }
 
     // The dock button's centre expressed in the panel's own client space (device px). The
@@ -1769,9 +2100,9 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
         }
     };
 
-    // The drawer shares the dock's Direct2D device, so bitmaps decoded at startup
-    // (`warm_cache` → BITMAP_CACHE) are reused directly — nothing to upload. Only
-    // entries without a cached bitmap fall through to the batched decode timer.
+    // The drawer shares the dock's Direct2D device, so cached bitmaps are reused
+    // directly — nothing to upload. Only entries without a cached bitmap fall through
+    // to the batched decode timer.
     let mut pending_icons: Vec<usize> = Vec::new();
     for (i, entry) in entries.iter_mut().enumerate() {
         match cached_icon(&entry.key) {
@@ -1785,6 +2116,7 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
     }
 
     let panel = Box::into_raw(Box::new(Drawer {
+        lifetime: Rc::new(()),
         owner: dock_hwnd,
         material: crate::dock_theme(dock_hwnd).surface(),
         glass,
@@ -1795,7 +2127,13 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
         label,
         glyph,
         entries,
+        saved_categories: categories.clone(),
         categories,
+        notice: None,
+        query: String::new(),
+        pending_high_surrogate: None,
+        ime_composing: false,
+        focused: None,
         sections,
         layout,
         dpi,
@@ -1808,12 +2146,20 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
         hovered: -1,
         drag: None,
         editing: false,
+        menu_open: false,
         closing: false,
-        anim_start: Instant::now(),
+        desktop_refresh_pending: false,
+        reduced_motion: crate::dock_layout(dock_hwnd).reduce_motion,
+        anim_start: if crate::dock_layout(dock_hwnd).reduce_motion {
+            Instant::now() - std::time::Duration::from_secs(1)
+        } else {
+            Instant::now()
+        },
         motion_from: PanelMotion::HIDDEN,
         cascade_suppressed: false,
         pending_icons,
         extracting: false,
+        icon_results: None,
         extraction_keys: Vec::new(),
     }));
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, panel as isize);
@@ -1894,6 +2240,7 @@ pub unsafe fn hide() {
 /// Destroy the GPU popup synchronously before its owner's devices are dropped.
 /// Exit must not enqueue the normal close animation or another owner frame.
 pub unsafe fn shutdown() {
+    RENDER_ERROR_POSTED.store(false, Ordering::Relaxed);
     let raw = PANEL_HWND.swap(0, Ordering::Relaxed);
     if raw == 0 {
         return;
@@ -1951,7 +2298,21 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             return result;
         }
         let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Drawer;
+        if msg == WM_KEYDOWN
+            && !ptr.is_null()
+            && ime_owns_key((*ptr).ime_composing, wparam.0 as u32)
+        {
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
         match msg {
+            WM_IME_STARTCOMPOSITION if !ptr.is_null() => {
+                (*ptr).ime_composing = true;
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_IME_ENDCOMPOSITION if !ptr.is_null() => {
+                (*ptr).ime_composing = false;
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_LBUTTONDOWN if !ptr.is_null() => {
                 let x = (lparam.0 & 0xFFFF) as i16 as f32;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
@@ -1972,23 +2333,33 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_LBUTTONUP if !ptr.is_null() => {
                 let x = (lparam.0 & 0xFFFF) as i16 as f32;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
-                on_up(hwnd, &mut *ptr, x, y);
+                if let Some(mut session) = DrawerSession::capture(hwnd) {
+                    let action = on_up(hwnd, &mut *ptr, x, y);
+                    dispatch_action(&mut session, action);
+                }
                 LRESULT(0)
             }
             WM_RBUTTONUP if !ptr.is_null() => {
                 let x = (lparam.0 & 0xFFFF) as i16 as f32;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
-                let panel = &mut *ptr;
-                if panel.closing {
+                let Some(mut session) = DrawerSession::capture(hwnd) else {
                     return LRESULT(0);
-                }
-                let elapsed = panel.anim_start.elapsed().as_secs_f32();
-                let motion = panel.motion_at(elapsed);
-                if let Some(ci) = panel.hit_cell(x, y, motion, elapsed) {
-                    let entry = panel.layout.cells[ci].entry;
-                    show_entry_menu(hwnd, panel, entry);
+                };
+                let entry_key = {
+                    let panel = &*ptr;
+                    if panel.closing {
+                        return LRESULT(0);
+                    }
+                    let elapsed = panel.anim_start.elapsed().as_secs_f32();
+                    let motion = panel.motion_at(elapsed);
+                    panel
+                        .hit_cell(x, y, motion, elapsed)
+                        .map(|ci| panel.entries[panel.layout.cells[ci].entry].key.clone())
+                };
+                if let Some(key) = entry_key {
+                    show_entry_menu(&mut session, &key);
                 } else {
-                    show_background_menu(hwnd, panel);
+                    show_background_menu(&mut session);
                 }
                 LRESULT(0)
             }
@@ -2033,8 +2404,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 // The background extraction finished: merge its BMPs into the cache,
                 // queue the newly-covered entries for decode, and remember which
                 // keys failed so we don't re-extract them every open.
-                let results = Box::from_raw(lparam.0 as *mut Vec<(String, PathBuf)>);
                 let panel = &mut *ptr;
+                let Some(results) = panel
+                    .icon_results
+                    .as_ref()
+                    .and_then(|rx| rx.try_recv().ok())
+                else {
+                    return LRESULT(0);
+                };
+                panel.icon_results = None;
                 panel.extracting = false;
                 mark_failed_jobs(&panel.extraction_keys, &results);
                 panel.extraction_keys.clear();
@@ -2059,9 +2437,90 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     render(panel);
                     wake_owner(panel);
                 }
+                schedule_icon_load(hwnd, panel);
+                LRESULT(0)
+            }
+            WM_CHAR if !ptr.is_null() && wparam.0 >= 0x20 && wparam.0 != 0x7f => {
+                let panel = &mut *ptr;
+                if push_query_utf16(
+                    &mut panel.query,
+                    &mut panel.pending_high_surrogate,
+                    wparam.0 as u16,
+                ) {
+                    panel.scroll = 0.0;
+                    panel.relayout();
+                    render(panel);
+                }
+                LRESULT(0)
+            }
+            WM_KEYDOWN
+                if !ptr.is_null()
+                    && matches!(wparam.0 as u32, 0x08 | 0x09 | 0x0d | 0x25..=0x28) =>
+            {
+                if wparam.0 == 0x0d {
+                    let action = {
+                        let panel = &*ptr;
+                        panel
+                            .focused
+                            .and_then(|i| panel.layout.cells.get(i))
+                            .map(|cell| {
+                                DrawerAction::Launch(panel.entries[cell.entry].launch_target())
+                            })
+                            .unwrap_or(DrawerAction::None)
+                    };
+                    if let Some(mut session) = DrawerSession::capture(hwnd) {
+                        dispatch_action(&mut session, action);
+                    }
+                    return LRESULT(0);
+                }
+                let panel = &mut *ptr;
+                let key = wparam.0 as u32;
+                if key == 0x08 {
+                    if panel.pending_high_surrogate.take().is_none() {
+                        panel.query.pop();
+                    }
+                    panel.scroll = 0.0;
+                    panel.relayout();
+                    render(panel);
+                    return LRESULT(0);
+                }
+                let count = panel.layout.cells.len();
+                if count > 0 {
+                    let cols = metrics(panel.width, panel.dpi).cols;
+                    let current = panel.focused.unwrap_or(0);
+                    let index = if panel.focused.is_none() {
+                        0
+                    } else {
+                        match key {
+                            0x25 => current.saturating_sub(1),
+                            0x26 => current.saturating_sub(cols),
+                            0x28 => (current + cols).min(count - 1),
+                            _ => (current + 1).min(count - 1),
+                        }
+                    };
+                    panel.focused = Some(index);
+                    let cell = &panel.layout.cells[index];
+                    if cell.rect.top < panel.scroll {
+                        panel.scroll = cell.rect.top;
+                    }
+                    if cell.rect.bottom > panel.scroll + panel.viewport_h {
+                        panel.scroll = (cell.rect.bottom - panel.viewport_h).min(panel.max_scroll);
+                    }
+                    render(panel);
+                }
                 LRESULT(0)
             }
             WM_KEYDOWN if wparam.0 == VK_ESCAPE.0 as usize => {
+                if let Some(panel) = ptr.as_mut().filter(|panel| {
+                    !panel.query.is_empty() || panel.pending_high_surrogate.is_some()
+                }) {
+                    panel.query.clear();
+                    panel.pending_high_surrogate = None;
+                    panel.scroll = 0.0;
+                    panel.relayout();
+                    render(panel);
+                    return LRESULT(0);
+                }
                 // Esc cancels an in-flight drag; otherwise it closes the drawer.
                 if ptr.is_null() {
                     let _ = DestroyWindow(hwnd);
@@ -2070,6 +2529,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     if panel.drag.is_some() {
                         panel.drag = None;
                         let _ = ReleaseCapture();
+                        apply_pending_desktop_refresh(hwnd, panel);
                         render(panel);
                     } else {
                         start_close(hwnd, panel);
@@ -2091,6 +2551,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_NCDESTROY => {
+                RENDER_ERROR_POSTED.store(false, Ordering::Relaxed);
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 if !ptr.is_null() {
                     drop(Box::from_raw(ptr));
@@ -2105,11 +2566,201 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 #[cfg(test)]
 mod tests {
     use super::{
-        click_away_guard, content_point_from_client, fit_icon, in_rect, mul, panel_transform, rect,
-        reopen_closing_with_toggle, risen_rect, take_reopen_guard, transform_point,
-        transition_from, translate, PanelMotion, CLOSE_ANIM_SECS, D2D_SIZE_F, OPEN_ANIM_SECS,
-        REOPEN_GUARD_MS,
+        click_away_guard, content_point_from_client, fit_icon, focused_cell_for_key,
+        focused_cell_key, ime_owns_key, in_rect, mul, panel_transform, push_query_utf16, rect,
+        reopen_closing_with_toggle, risen_rect, take_desktop_refresh_pending, take_reopen_guard,
+        transform_point, transition_from, translate, PanelMotion, CLOSE_ANIM_SECS, D2D_SIZE_F,
+        MAX_QUERY_CHARS, OPEN_ANIM_SECS, REOPEN_GUARD_MS,
     };
+    use super::{entry_index_for_key, DrawerSession, Entry};
+    use std::rc::Rc;
+    use windows::Win32::Foundation::HWND;
+
+    fn cells(entries: &[usize]) -> Vec<crate::drawer_layout::Cell> {
+        entries
+            .iter()
+            .map(|&entry| crate::drawer_layout::Cell {
+                entry,
+                rect: crate::drawer_layout::Rect {
+                    left: 0.0,
+                    top: 0.0,
+                    right: 0.0,
+                    bottom: 0.0,
+                },
+            })
+            .collect()
+    }
+
+    #[test]
+    fn deferred_desktop_refresh_is_coalesced_and_applied_once() {
+        let mut pending = false;
+        assert!(!take_desktop_refresh_pending(
+            &mut pending,
+            false,
+            false,
+            false,
+            false
+        ));
+        for (editing, menu, dragging, closing) in [
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ] {
+            pending = true;
+            assert!(!take_desktop_refresh_pending(
+                &mut pending,
+                editing,
+                menu,
+                dragging,
+                closing
+            ));
+            // More scan completions while busy remain one pending refresh.
+            pending = true;
+            assert!(!take_desktop_refresh_pending(
+                &mut pending,
+                editing,
+                menu,
+                dragging,
+                closing
+            ));
+            assert!(pending);
+            assert!(take_desktop_refresh_pending(
+                &mut pending,
+                false,
+                false,
+                false,
+                false
+            ));
+        }
+        assert!(!pending);
+        assert!(!take_desktop_refresh_pending(
+            &mut pending,
+            false,
+            false,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn modal_return_rejects_a_destroyed_or_replaced_drawer() {
+        let lifetime = Rc::new(());
+        let mut session = DrawerSession {
+            hwnd: HWND::default(),
+            lifetime: Rc::downgrade(&lifetime),
+        };
+        assert!(session.identifies(&lifetime));
+        let replacement = Rc::new(());
+        assert!(!session.identifies(&replacement));
+        // A nested callback destroys the old drawer before its caller resumes.
+        drop(lifetime);
+        assert!(session.lifetime.upgrade().is_none());
+        assert!(unsafe { session.state() }.is_none());
+        assert!(!session.identifies(&replacement));
+    }
+
+    #[test]
+    fn menu_target_and_launch_snapshot_survive_reordered_or_removed_entries() {
+        let entry = |key: &str| Entry {
+            label: key.into(),
+            key: key.into(),
+            path: Some(format!(r"C:\{key}.exe")),
+            pidl: None,
+            icon: None,
+            preloaded_icon: None,
+            glyph: "",
+            color: (0.0, 0.0, 0.0),
+        };
+        let mut entries = vec![entry("a"), entry("target"), entry("b")];
+        let key = entries[1].key.clone();
+        entries.insert(0, entry("new"));
+        entries.swap(0, 2);
+        let index = entry_index_for_key(&entries, &key).unwrap();
+        assert_eq!(entries[index].label, "target");
+        let launch = entries[index].launch_target();
+        entries.remove(index);
+        assert_eq!(entry_index_for_key(&entries, &key), None);
+        drop(entries);
+        assert_eq!(launch.key, "target");
+        assert_eq!(launch.path.as_deref(), Some(r"C:\target.exe"));
+    }
+
+    #[test]
+    fn focus_follows_entry_key_across_reload_and_query_fallback() {
+        let old_keys = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let old_cells = cells(&[0, 2, 1]);
+        let focused_key = focused_cell_key(&old_keys, &old_cells, Some(1)).map(str::to_owned);
+        assert_eq!(focused_key.as_deref(), Some("c"));
+
+        let new_keys = vec!["x".to_string(), "c".to_string(), "a".to_string()];
+        let new_cells = cells(&[2, 0, 1]);
+        assert_eq!(
+            focused_cell_for_key(&new_keys, &new_cells, focused_key.as_deref()),
+            Some(2)
+        );
+        assert_eq!(
+            focused_cell_for_key(&new_keys, &cells(&[2, 0]), focused_key.as_deref()),
+            None
+        );
+        assert_eq!(focused_cell_key(&new_keys, &new_cells, Some(99)), None);
+    }
+
+    #[test]
+    fn wm_char_decodes_surrogate_pairs_as_one_query_char() {
+        let mut query = String::new();
+        let mut pending_high = None;
+        for unit in "A😀B".encode_utf16() {
+            push_query_utf16(&mut query, &mut pending_high, unit);
+        }
+        assert_eq!(query, "A😀B");
+        assert_eq!(pending_high, None);
+    }
+
+    #[test]
+    fn unmatched_surrogates_do_not_drop_neighbouring_input() {
+        let mut query = String::new();
+        let mut pending_high = None;
+        push_query_utf16(&mut query, &mut pending_high, 0xD83D);
+        push_query_utf16(&mut query, &mut pending_high, 'x' as u16);
+        push_query_utf16(&mut query, &mut pending_high, 0xDC00);
+        assert_eq!(query, "�x�");
+        assert_eq!(pending_high, None);
+
+        query.clear();
+        push_query_utf16(&mut query, &mut pending_high, 0xD800);
+        push_query_utf16(&mut query, &mut pending_high, 0xD801);
+        push_query_utf16(&mut query, &mut pending_high, 'z' as u16);
+        assert_eq!(query, "��z");
+        assert_eq!(pending_high, None);
+    }
+
+    #[test]
+    fn surrogate_pairs_and_full_queries_obey_the_scalar_limit() {
+        let mut query = "a".repeat(MAX_QUERY_CHARS - 1);
+        let mut pending_high = None;
+        assert!(!push_query_utf16(&mut query, &mut pending_high, 0xD83D));
+        assert!(push_query_utf16(&mut query, &mut pending_high, 0xDE00));
+        assert_eq!(query.chars().count(), MAX_QUERY_CHARS);
+        assert!(query.ends_with('😀'));
+        assert!(!push_query_utf16(&mut query, &mut pending_high, 'b' as u16));
+        assert_eq!(query.chars().count(), MAX_QUERY_CHARS);
+
+        assert!(!push_query_utf16(&mut query, &mut pending_high, 0xD83D));
+        assert!(!push_query_utf16(&mut query, &mut pending_high, 0xDE00));
+        assert_eq!(pending_high, None);
+        assert_eq!(query.chars().count(), MAX_QUERY_CHARS);
+    }
+
+    #[test]
+    fn composing_ime_owns_navigation_commit_cancel_and_delete_keys() {
+        for key in [0x08, 0x0d, 0x1b, 0x25, 0x26, 0x27, 0x28] {
+            assert!(ime_owns_key(true, key));
+            assert!(!ime_owns_key(false, key));
+        }
+        assert!(!ime_owns_key(true, 0x09));
+        assert!(!ime_owns_key(true, 'A' as u32));
+    }
 
     fn assert_close(actual: f32, expected: f32) {
         assert!(

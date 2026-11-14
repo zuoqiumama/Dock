@@ -40,6 +40,21 @@ pub struct SurfaceTheme {
     pub radius: f32,
 }
 
+/// Colors for the Agent zone capsule, status lights, shimmer wash, and waiting badges.
+#[derive(Clone, Copy, Debug)]
+pub struct AgentTheme {
+    pub capsule_rgb: (f32, f32, f32),
+    pub capsule_alpha: f32,
+    pub capsule_border_alpha: f32,
+    pub shimmer_rgb: (f32, f32, f32),
+    pub running_rgb: (f32, f32, f32),
+    pub waiting_rgb: (f32, f32, f32),
+    pub error_rgb: (f32, f32, f32),
+    pub done_rgb: (f32, f32, f32),
+    pub badge_text_rgb: (f32, f32, f32),
+    pub alert_text_rgb: (f32, f32, f32),
+}
+
 pub const fn rgb8(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
     (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0)
 }
@@ -189,6 +204,59 @@ impl ThemePreset {
             radius: if self == Self::Glass { 32.0 } else { 18.0 },
         }
     }
+
+    pub fn agent_palette(self) -> AgentTheme {
+        match self {
+            ThemePreset::Glass => AgentTheme {
+                capsule_rgb: rgb8(104, 136, 121),
+                capsule_alpha: 0.11,
+                capsule_border_alpha: 0.18,
+                shimmer_rgb: rgb8(186, 224, 206),
+                running_rgb: rgb8(78, 146, 114),
+                waiting_rgb: rgb8(217, 119, 6),
+                error_rgb: rgb8(210, 68, 62),
+                done_rgb: rgb8(56, 142, 108),
+                badge_text_rgb: rgb8(42, 68, 56),
+                alert_text_rgb: (1.0, 1.0, 1.0),
+            },
+            ThemePreset::Macos => AgentTheme {
+                capsule_rgb: rgb8(52, 89, 116),
+                capsule_alpha: 0.10,
+                capsule_border_alpha: 0.16,
+                shimmer_rgb: rgb8(230, 240, 248),
+                running_rgb: rgb8(48, 132, 98),
+                waiting_rgb: rgb8(212, 112, 10),
+                error_rgb: rgb8(204, 58, 54),
+                done_rgb: rgb8(46, 128, 92),
+                badge_text_rgb: rgb8(28, 40, 52),
+                alert_text_rgb: (1.0, 1.0, 1.0),
+            },
+            ThemePreset::Compact | ThemePreset::Solid => AgentTheme {
+                capsule_rgb: rgb8(116, 232, 168),
+                capsule_alpha: 0.08,
+                capsule_border_alpha: 0.14,
+                shimmer_rgb: rgb8(170, 244, 206),
+                running_rgb: rgb8(116, 232, 168),
+                waiting_rgb: rgb8(251, 191, 36),
+                error_rgb: rgb8(248, 113, 113),
+                done_rgb: rgb8(110, 231, 183),
+                badge_text_rgb: rgb8(226, 244, 235),
+                alert_text_rgb: rgb8(28, 22, 12),
+            },
+            ThemePreset::Contrast => AgentTheme {
+                capsule_rgb: rgb8(255, 220, 46),
+                capsule_alpha: 0.12,
+                capsule_border_alpha: 0.36,
+                shimmer_rgb: rgb8(255, 255, 255),
+                running_rgb: rgb8(96, 255, 168),
+                waiting_rgb: rgb8(255, 214, 10),
+                error_rgb: rgb8(255, 92, 92),
+                done_rgb: rgb8(120, 255, 190),
+                badge_text_rgb: (1.0, 1.0, 1.0),
+                alert_text_rgb: (0.0, 0.0, 0.0),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -239,6 +307,23 @@ mod tests {
                 "{:?} and {:?} are too similar: rgb_delta={rgb_delta:.3}, alpha_delta={alpha_delta:.3}",
                 pair[0],
                 pair[1]
+            );
+        }
+    }
+
+    #[test]
+    fn agent_palette_distinguishes_running_waiting_and_error_for_all_themes() {
+        for preset in ThemePreset::ALL {
+            let p = preset.agent_palette();
+            let rw = (p.running_rgb.0 - p.waiting_rgb.0).abs()
+                + (p.running_rgb.1 - p.waiting_rgb.1).abs()
+                + (p.running_rgb.2 - p.waiting_rgb.2).abs();
+            let we = (p.waiting_rgb.0 - p.error_rgb.0).abs()
+                + (p.waiting_rgb.1 - p.error_rgb.1).abs()
+                + (p.waiting_rgb.2 - p.error_rgb.2).abs();
+            assert!(
+                rw >= 0.4 && we >= 0.25,
+                "{preset:?} agent palette lacks state contrast: rw={rw:.2}, we={we:.2}"
             );
         }
     }

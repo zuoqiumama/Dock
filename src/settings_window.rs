@@ -46,6 +46,21 @@ const ID_AUTOSTART: usize = 141;
 const ID_DRAWER_ENABLED: usize = 142;
 const ID_HIDE_DESKTOP_ICONS: usize = 143;
 const ID_THEME: usize = 144;
+const ID_PREFERENCES: usize = 145;
+static HOTKEY_CONFLICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) const WM_HOTKEY_STATUS: u32 = WM_APP + 0x43;
+pub fn set_hotkey_conflict(conflict: bool) {
+    HOTKEY_CONFLICT.store(conflict, Ordering::Relaxed);
+    let hwnd = HWND(SETTINGS_HWND.load(Ordering::Relaxed) as *mut c_void);
+    if !hwnd.is_invalid() {
+        unsafe {
+            let _ = PostMessageW(hwnd, WM_HOTKEY_STATUS, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+pub fn hotkey_conflict() -> bool {
+    HOTKEY_CONFLICT.load(Ordering::Relaxed)
+}
 const ID_CLOSE: usize = 151;
 
 const BST_CHECKED: usize = 1;
@@ -182,7 +197,7 @@ unsafe extern "system" fn theme_child(hwnd: HWND, light: LPARAM) -> BOOL {
     BOOL(1)
 }
 
-unsafe fn apply_window_theme(hwnd: HWND, theme: ThemePreset) {
+pub(crate) unsafe fn apply_window_theme(hwnd: HWND, theme: ThemePreset) {
     let light = light_theme(theme);
     let dark: i32 = i32::from(!light);
     let _ = DwmSetWindowAttribute(
@@ -221,12 +236,12 @@ unsafe fn apply_window_theme(hwnd: HWND, theme: ThemePreset) {
 }
 
 unsafe fn refresh_surface(hwnd: HWND, state: &mut SettingsState) {
-    let bg = CreateSolidBrush(bg_color(state.settings.theme));
+    let bg = CreateSolidBrush(bg_color(state.settings.effective_theme()));
     if !bg.0.is_null() {
         let previous = std::mem::replace(&mut state.bg, bg);
         let _ = DeleteObject(HGDIOBJ(previous.0));
     }
-    apply_window_theme(hwnd, state.settings.theme);
+    apply_window_theme(hwnd, state.settings.effective_theme());
 }
 
 /// Keep an already-open settings window in sync with tray theme changes.
@@ -241,6 +256,10 @@ pub unsafe fn sync_theme(theme: ThemePreset) {
         return;
     }
     let state = &mut *ptr;
+    if state.settings.follow_system {
+        refresh_surface(hwnd, state);
+        return;
+    }
     state.settings.theme = theme;
     let index = ThemePreset::ALL
         .iter()
@@ -349,7 +368,10 @@ pub unsafe fn open(dock_hwnd: HWND) {
     };
     RegisterClassExW(&wc); // ignore "already registered"
 
-    let scale = (GetDpiForWindow(dock_hwnd).max(96) as f32) / 96.0;
+    let (_, _, available_w, available_h) = monitor_work_area(dock_hwnd);
+    let scale = ((GetDpiForWindow(dock_hwnd).max(96) as f32) / 96.0)
+        .min((available_h - 48).max(1) as f32 / 740.0)
+        .min((available_w - 24).max(1) as f32 / 420.0);
     let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     let mut rect = RECT {
         left: 0,
@@ -402,7 +424,7 @@ pub unsafe fn open(dock_hwnd: HWND) {
         0,
         PCWSTR(face.as_ptr()),
     );
-    let bg = CreateSolidBrush(bg_color(current.theme));
+    let bg = CreateSolidBrush(bg_color(current.effective_theme()));
 
     let btn = w!("BUTTON");
     let group = WINDOW_STYLE(BS_GROUPBOX as u32).0;
@@ -479,6 +501,16 @@ pub unsafe fn open(dock_hwnd: HWND) {
         );
     }
 
+    mk(
+        if hotkey_conflict() {
+            "快捷键冲突，点此修改…"
+        } else {
+            "布局与快捷键…"
+        },
+        push,
+        ID_PREFERENCES,
+        (218, 306, 178, 26),
+    );
     mk("常驻应用（Dock 左侧固定项）", group, 0, (12, 350, 396, 150));
     let pin_list = control(
         hwnd,
@@ -558,7 +590,7 @@ pub unsafe fn open(dock_hwnd: HWND) {
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
     SETTINGS_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
     refresh_pins(&mut *state);
-    apply_window_theme(hwnd, (*state).settings.theme);
+    apply_window_theme(hwnd, (*state).settings.effective_theme());
 
     let _ = ShowWindow(hwnd, SW_SHOW);
     let _ = SetForegroundWindow(hwnd);
@@ -632,8 +664,9 @@ unsafe fn ctl_color(state: *mut SettingsState, wparam: WPARAM) -> LRESULT {
         return LRESULT(0);
     }
     let hdc = HDC(wparam.0 as *mut c_void);
-    SetTextColor(hdc, text_color((*state).settings.theme));
-    SetBkColor(hdc, bg_color((*state).settings.theme));
+    let theme = (*state).settings.effective_theme();
+    SetTextColor(hdc, text_color(theme));
+    SetBkColor(hdc, bg_color(theme));
     SetBkMode(hdc, TRANSPARENT);
     LRESULT((*state).bg.0 as isize)
 }
@@ -652,12 +685,35 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_CTLCOLORSTATIC | WM_CTLCOLORLISTBOX | WM_CTLCOLORBTN | WM_CTLCOLOREDIT => {
                 ctl_color(ptr, wparam)
             }
+            WM_HOTKEY_STATUS if !ptr.is_null() => {
+                if let Ok(button) = GetDlgItem(hwnd, ID_PREFERENCES as i32) {
+                    let _ = SetWindowTextW(
+                        button,
+                        if hotkey_conflict() {
+                            w!("快捷键冲突，点此修改…")
+                        } else {
+                            w!("布局与快捷键…")
+                        },
+                    );
+                }
+                LRESULT(0)
+            }
+            crate::preferences::WM_SAVED if !ptr.is_null() => {
+                let state = &mut *ptr;
+                state.settings = settings::load();
+                restore_controls(state);
+                refresh_surface(hwnd, state);
+                LRESULT(0)
+            }
             WM_COMMAND if !ptr.is_null() => {
                 let state = &mut *ptr;
                 let id = wparam.0 & 0xFFFF;
                 let code = (wparam.0 >> 16) & 0xFFFF;
                 let previous = state.settings;
                 match id {
+                    ID_PREFERENCES => {
+                        crate::preferences::show(hwnd, state.dock_hwnd, state.settings)
+                    }
                     ID_TB_SHOW | ID_TB_AUTOHIDE | ID_TB_HIDDEN => {
                         let (mode, index) = match id {
                             ID_TB_SHOW => (TaskbarMode::Show, 0),

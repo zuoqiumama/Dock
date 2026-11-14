@@ -26,3 +26,6 @@ Cargo.lock.bak
 
 # WorkBuddy agent memory (tool directory, not source).
 .workbuddy/
+
+# Local agent scratch and validation artifacts.
+.dsh/

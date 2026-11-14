@@ -3,6 +3,7 @@
 
 use std::time::Instant;
 
+use crate::agent_state::AgentState;
 use crate::content::ContentKind;
 use crate::theme::ThemePreset;
 
@@ -23,6 +24,7 @@ pub const REVEAL_TAU: f32 = 0.14; // auto-hide slide smoothing (seconds)
 pub const HIDE_SLIVER: f32 = 3.0; // visible sliver when hidden (logical px)
 pub const TRIGGER_PX: f32 = 4.0; // bottom hot-zone height that reveals the dock
 pub const DIVIDER_W: f32 = 16.0; // width of the separator slot (logical px)
+pub const AGENT_DIVIDER_W: f32 = 18.0; // subtle double-line gap before the Agent Zone
 pub const ENTER_TAU: f32 = 0.17; // appear easing — slot opens + icon scales/fades in
 pub const EXIT_TAU: f32 = 0.13; // disappear easing — a touch quicker than the open
 pub const PRESENCE_GONE: f32 = 0.015; // below this, a fully-exited slot is dropped
@@ -68,14 +70,45 @@ fn animation_dt(elapsed: f32) -> f32 {
 /// and what a click does. The dock row is ordered: Start, pinned…, Divider,
 /// running windows… (left = pinned, right = open windows, like the user's macOS-
 /// style mental model).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentSlotInfo {
+    pub agent_id: String,
+    pub state: AgentState,
+    pub badge: Option<String>,
+    pub active_sessions: usize,
+    pub total_sessions: usize,
+    pub waiting_sessions: usize,
+}
+
+impl AgentSlotInfo {
+    pub fn idle(agent_id: impl Into<String>) -> Self {
+        Self {
+            agent_id: agent_id.into(),
+            state: AgentState::Idle,
+            badge: None,
+            active_sessions: 0,
+            total_sessions: 0,
+            waiting_sessions: 0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ItemRole {
-    Start,   // opens the Windows Start menu
-    Pinned,  // launches `path` via the shell
-    Running, // activates the open window identified by `hwnd`
-    Divider, // a vertical separator: no icon, no magnify, not clickable
-    Control, // far-right button: opens the glass control center
-    Drawer,  // opens the glass app drawer (all desktop programs)
+    Start,        // opens the Windows Start menu
+    Pinned,       // launches `path` via the shell
+    Running,      // activates the open window identified by `hwnd`
+    Divider,      // a vertical separator: no icon, no magnify, not clickable
+    AgentDivider, // subtle zone separator before the dedicated Agent Zone
+    Control,      // far-right button: opens the glass control center
+    Drawer,       // opens the glass app drawer (all desktop programs)
+    Overflow,     // reachable applications that do not fit the current monitor
+}
+
+impl ItemRole {
+    pub fn is_divider(self) -> bool {
+        matches!(self, ItemRole::Divider | ItemRole::AgentDivider)
+    }
 }
 
 /// A stable identity for a slot, so the dock can be *reconciled* across rebuilds
@@ -85,10 +118,13 @@ pub enum ItemRole {
 pub enum ItemKey {
     Start,
     Divider,
+    AgentDivider,
     Control,
     Drawer,
+    Overflow,
     Pinned(String),  // by launch path (falls back to icon source, then label)
     Running(String), // by application group key
+    Agent(String),   // by normalized agent id ("antigravity", "codex", "dsh", ...)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,13 +134,23 @@ pub struct RunningWindowRef {
 }
 
 /// Resting width of a slot in logical px (before DPI + magnification).
+pub fn gap_for(theme: ThemePreset) -> f32 {
+    if theme == ThemePreset::Compact {
+        8.0
+    } else {
+        GAP
+    }
+}
+
 pub fn role_base_width(role: ItemRole) -> f32 {
     match role {
         ItemRole::Divider => DIVIDER_W,
+        ItemRole::AgentDivider => AGENT_DIVIDER_W,
         _ => BASE_ICON,
     }
 }
 
+#[derive(Clone)]
 pub struct DockItem {
     pub label: String,
     pub glyph: &'static str,    // fallback if the icon can't be extracted
@@ -116,16 +162,36 @@ pub struct DockItem {
     pub hwnd: Option<isize>, // for Running items: the window to activate
     pub group_key: Option<String>,
     pub windows: Vec<RunningWindowRef>,
+    pub agent: Option<AgentSlotInfo>,
 }
 
 impl DockItem {
+    pub fn is_agent(&self) -> bool {
+        self.agent.is_some()
+    }
+
+    pub fn has_active_indicator(&self) -> bool {
+        !self.windows.is_empty()
+            || self
+                .agent
+                .as_ref()
+                .is_some_and(|a| a.state != AgentState::Idle)
+    }
+
     /// Stable identity used to reconcile the dock across rebuilds (see `ItemKey`).
     pub fn key(&self) -> ItemKey {
+        if let Some(agent) = &self.agent {
+            if matches!(self.role, ItemRole::Pinned | ItemRole::Running) {
+                return ItemKey::Agent(agent.agent_id.clone());
+            }
+        }
         match self.role {
             ItemRole::Start => ItemKey::Start,
             ItemRole::Divider => ItemKey::Divider,
+            ItemRole::AgentDivider => ItemKey::AgentDivider,
             ItemRole::Control => ItemKey::Control,
             ItemRole::Drawer => ItemKey::Drawer,
+            ItemRole::Overflow => ItemKey::Overflow,
             ItemRole::Running => ItemKey::Running(
                 self.group_key
                     .clone()
@@ -195,6 +261,9 @@ pub struct Frame {
 
 pub struct Dock {
     pub items: Vec<DockItem>,
+    pub foreground: Option<isize>,
+    pub preferences: crate::settings::Layout,
+    pub insertion_x: Option<f32>,
     slots: Vec<Slot>, // per-item animation state, kept in lockstep with `items`
     pub cursor_x: Option<f32>,
     /// Low-passed cursor position (px) that `frame` actually lays out against.
@@ -219,32 +288,135 @@ pub struct Dock {
     pub win_h: f32,
     last: Instant,
     resume_pending: bool,
+    pub shimmer_phase: Option<f32>,
 }
 
 /// Window size (device px) needed to fit every slot at full magnification PLUS the
 /// click hop, so a bouncing, magnified icon never gets clipped at the top. Takes
 /// the actual items because slots have different widths (a divider is narrow).
-pub fn window_size(items: &[DockItem], dpi: f32) -> (u32, u32) {
-    let base = BASE_ICON * dpi;
+pub fn window_size_with(
+    items: &[DockItem],
+    dpi: f32,
+    preferences: crate::settings::Layout,
+    theme: ThemePreset,
+) -> (u32, u32) {
+    let base = preferences.icon_size as f32 * dpi;
     let n = items.len();
     let row: f32 = items
         .iter()
-        .map(|it| role_base_width(it.role) * dpi)
+        .map(|it| role_base_width(it.role) * preferences.icon_size as f32 / BASE_ICON * dpi)
         .sum::<f32>()
-        + GAP * dpi * n.saturating_sub(1) as f32;
+        + gap_for(theme) * dpi * n.saturating_sub(1) as f32;
     let w = row + 2.0 * PILL_PAD_X * dpi + base * 4.0; // bulge headroom
-    let h = base * MAX_SCALE + BOUNCE_AMP * base + (PILL_PAD_Y + TOP_PAD + SHOWN_GAP) * dpi;
+    let h = base * preferences.magnification as f32 / 100.0
+        + BOUNCE_AMP * base
+        + (PILL_PAD_Y + TOP_PAD + preferences.bottom_gap as f32) * dpi;
     (w.ceil() as u32, h.ceil() as u32)
 }
 
+fn overflow_tier(item: &DockItem) -> Option<u8> {
+    match (&item.role, &item.agent) {
+        (ItemRole::Running, None) => Some(0),
+        (ItemRole::Pinned, None) => Some(1),
+        (ItemRole::Pinned | ItemRole::Running, Some(agent)) => Some(match agent.state {
+            AgentState::Idle if item.windows.is_empty() => 2,
+            AgentState::Idle => 3,
+            AgentState::Done => 4,
+            AgentState::Running => 5,
+            AgentState::Error => 6,
+            AgentState::Waiting => 7,
+        }),
+        _ => None,
+    }
+}
+
+fn overflow_drop_index(items: &[DockItem]) -> Option<usize> {
+    (0..=7).find_map(|tier| {
+        items
+            .iter()
+            .rposition(|item| overflow_tier(item) == Some(tier))
+    })
+}
+
+fn prune_dangling_dividers(items: &mut Vec<DockItem>) {
+    if let Some(index) = items.iter().position(|i| i.role == ItemRole::Divider) {
+        let has_regular_running = items[index + 1..]
+            .iter()
+            .any(|i| i.role == ItemRole::Running && !i.is_agent());
+        let has_regular_pinned = items[..index]
+            .iter()
+            .any(|i| i.role == ItemRole::Pinned && !i.is_agent());
+        if !has_regular_running || !has_regular_pinned {
+            items.remove(index);
+        }
+    }
+    if let Some(index) = items.iter().position(|i| i.role == ItemRole::AgentDivider) {
+        let has_regular_before = items[..index]
+            .iter()
+            .any(|i| matches!(i.role, ItemRole::Pinned | ItemRole::Running) && !i.is_agent());
+        let has_agent_after = items[index + 1..].iter().any(|i| i.is_agent());
+        if !has_regular_before || !has_agent_after {
+            items.remove(index);
+        }
+    }
+}
+
+/// Keep every displaced app accessible through the overflow menu. System buttons
+/// and active/waiting Agents are retained longest; remove dangling separators
+/// rather than spending slots on them.
+pub fn limit_items(
+    mut items: Vec<DockItem>,
+    width: u32,
+    dpi: f32,
+    preferences: crate::settings::Layout,
+    theme: ThemePreset,
+) -> (Vec<DockItem>, Vec<DockItem>) {
+    let mut overflow = Vec::new();
+    if window_size_with(&items, dpi, preferences, theme).0 <= width
+        || !items
+            .iter()
+            .any(|i| matches!(i.role, ItemRole::Pinned | ItemRole::Running))
+    {
+        return (items, overflow);
+    }
+    let at = items
+        .iter()
+        .position(|i| i.role == ItemRole::Control)
+        .unwrap_or(items.len());
+    items.insert(at, crate::apps::overflow_item());
+    while window_size_with(&items, dpi, preferences, theme).0 > width {
+        let Some(index) = overflow_drop_index(&items) else {
+            break;
+        };
+        overflow.insert(0, items.remove(index));
+        prune_dangling_dividers(&mut items);
+    }
+    prune_dangling_dividers(&mut items);
+    (items, overflow)
+}
+
 impl Dock {
+    /// The full animation envelope also fits during reconciliation (old slots
+    /// remain briefly while fading out). Rendering and hit testing share this DPI.
+    pub fn layout_dpi(&self) -> f32 {
+        let natural =
+            window_size_with(&self.items, self.dpi, self.preferences, self.theme).0 as f32;
+        self.dpi * (self.win_w / natural.max(1.0)).min(1.0)
+    }
+    pub fn base_icon(&self) -> f32 {
+        self.preferences.icon_size as f32 * self.layout_dpi()
+    }
+
     pub fn new(items: Vec<DockItem>, dpi: f32, win_w: f32, win_h: f32, theme: ThemePreset) -> Dock {
         let slots = items
             .iter()
-            .map(|item| Slot::present(!item.windows.is_empty()))
+            .map(|item| Slot::present(item.has_active_indicator()))
             .collect();
         Dock {
             items,
+            foreground: None,
+            preferences: crate::settings::Layout::default(),
+            insertion_x: None,
             // Whatever is present at construction starts fully shown (no intro animation).
             slots,
             cursor_x: None,
@@ -262,25 +434,52 @@ impl Dock {
             win_h,
             last: Instant::now(),
             resume_pending: false,
+            shimmer_phase: None,
+        }
+    }
+
+    pub fn has_running_agent(&self) -> bool {
+        self.items.iter().enumerate().any(|(i, item)| {
+            self.slots.get(i).is_some_and(|s| s.presence_target > 0.0)
+                && item
+                    .agent
+                    .as_ref()
+                    .is_some_and(|a| a.state == AgentState::Running)
+        })
+    }
+
+    pub fn sync_active_indicators(&mut self) {
+        for (i, item) in self.items.iter().enumerate() {
+            if let Some(slot) = self.slots.get_mut(i) {
+                slot.running_target = if item.has_active_indicator() {
+                    1.0
+                } else {
+                    0.0
+                };
+            }
         }
     }
 
     /// How far (device px) content slides down when hidden (leaves a small sliver).
     fn hide_slide(&self) -> f32 {
-        BASE_ICON * self.dpi + (2.0 * PILL_PAD_Y + SHOWN_GAP - HIDE_SLIVER) * self.dpi
+        self.preferences.icon_size as f32 * self.layout_dpi()
+            + (2.0 * PILL_PAD_Y + self.preferences.bottom_gap as f32 - HIDE_SLIVER)
+                * self.layout_dpi()
     }
 
     /// Resting (un-magnified) width of slot `i` in device px.
     fn item_w(&self, i: usize) -> f32 {
-        role_base_width(self.items[i].role) * self.dpi
+        role_base_width(self.items[i].role) * self.preferences.icon_size as f32 / BASE_ICON
+            * self.layout_dpi()
     }
 
     pub fn dock_span_x(&self) -> (f32, f32) {
-        let base = BASE_ICON * self.dpi;
-        let gap = GAP * self.dpi;
+        let base = self.preferences.icon_size as f32 * self.layout_dpi();
+        let gap = gap_for(self.theme) * self.layout_dpi();
         let n = self.items.len();
         let widths: f32 = (0..n).map(|i| self.item_w(i)).sum();
-        let row = widths + gap * n.saturating_sub(1) as f32 + 2.0 * PILL_PAD_X * self.dpi + base; // bulge slack
+        let row =
+            widths + gap * n.saturating_sub(1) as f32 + 2.0 * PILL_PAD_X * self.layout_dpi() + base; // bulge slack
         let cx = self.win_w / 2.0;
         (cx - row / 2.0, cx + row / 2.0)
     }
@@ -290,10 +489,27 @@ impl Dock {
     pub fn hit_zone(&self, shown: bool) -> (f32, f32, f32, f32) {
         let (l, r) = self.dock_span_x();
         if shown {
-            let top = self.win_h - (BASE_ICON * MAX_SCALE * self.dpi + 2.0 * PILL_PAD_Y * self.dpi);
-            (l, top.max(0.0), r, self.win_h)
+            let frame = self.frame();
+            let base = self.base_icon();
+            let pad = PILL_PAD_Y * self.layout_dpi();
+            // Use the drawing baseline so bottom_gap and reveal stay in sync.
+            // A click hop or a settling old scale can exceed the configured envelope.
+            let top = frame.icons.iter().fold(
+                frame.baseline - base * self.preferences.magnification as f32 / 100.0 - pad,
+                |top, icon| {
+                    let rise = (1.0 - icon.presence) * ENTER_RISE * base;
+                    let width = self.item_w(icon.idx) * icon.scale * icon.presence;
+                    top.min(frame.baseline - icon.bounce_y + rise - width - pad)
+                },
+            );
+            (l, top.clamp(0.0, self.win_h), r, self.win_h)
         } else {
-            (l, self.win_h - TRIGGER_PX * self.dpi, r, self.win_h)
+            (
+                l,
+                self.win_h - TRIGGER_PX * self.layout_dpi(),
+                r,
+                self.win_h,
+            )
         }
     }
 
@@ -328,6 +544,18 @@ impl Dock {
         }
     }
 
+    /// Start a bounce on the live item whose `ItemKey` matches `key`.
+    pub fn bump_key(&mut self, key: &ItemKey) {
+        if let Some(i) = self
+            .items
+            .iter()
+            .enumerate()
+            .position(|(idx, item)| self.slots[idx].presence_target > 0.0 && &item.key() == key)
+        {
+            self.bump(i);
+        }
+    }
+
     /// Reset the frame clock when the blocking message loop wakes an idle Dock.
     pub fn wake_animation_clock(&mut self) {
         self.last = Instant::now();
@@ -335,7 +563,10 @@ impl Dock {
     }
 
     fn metrics(&self) -> (f32, f32) {
-        (BASE_ICON * self.dpi, GAP * self.dpi)
+        (
+            self.preferences.icon_size as f32 * self.layout_dpi(),
+            gap_for(self.theme) * self.layout_dpi(),
+        )
     }
 
     fn rest_centers(&self) -> Vec<f32> {
@@ -365,13 +596,15 @@ impl Dock {
         match self.cursor_x {
             None => 1.0,
             Some(cx) => {
-                let infl = INFLUENCE * self.dpi;
+                let infl = INFLUENCE * self.layout_dpi();
                 let d = (cx - rest_cx).abs();
                 if d >= infl {
                     1.0
                 } else {
                     let t = d / infl;
-                    1.0 + (MAX_SCALE - 1.0) * 0.5 * (1.0 + (std::f32::consts::PI * t).cos())
+                    1.0 + (self.preferences.magnification as f32 / 100.0 - 1.0)
+                        * 0.5
+                        * (1.0 + (std::f32::consts::PI * t).cos())
                 }
             }
         }
@@ -379,6 +612,16 @@ impl Dock {
 
     /// Advance the easing one frame. Returns true while still animating.
     pub fn tick(&mut self) -> bool {
+        if self.preferences.reduce_motion {
+            self.reveal = self.reveal_target;
+            for slot in &mut self.slots {
+                slot.scale = 1.0;
+                slot.bounce = 0.0;
+                slot.presence = slot.presence_target;
+                slot.running_presence = slot.running_target;
+            }
+            return false;
+        }
         let now = Instant::now();
         let dt = if std::mem::take(&mut self.resume_pending) {
             0.0
@@ -394,7 +637,7 @@ impl Dock {
         #[allow(clippy::needless_range_loop)]
         for i in 0..self.items.len() {
             // Dividers never magnify; everything else follows the cursor bell.
-            let tg = if self.items[i].role == ItemRole::Divider {
+            let tg = if self.items[i].role.is_divider() {
                 1.0
             } else {
                 self.target(rc[i])
@@ -599,7 +842,8 @@ impl Dock {
         }
 
         // auto-hide slide: shown floats SHOWN_GAP above the bottom; hidden slides down.
-        let shown_baseline = self.win_h - (PILL_PAD_Y + SHOWN_GAP) * self.dpi;
+        let shown_baseline =
+            self.win_h - (PILL_PAD_Y + self.preferences.bottom_gap as f32) * self.layout_dpi();
         let baseline = shown_baseline + (1.0 - self.reveal) * self.hide_slide();
         let mut icons = Vec::with_capacity(n);
         for (i, &cx) in centers.iter().enumerate() {
@@ -614,10 +858,10 @@ impl Dock {
                 running_presence: self.slots[i].running_presence,
             });
         }
-        let pill_l = icons[0].cx - widths[0] / 2.0 - PILL_PAD_X * self.dpi;
-        let pill_r = icons[n - 1].cx + widths[n - 1] / 2.0 + PILL_PAD_X * self.dpi;
-        let pill_t = baseline - base - PILL_PAD_Y * self.dpi;
-        let pill_b = baseline + PILL_PAD_Y * self.dpi; // tracks the slide (clipped at win_h)
+        let pill_l = icons[0].cx - widths[0] / 2.0 - PILL_PAD_X * self.layout_dpi();
+        let pill_r = icons[n - 1].cx + widths[n - 1] / 2.0 + PILL_PAD_X * self.layout_dpi();
+        let pill_t = baseline - base - PILL_PAD_Y * self.layout_dpi();
+        let pill_b = baseline + PILL_PAD_Y * self.layout_dpi(); // tracks the slide (clipped at win_h)
         Frame {
             baseline,
             icons,
@@ -629,7 +873,7 @@ impl Dock {
         let f = self.frame();
         let (base, _) = self.metrics();
         for ic in &f.icons {
-            if self.items[ic.idx].role == ItemRole::Divider {
+            if self.items[ic.idx].role.is_divider() {
                 continue; // separators aren't clickable
             }
             // A slot that's collapsing away (its window already closed) isn't a target.
@@ -713,7 +957,7 @@ impl Dock {
 
             match old_match {
                 Some(old_index) => {
-                    let running = !desired[new_index].as_ref().unwrap().windows.is_empty();
+                    let running = desired[new_index].as_ref().unwrap().has_active_indicator();
                     items.push(desired[new_index].take().unwrap());
                     let mut s = old_slots[old_index];
                     s.presence_target = 1.0; // revive if it had been mid-exit
@@ -722,7 +966,7 @@ impl Dock {
                     remap.push(Some(old_index));
                 }
                 None => {
-                    let running = !desired[new_index].as_ref().unwrap().windows.is_empty();
+                    let running = desired[new_index].as_ref().unwrap().has_active_indicator();
                     items.push(desired[new_index].take().unwrap());
                     slots.push(Slot::entering(running));
                     remap.push(None);
@@ -794,7 +1038,7 @@ mod tests {
         Dock::new(Vec::new(), 1.0, 400.0, 140.0, ThemePreset::Glass)
     }
 
-    fn item(role: ItemRole, hwnd: Option<isize>, path: Option<&str>) -> DockItem {
+    pub(super) fn item(role: ItemRole, hwnd: Option<isize>, path: Option<&str>) -> DockItem {
         DockItem {
             label: String::new(),
             glyph: "",
@@ -813,16 +1057,17 @@ mod tests {
                     }]
                 })
                 .unwrap_or_default(),
+            agent: None,
         }
     }
 
-    fn start() -> DockItem {
+    pub(super) fn start() -> DockItem {
         item(ItemRole::Start, None, None)
     }
-    fn divider() -> DockItem {
+    pub(super) fn divider() -> DockItem {
         item(ItemRole::Divider, None, None)
     }
-    fn running(hwnd: isize) -> DockItem {
+    pub(super) fn running(hwnd: isize) -> DockItem {
         item(ItemRole::Running, Some(hwnd), None)
     }
 
@@ -832,7 +1077,7 @@ mod tests {
         item
     }
 
-    fn pinned(path: &str, hwnd: Option<isize>) -> DockItem {
+    pub(super) fn pinned(path: &str, hwnd: Option<isize>) -> DockItem {
         let mut item = item(ItemRole::Pinned, None, Some(path));
         item.hwnd = hwnd;
         item.windows = hwnd
@@ -850,7 +1095,7 @@ mod tests {
         dock.items.iter().map(DockItem::key).collect()
     }
 
-    fn seeded(items: Vec<DockItem>) -> Dock {
+    pub(super) fn seeded(items: Vec<DockItem>) -> Dock {
         // Start with the items already present (presence == 1), like a fresh launch.
         Dock::new(items, 1.0, 1200.0, 140.0, ThemePreset::Glass)
     }
@@ -941,6 +1186,101 @@ mod tests {
             rest_top > hover_top,
             "rest_top {rest_top} should be below hover_top {hover_top}"
         );
+    }
+
+    #[test]
+    fn shown_hit_zone_uses_each_configured_icon_size_without_expanding_click_through() {
+        fn contains(zone: (f32, f32, f32, f32), x: f32, y: f32) -> bool {
+            x >= zone.0 && x <= zone.2 && y >= zone.1 && y <= zone.3
+        }
+
+        for icon_size in [24, 50, 80] {
+            let mut dock = Dock::new(vec![start()], 1.0, 1200.0, 300.0, ThemePreset::Glass);
+            dock.preferences.icon_size = icon_size;
+            dock.preferences.magnification = 100;
+            let zone = dock.hit_zone(true);
+            let expected_top =
+                300.0 - icon_size as f32 - 2.0 * PILL_PAD_Y - dock.preferences.bottom_gap as f32;
+            assert!((zone.1 - expected_top).abs() < 1e-4, "size {icon_size}");
+            assert!(zone.0 > 0.0 && zone.2 < dock.win_w);
+
+            let cx = (zone.0 + zone.2) / 2.0;
+            assert!(!contains(zone, cx, zone.1 - 1.0));
+            assert!(contains(zone, cx, zone.1 + 1.0));
+            assert!(!contains(zone, zone.0 - 1.0, zone.1 + 1.0));
+        }
+    }
+
+    #[test]
+    fn shown_hit_zone_tracks_the_magnification_envelope() {
+        let mut dock = Dock::new(vec![start()], 1.0, 1200.0, 300.0, ThemePreset::Glass);
+        dock.preferences.icon_size = 50;
+        dock.preferences.magnification = 100;
+        assert!((dock.hit_zone(true).1 - 224.0).abs() < 1e-4);
+        dock.preferences.magnification = 180;
+        assert!((dock.hit_zone(true).1 - 184.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn shown_hit_zone_uses_the_automatically_scaled_layout_dpi() {
+        let mut dock = Dock::new(vec![start()], 1.0, 141.0, 300.0, ThemePreset::Glass);
+        dock.preferences.icon_size = 50;
+        dock.preferences.magnification = 160;
+        assert!((dock.layout_dpi() - 0.5).abs() < 1e-4);
+        assert!((dock.base_icon() - 25.0).abs() < 1e-4);
+        assert!((dock.hit_zone(true).1 - 247.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn hover_keeps_visible_icons_interactive_with_bottom_gap_and_click_hops() {
+        for dpi in [1.0, 1.5, 2.0] {
+            for icon_size in [24, 50, 80] {
+                for magnification in [100, 180, 220] {
+                    for bottom_gap in [0, 8, 32] {
+                        for width_ratio in [0.5, 1.0] {
+                            let preferences = crate::settings::Layout {
+                                icon_size,
+                                magnification,
+                                bottom_gap,
+                                ..Default::default()
+                            };
+                            let items = vec![start()];
+                            let (width, height) =
+                                window_size_with(&items, dpi, preferences, ThemePreset::Glass);
+                            let mut dock = Dock::new(
+                                items,
+                                dpi,
+                                width as f32 * width_ratio,
+                                height as f32,
+                                ThemePreset::Glass,
+                            );
+                            dock.preferences = preferences;
+                            let frame = dock.frame();
+                            let x = frame.icons[0].cx;
+                            let y = frame.baseline - dock.base_icon() + 1.0;
+                            let rest = dock.pointer_hit_zone();
+                            assert!(y >= rest.1 && y <= rest.3);
+                            assert_eq!(dock.hit_test(x, y), Some(0));
+                            dock.cursor_x = Some(x);
+                            let hovered = dock.pointer_hit_zone();
+                            assert!(y >= hovered.1 && y <= hovered.3);
+
+                            // Settings may lower magnification while the old scale
+                            // and the click hop are still easing out.
+                            dock.slots[0].scale = 2.2;
+                            dock.slots[0].bounce = 0.5;
+                            let frame = dock.frame();
+                            let top =
+                                frame.baseline - frame.icons[0].bounce_y - dock.base_icon() * 2.2;
+                            let visible_y = top.max(0.0) + 0.1;
+                            let hovered = dock.pointer_hit_zone();
+                            assert!(visible_y >= hovered.1 && visible_y <= hovered.3);
+                            assert_eq!(dock.hit_test(x, visible_y), Some(0));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1311,5 +1651,192 @@ mod tests {
             .unwrap();
         assert_eq!(dock.slots[r].presence_target, 1.0);
         assert_eq!(dock.slots[r].presence, 0.4); // eases back up from where it was
+    }
+}
+
+#[cfg(test)]
+mod layout_regression_tests {
+    use super::tests::{divider, item, pinned, running, seeded, start};
+    use super::*;
+    fn row(count: usize) -> Vec<DockItem> {
+        let mut row = vec![crate::apps::start_item(), crate::apps::drawer_item()];
+        for index in 0..count {
+            let mut item = crate::apps::control_item();
+            item.role = ItemRole::Pinned;
+            item.path = Some(format!(r"C:\Apps\{index}.exe"));
+            row.push(item);
+        }
+        row.push(crate::apps::control_item());
+        row
+    }
+    #[test]
+    fn overflow_preserves_every_application_and_keeps_controls() {
+        for dpi in [1.0, 1.5, 2.0] {
+            let (visible, hidden) =
+                limit_items(row(40), 900, dpi, Default::default(), ThemePreset::Glass);
+            assert!(visible.iter().any(|i| i.role == ItemRole::Overflow));
+            assert!(visible.iter().any(|i| i.role == ItemRole::Control));
+            let mut paths: Vec<_> = visible
+                .iter()
+                .chain(&hidden)
+                .filter_map(|i| i.path.clone())
+                .collect();
+            paths.sort();
+            paths.dedup();
+            assert_eq!(paths.len(), 40);
+            let model = Dock::new(visible, dpi, 900.0, 300.0, ThemePreset::Glass);
+            let frame = model.frame();
+            assert!(frame.pill.0 >= 0.0 && frame.pill.2 <= 900.0);
+            assert!(model.layout_dpi() <= dpi);
+        }
+    }
+    #[test]
+    fn empty_application_rows_do_not_create_an_empty_more_menu() {
+        let (visible, hidden) =
+            limit_items(row(0), 400, 2.0, Default::default(), ThemePreset::Glass);
+        assert!(hidden.is_empty());
+        assert!(!visible.iter().any(|i| i.role == ItemRole::Overflow));
+    }
+    #[test]
+    fn roomy_monitors_have_no_unnecessary_overflow() {
+        let (visible, hidden) =
+            limit_items(row(3), 1920, 1.0, Default::default(), ThemePreset::Glass);
+        assert!(hidden.is_empty());
+        assert!(!visible.iter().any(|i| i.role == ItemRole::Overflow));
+    }
+    #[test]
+    fn custom_magnification_and_reduced_motion_share_model_geometry() {
+        let mut dock = Dock::new(row(2), 1.0, 800.0, 160.0, ThemePreset::Glass);
+        dock.preferences.magnification = 130;
+        dock.cursor_x = Some(200.0);
+        assert!((dock.target(200.0) - 1.3).abs() < 0.001);
+        dock.preferences.reduce_motion = true;
+        dock.reveal_target = 0.0;
+        dock.bump(2);
+        assert!(!dock.tick());
+        assert_eq!(dock.reveal, 0.0);
+        assert!(dock.slots.iter().all(|slot| slot.bounce == 0.0));
+    }
+    #[test]
+    fn compact_preset_reduces_actual_row_width() {
+        let row = row(8);
+        assert!(
+            window_size_with(&row, 1.0, Default::default(), ThemePreset::Compact).0
+                < window_size_with(&row, 1.0, Default::default(), ThemePreset::Glass).0
+        );
+    }
+
+    #[test]
+    fn limit_items_drops_regular_items_before_waiting_and_running_agents() {
+        let mut codex_waiting = pinned("C:\\Codex.exe", None);
+        codex_waiting.agent = Some(AgentSlotInfo {
+            agent_id: "codex".to_string(),
+            state: AgentState::Waiting,
+            badge: Some("!".to_string()),
+            active_sessions: 0,
+            total_sessions: 1,
+            waiting_sessions: 1,
+        });
+        let mut dsh_idle = pinned("C:\\dsh.exe", None);
+        dsh_idle.agent = Some(AgentSlotInfo::idle("dsh"));
+        let agent_div = item(ItemRole::AgentDivider, None, None);
+        let control = item(ItemRole::Control, None, None);
+
+        let all = vec![
+            start(),
+            pinned("C:\\App1.exe", None),
+            pinned("C:\\App2.exe", None),
+            divider(),
+            running(101),
+            agent_div,
+            codex_waiting,
+            dsh_idle,
+            control,
+        ];
+        // Minimum width for `[start, codex_waiting, overflow, control]` at default 50px + headroom
+        // is 474 px; 500 px keeps `codex_waiting` while evicting regular items + idle Agent.
+        let (visible, hidden) = limit_items(
+            all.clone(),
+            500,
+            1.0,
+            Default::default(),
+            ThemePreset::Glass,
+        );
+        assert!(visible
+            .iter()
+            .any(|i| i.agent.as_ref().is_some_and(|a| a.agent_id == "codex")));
+        assert!(hidden
+            .iter()
+            .any(|i| i.role == ItemRole::Running && !i.is_agent()));
+        assert!(!visible.iter().any(|i| i.role == ItemRole::Divider));
+        assert!(!visible.iter().any(|i| i.role == ItemRole::AgentDivider));
+
+        // Even below minimum slot width, system buttons remain reachable.
+        let (extreme, _) = limit_items(all, 300, 1.0, Default::default(), ThemePreset::Glass);
+        assert!(extreme.iter().any(|i| i.role == ItemRole::Start));
+        assert!(extreme.iter().any(|i| i.role == ItemRole::Overflow));
+        assert!(extreme.iter().any(|i| i.role == ItemRole::Control));
+    }
+
+    #[test]
+    fn overflow_keeps_running_agent_before_idle_gui_agent() {
+        let mut codex_running = pinned("C:\\Codex.exe", None);
+        codex_running.agent = Some(AgentSlotInfo {
+            agent_id: "codex".to_string(),
+            state: AgentState::Running,
+            badge: Some("1".to_string()),
+            active_sessions: 1,
+            total_sessions: 1,
+            waiting_sessions: 0,
+        });
+        let mut dsh_idle_gui = pinned("C:\\dsh.exe", Some(42));
+        dsh_idle_gui.agent = Some(AgentSlotInfo::idle("dsh"));
+        let all = vec![
+            start(),
+            item(ItemRole::AgentDivider, None, None),
+            codex_running,
+            dsh_idle_gui,
+            item(ItemRole::Control, None, None),
+        ];
+        let (visible, hidden) = limit_items(all, 500, 1.0, Default::default(), ThemePreset::Glass);
+        assert!(visible
+            .iter()
+            .any(|i| i.agent.as_ref().is_some_and(|a| a.agent_id == "codex")));
+        assert!(hidden
+            .iter()
+            .any(|i| i.agent.as_ref().is_some_and(|a| a.agent_id == "dsh")));
+    }
+
+    #[test]
+    fn reconcile_tracks_agent_active_indicator_and_running_presence() {
+        let mut agent_pinned = pinned("C:\\Antigravity.exe", None);
+        agent_pinned.agent = Some(AgentSlotInfo::idle("antigravity"));
+        let mut dock = seeded(vec![
+            start(),
+            item(ItemRole::AgentDivider, None, None),
+            agent_pinned.clone(),
+        ]);
+        assert!(!dock.has_running_agent());
+        assert_eq!(dock.slots[2].running_target, 0.0);
+
+        agent_pinned.agent = Some(AgentSlotInfo {
+            agent_id: "antigravity".to_string(),
+            state: AgentState::Running,
+            badge: Some("1".to_string()),
+            active_sessions: 1,
+            total_sessions: 1,
+            waiting_sessions: 0,
+        });
+        dock.reconcile(vec![
+            start(),
+            item(ItemRole::AgentDivider, None, None),
+            agent_pinned,
+        ]);
+        assert!(dock.has_running_agent());
+        assert_eq!(dock.slots[2].running_target, 1.0);
+        assert_eq!(
+            dock.items[2].key(),
+            ItemKey::Agent("antigravity".to_string())
+        );
     }
 }

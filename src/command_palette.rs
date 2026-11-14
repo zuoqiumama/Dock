@@ -21,6 +21,7 @@ const ID_EDIT: usize = 4301;
 const ID_LIST: usize = 4302;
 const MAX_RESULTS: usize = 18;
 const PALETTE_SUBCLASS_ID: usize = 1;
+pub(crate) const WM_ENTRIES_READY: u32 = WM_APP + 0x40;
 
 static PALETTE_HWND: AtomicIsize = AtomicIsize::new(0);
 
@@ -35,6 +36,10 @@ pub struct CommandEntry {
     pub label: String,
     pub detail: String,
     action: CommandAction,
+    action_id: String,
+    history_key: String,
+    aliases: Vec<String>,
+    used: u64,
 }
 
 impl CommandEntry {
@@ -43,6 +48,10 @@ impl CommandEntry {
         CommandEntry {
             label: label.into(),
             detail: path.clone(),
+            action_id: crate::app_identity::command_action_id(&path),
+            history_key: crate::app_identity::cached_launch_key(&path),
+            aliases: Vec::new(),
+            used: 0,
             action: CommandAction::OpenPath(path),
         }
     }
@@ -52,39 +61,27 @@ impl CommandEntry {
             label: label.into(),
             detail: "运行中的窗口".to_string(),
             action: CommandAction::ActivateWindow(hwnd),
+            action_id: format!("window:{hwnd}"),
+            history_key: String::new(),
+            aliases: Vec::new(),
+            used: 0,
         }
     }
 }
 
-fn haystack(entry: &CommandEntry) -> String {
-    format!("{} {}", entry.label, entry.detail).to_lowercase()
-}
-
 pub fn matches_query(entry: &CommandEntry, query: &str) -> bool {
-    let haystack = haystack(entry);
-    query
-        .split_whitespace()
-        .all(|part| haystack.contains(&part.to_lowercase()))
+    crate::search::matches_names(
+        std::iter::once(entry.label.as_str()).chain(entry.aliases.iter().map(String::as_str)),
+        &entry.detail,
+        query,
+    )
 }
 
 fn score(entry: &CommandEntry, query: &str) -> i32 {
-    let query = query.trim().to_lowercase();
-    let label = entry.label.to_lowercase();
-    if query.is_empty() {
-        return 0;
-    }
-    if label.starts_with(&query) {
-        0
-    } else if label
-        .split(|ch: char| ch.is_whitespace() || ch == '-' || ch == '_')
-        .any(|word| word.starts_with(&query))
-    {
-        1
-    } else if label.contains(&query) {
-        2
-    } else {
-        3
-    }
+    crate::search::score_names(
+        std::iter::once(entry.label.as_str()).chain(entry.aliases.iter().map(String::as_str)),
+        query,
+    )
 }
 
 pub fn filter_entries(entries: &[CommandEntry], query: &str, limit: usize) -> Vec<CommandEntry> {
@@ -96,6 +93,7 @@ pub fn filter_entries(entries: &[CommandEntry], query: &str, limit: usize) -> Ve
     matches.sort_by(|a, b| {
         score(a, query)
             .cmp(&score(b, query))
+            .then_with(|| b.used.cmp(&a.used))
             .then_with(|| a.label.to_lowercase().cmp(&b.label.to_lowercase()))
     });
     matches.truncate(limit);
@@ -109,14 +107,137 @@ struct Palette {
     filtered: Vec<CommandEntry>,
     bg: HBRUSH,
     font: HFONT,
+    material: crate::theme::SurfaceTheme,
+    pending: Option<std::sync::mpsc::Receiver<Vec<CommandEntry>>>,
 }
 
 fn wide_nul(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
-    COLORREF(r as u32 | ((g as u32) << 8) | ((b as u32) << 16))
+fn material_color(rgb: (f32, f32, f32)) -> COLORREF {
+    COLORREF(
+        (rgb.0 * 255.0).round() as u32
+            | (((rgb.1 * 255.0).round() as u32) << 8)
+            | (((rgb.2 * 255.0).round() as u32) << 16),
+    )
+}
+
+fn window_launch_history_key(
+    entries: &[CommandEntry],
+    app_id: Option<&str>,
+    exe_path: Option<&str>,
+    running: &[crate::windows_list::RunningWindow],
+) -> Option<String> {
+    if let (Some(app_id), Some(exe_path)) = (app_id, exe_path) {
+        let exe_path = crate::app_identity::normalize(exe_path);
+        let ids: std::collections::BTreeSet<&str> = running
+            .iter()
+            .filter(|window| {
+                window
+                    .exe_path
+                    .as_deref()
+                    .map(crate::app_identity::normalize)
+                    .as_deref()
+                    == Some(exe_path.as_str())
+            })
+            .filter_map(|window| window.app_id.as_deref())
+            .collect();
+        if ids.len() != 1 || ids.iter().next().copied() != Some(app_id) {
+            return None;
+        }
+    }
+    let exe_path = exe_path.map(crate::app_identity::normalize);
+    let mut keys = std::collections::BTreeSet::new();
+    for entry in entries.iter().filter(|entry| {
+        matches!(entry.action, CommandAction::OpenPath(_))
+            && (app_id.is_some_and(|id| id == entry.history_key)
+                || exe_path
+                    .as_ref()
+                    .is_some_and(|path| path == &entry.history_key))
+    }) {
+        keys.insert(entry.history_key.clone());
+    }
+    if keys.len() == 1 {
+        keys.into_iter().next()
+    } else {
+        None
+    }
+}
+
+fn unify_history_keys(
+    entries: &mut [CommandEntry],
+    running: &[crate::windows_list::RunningWindow],
+) {
+    let mappings: Vec<(isize, String)> = running
+        .iter()
+        .filter_map(|window| {
+            window_launch_history_key(
+                entries,
+                window.app_id.as_deref(),
+                window.exe_path.as_deref(),
+                running,
+            )
+            .map(|key| (window.hwnd, key))
+        })
+        .collect();
+    for entry in entries.iter_mut() {
+        let hwnd = match &entry.action {
+            CommandAction::ActivateWindow(hwnd) => *hwnd,
+            _ => continue,
+        };
+        if let Some((_, key)) = mappings.iter().find(|(candidate, _)| candidate == &hwnd) {
+            entry.history_key = key.clone();
+        }
+    }
+}
+
+fn unified_history(
+    history: &[(String, u64)],
+    entries: &[CommandEntry],
+    running: &[crate::windows_list::RunningWindow],
+) -> Vec<(String, u64)> {
+    let launch_keys: std::collections::BTreeSet<String> = entries
+        .iter()
+        .filter(|entry| matches!(entry.action, CommandAction::OpenPath(_)))
+        .map(|entry| entry.history_key.clone())
+        .collect();
+    let mut unified: Vec<(String, u64)> = Vec::new();
+    for (key, time) in history {
+        let key = if launch_keys.contains(key) {
+            key.clone()
+        } else {
+            running
+                .iter()
+                .find_map(|window| {
+                    if window.app_id.as_deref() != Some(key.as_str())
+                        && window
+                            .exe_path
+                            .as_deref()
+                            .map(crate::app_identity::normalize)
+                            .as_deref()
+                            != Some(key.as_str())
+                    {
+                        return None;
+                    }
+                    window_launch_history_key(
+                        entries,
+                        window.app_id.as_deref(),
+                        window.exe_path.as_deref(),
+                        running,
+                    )
+                })
+                .unwrap_or_else(|| key.clone())
+        };
+        if let Some(existing) = unified.iter_mut().find(|(old, _)| old == &key) {
+            existing.1 = existing.1.max(*time);
+        } else {
+            unified.push((key, *time));
+        }
+    }
+    unified.sort_by_key(|(_, time)| std::cmp::Reverse(*time));
+    unified.truncate(128);
+    unified
 }
 
 fn collect_entries() -> Vec<CommandEntry> {
@@ -131,27 +252,118 @@ fn collect_entries() -> Vec<CommandEntry> {
                         .map(|value| value.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "Item".to_string())
                 });
-                entries.push(CommandEntry::open_path(label, path));
+                let mut entry = CommandEntry::open_path(label, path.clone());
+                entry.history_key = unsafe { crate::app_identity::resolve_launch_key(&path) };
+                entries.push(entry);
             }
         }
     }
-    unsafe {
-        for window in crate::windows_list::enumerate_sorted() {
-            entries.push(CommandEntry::activate_window(window.title, window.hwnd));
-        }
+    let running = unsafe { crate::windows_list::enumerate_sorted() };
+    for window in &running {
+        let mut entry = CommandEntry::activate_window(window.title.clone(), window.hwnd);
+        entry.history_key = window
+            .app_id
+            .clone()
+            .or_else(|| {
+                window
+                    .exe_path
+                    .as_deref()
+                    .map(crate::app_identity::normalize)
+            })
+            .unwrap_or_default();
+        entries.push(entry);
     }
-    unsafe {
-        for entry in crate::desktop_scan::scan_programs_cached() {
+    {
+        for entry in crate::desktop_scan::snapshot() {
             if let Some(path) = entry.path {
-                entries.push(CommandEntry::open_path(entry.label, path));
+                let mut entry = CommandEntry::open_path(entry.label, path.clone());
+                entry.history_key = unsafe { crate::app_identity::resolve_launch_key(&path) };
+                entries.push(entry);
             }
         }
     }
-    entries.sort_by_key(|entry| entry.label.to_lowercase());
-    entries.dedup_by(|a, b| {
-        a.label.eq_ignore_ascii_case(&b.label) && a.detail.eq_ignore_ascii_case(&b.detail)
+    unify_history_keys(&mut entries, &running);
+    let history = unified_history(&load_history(), &entries, &running);
+    merge_entries(entries, &history)
+}
+
+fn add_alias(entry: &mut CommandEntry, alias: String) {
+    if !entry.label.eq_ignore_ascii_case(&alias)
+        && !entry
+            .aliases
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&alias))
+    {
+        entry.aliases.push(alias);
+    }
+}
+
+fn merge_entries(entries: Vec<CommandEntry>, history: &[(String, u64)]) -> Vec<CommandEntry> {
+    let mut merged: Vec<CommandEntry> = Vec::new();
+    for mut entry in entries {
+        entry.used = if entry.history_key.is_empty() {
+            0
+        } else {
+            history
+                .iter()
+                .find(|(key, _)| key == &entry.history_key)
+                .map_or(0, |(_, time)| *time)
+        };
+        if matches!(entry.action, CommandAction::OpenPath(_)) {
+            if let Some(existing) = merged.iter_mut().find(|existing| {
+                existing.action_id == entry.action_id
+                    && matches!(existing.action, CommandAction::OpenPath(_))
+            }) {
+                add_alias(existing, entry.label.clone());
+                for alias in entry.aliases {
+                    add_alias(existing, alias);
+                }
+                existing.used = existing.used.max(entry.used);
+                continue;
+            }
+        }
+        merged.push(entry);
+    }
+    merged
+}
+
+fn history_path() -> std::path::PathBuf {
+    crate::config::config_path().with_file_name("search-history.tsv")
+}
+fn load_history() -> Vec<(String, u64)> {
+    std::fs::read_to_string(history_path())
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| {
+            let (time, key) = line.split_once('\t')?;
+            Some((key.to_string(), time.parse().ok()?))
+        })
+        .take(128)
+        .collect()
+}
+static HISTORY_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn remember(key: String) {
+    if key.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let _guard = HISTORY_WRITE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut history = load_history();
+        history.retain(|(old, _)| old != &key);
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        history.insert(0, (key, time));
+        history.truncate(128);
+        let data: String = history
+            .iter()
+            .map(|(key, time)| format!("{time}\t{}\n", key.replace(['\n', '\r', '\t'], " ")))
+            .collect();
+        if let Err(error) = crate::atomic::write(&history_path(), data.as_bytes()) {
+            crate::error_log::write("保存搜索历史失败", &error);
+        }
     });
-    entries
 }
 
 unsafe fn read_text(hwnd: HWND) -> String {
@@ -164,12 +376,42 @@ unsafe fn read_text(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..n as usize])
 }
 
-unsafe fn refresh_list(state: &mut Palette) {
+fn refreshed_selection(
+    previous: &[CommandEntry],
+    selected: isize,
+    current: &[CommandEntry],
+    preserve: bool,
+) -> Option<usize> {
+    if current.is_empty() {
+        return None;
+    }
+    if preserve && selected >= 0 {
+        if let Some(selected) = previous.get(selected as usize) {
+            if let Some(index) = current
+                .iter()
+                .position(|entry| entry.action_id == selected.action_id)
+            {
+                return Some(index);
+            }
+        }
+    }
+    Some(0)
+}
+
+unsafe fn refresh_list(state: &mut Palette, preserve_selection: bool) {
     let query = read_text(state.edit);
-    state.filtered = filter_entries(&state.entries, &query, MAX_RESULTS);
+    let selected = SendMessageW(state.list, LB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
+    let filtered = filter_entries(&state.entries, &query, MAX_RESULTS);
+    let selection = refreshed_selection(&state.filtered, selected, &filtered, preserve_selection);
+    state.filtered = filtered;
     SendMessageW(state.list, LB_RESETCONTENT, WPARAM(0), LPARAM(0));
     for entry in &state.filtered {
-        let text = wide_nul(&format!("{}   {}", entry.label, entry.detail));
+        let kind = if matches!(entry.action, CommandAction::ActivateWindow(_)) {
+            "切换窗口"
+        } else {
+            "打开"
+        };
+        let text = wide_nul(&format!("{}   · {}", entry.label, kind));
         SendMessageW(
             state.list,
             LB_ADDSTRING,
@@ -177,12 +419,25 @@ unsafe fn refresh_list(state: &mut Palette) {
             LPARAM(text.as_ptr() as isize),
         );
     }
-    if !state.filtered.is_empty() {
-        SendMessageW(state.list, LB_SETCURSEL, WPARAM(0), LPARAM(0));
+    if let Some(selected) = selection {
+        SendMessageW(state.list, LB_SETCURSEL, WPARAM(selected), LPARAM(0));
+    } else {
+        let text = wide_nul(if state.pending.is_some() {
+            "正在后台加载…"
+        } else {
+            "没有匹配的项目"
+        });
+        SendMessageW(
+            state.list,
+            LB_ADDSTRING,
+            WPARAM(0),
+            LPARAM(text.as_ptr() as isize),
+        );
     }
 }
 
 unsafe fn run_entry(entry: &CommandEntry) {
+    remember(entry.history_key.clone());
     match &entry.action {
         CommandAction::OpenPath(path) => {
             let target = wide_nul(path);
@@ -223,16 +478,121 @@ unsafe extern "system" fn key_subclass_proc(
     subclass_id: usize,
     _ref_data: usize,
 ) -> LRESULT {
-    if msg == WM_KEYDOWN && (wparam.0 == VK_RETURN.0 as usize || wparam.0 == VK_ESCAPE.0 as usize) {
+    if msg == WM_KEYDOWN
+        && GetPropW(hwnd, w!("FeatherDock.IME")).is_invalid()
+        && (wparam.0 == VK_RETURN.0 as usize || wparam.0 == VK_ESCAPE.0 as usize)
+    {
         if let Ok(parent) = GetParent(hwnd) {
             SendMessageW(parent, msg, wparam, lparam);
         }
         return LRESULT(0);
     }
+    if msg == WM_IME_STARTCOMPOSITION {
+        let _ = SetPropW(
+            hwnd,
+            w!("FeatherDock.IME"),
+            HANDLE(std::ptr::dangling_mut::<c_void>()),
+        );
+    }
+    if msg == WM_IME_ENDCOMPOSITION {
+        let _ = RemovePropW(hwnd, w!("FeatherDock.IME"));
+    }
+    let composing = !GetPropW(hwnd, w!("FeatherDock.IME")).is_invalid();
+    if msg == WM_KEYDOWN && !composing && wparam.0 == 0x09 {
+        if let Ok(parent) = GetParent(hwnd) {
+            let id = if GetWindowLongPtrW(hwnd, GWLP_ID) == ID_EDIT as isize {
+                ID_LIST
+            } else {
+                ID_EDIT
+            };
+            if let Ok(target) = GetDlgItem(parent, id as i32) {
+                let _ = SetFocus(target);
+            }
+        }
+        return LRESULT(0);
+    }
+    if msg == WM_KEYDOWN
+        && !composing
+        && GetWindowLongPtrW(hwnd, GWLP_ID) == ID_EDIT as isize
+        && matches!(wparam.0, 0x26 | 0x28 | 0x21 | 0x22)
+    {
+        if let Ok(parent) = GetParent(hwnd) {
+            if let Ok(list) = GetDlgItem(parent, ID_LIST as i32) {
+                let count = SendMessageW(list, LB_GETCOUNT, WPARAM(0), LPARAM(0)).0;
+                let current = SendMessageW(list, LB_GETCURSEL, WPARAM(0), LPARAM(0))
+                    .0
+                    .max(0);
+                let delta = match wparam.0 {
+                    0x26 => -1,
+                    0x21 => -8,
+                    0x22 => 8,
+                    _ => 1,
+                };
+                if count > 0 {
+                    SendMessageW(
+                        list,
+                        LB_SETCURSEL,
+                        WPARAM((current + delta).clamp(0, count - 1) as usize),
+                        LPARAM(0),
+                    );
+                }
+            }
+        }
+        return LRESULT(0);
+    }
     if msg == WM_NCDESTROY {
+        let _ = RemovePropW(hwnd, w!("FeatherDock.IME"));
         let _ = RemoveWindowSubclass(hwnd, Some(key_subclass_proc), subclass_id);
     }
     DefSubclassProc(hwnd, msg, wparam, lparam)
+}
+
+unsafe fn collect_async(hwnd: HWND, state: &mut Palette) {
+    let (send, receive) = std::sync::mpsc::channel();
+    state.pending = Some(receive);
+    let owner = hwnd.0 as isize;
+    std::thread::spawn(move || {
+        let initialized = unsafe {
+            windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+            )
+            .is_ok()
+        };
+        let entries = std::panic::catch_unwind(collect_entries).unwrap_or_default();
+        if initialized {
+            unsafe {
+                windows::Win32::System::Com::CoUninitialize();
+            }
+        }
+        if send.send(entries).is_ok() {
+            unsafe {
+                let _ = PostMessageW(
+                    HWND(owner as *mut c_void),
+                    WM_ENTRIES_READY,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+        }
+    });
+}
+
+pub unsafe fn close() {
+    let hwnd = HWND(PALETTE_HWND.load(Ordering::Relaxed) as *mut c_void);
+    if IsWindow(hwnd).as_bool() {
+        let _ = DestroyWindow(hwnd);
+    }
+}
+
+pub unsafe fn desktop_ready() {
+    let hwnd = HWND(PALETTE_HWND.load(Ordering::Relaxed) as *mut c_void);
+    if IsWindow(hwnd).as_bool() {
+        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Palette;
+        if !ptr.is_null() {
+            collect_async(hwnd, &mut *ptr);
+        }
+    }
 }
 
 pub unsafe fn toggle(owner: HWND) {
@@ -245,6 +605,51 @@ pub unsafe fn toggle(owner: HWND) {
         }
     }
     open(owner);
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ControlLayout {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PaletteLayout {
+    edit: ControlLayout,
+    list: ControlLayout,
+    font_height: i32,
+}
+
+fn palette_layout(client_width: i32, client_height: i32, dpi_scale: f32) -> PaletteLayout {
+    let width = client_width.max(0);
+    let height = client_height.max(0);
+    let scale = dpi_scale
+        .max(0.0)
+        .min(width as f32 / 560.0)
+        .min(height as f32 / 420.0);
+    let s = |value: f32| (value * scale).round() as i32;
+    let margin = s(14.0);
+    let left = margin.min(width);
+    let right = (width - margin).max(left);
+    let edit_y = margin.min(height);
+    let list_y = s(54.0).min(height);
+    PaletteLayout {
+        edit: ControlLayout {
+            x: left,
+            y: edit_y,
+            width: right - left,
+            height: s(30.0).min(height - edit_y),
+        },
+        list: ControlLayout {
+            x: left,
+            y: list_y,
+            width: right - left,
+            height: (height - list_y - s(46.0)).max(0),
+        },
+        font_height: (10.0 * scale * 96.0 / 72.0).round().max(1.0) as i32,
+    }
 }
 
 unsafe fn open(owner: HWND) {
@@ -274,10 +679,13 @@ unsafe fn open(owner: HWND) {
         bottom: s(420.0),
     };
     let _ = AdjustWindowRectEx(&mut rc, style, false, WS_EX_TOPMOST);
-    let win_w = rc.right - rc.left;
-    let win_h = rc.bottom - rc.top;
-    let x = (GetSystemMetrics(SM_CXSCREEN) - win_w) / 2;
-    let y = (GetSystemMetrics(SM_CYSCREEN) - win_h) / 3;
+    let mut parent_rect = RECT::default();
+    let _ = GetWindowRect(owner, &mut parent_rect);
+    let area = crate::geometry::work_area(parent_rect.left, parent_rect.top);
+    let win_w = (rc.right - rc.left).min((area.right - area.left - 16).max(1));
+    let win_h = (rc.bottom - rc.top).min((area.bottom - area.top - 16).max(1));
+    let x = area.left + (area.right - area.left - win_w) / 2;
+    let y = area.top + (area.bottom - area.top - win_h) / 3;
 
     let Ok(hwnd) = CreateWindowExW(
         WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
@@ -296,7 +704,9 @@ unsafe fn open(owner: HWND) {
         return;
     };
 
-    let dark: i32 = 1;
+    let material = crate::dock_theme(owner).surface();
+    let light = material.rgb.0 > 0.5;
+    let dark: i32 = i32::from(!light);
     let _ = DwmSetWindowAttribute(
         hwnd,
         DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -304,9 +714,16 @@ unsafe fn open(owner: HWND) {
         4,
     );
 
+    let mut client = RECT::default();
+    let _ = GetClientRect(hwnd, &mut client);
+    let layout = palette_layout(
+        client.right - client.left,
+        client.bottom - client.top,
+        scale,
+    );
     let face = wide_nul("Microsoft YaHei UI");
     let font = CreateFontW(
-        -((10.0 * scale * 96.0 / 72.0) as i32),
+        -layout.font_height,
         0,
         0,
         0,
@@ -321,17 +738,17 @@ unsafe fn open(owner: HWND) {
         0,
         PCWSTR(face.as_ptr()),
     );
-    let bg = CreateSolidBrush(rgb(0x20, 0x20, 0x24));
+    let bg = CreateSolidBrush(material_color(material.rgb));
 
     let edit = CreateWindowExW(
         WS_EX_CLIENTEDGE,
         w!("EDIT"),
         w!(""),
         WS_CHILD | WS_VISIBLE | WINDOW_STYLE(ES_AUTOHSCROLL as u32 | WS_TABSTOP.0),
-        s(14.0),
-        s(14.0),
-        s(532.0),
-        s(30.0),
+        layout.edit.x,
+        layout.edit.y,
+        layout.edit.width,
+        layout.edit.height,
         hwnd,
         HMENU(ID_EDIT as *mut c_void),
         instance,
@@ -346,10 +763,10 @@ unsafe fn open(owner: HWND) {
             | WS_VISIBLE
             | WS_VSCROLL
             | WINDOW_STYLE(LBS_NOTIFY as u32 | LBS_NOINTEGRALHEIGHT as u32 | WS_BORDER.0),
-        s(14.0),
-        s(54.0),
-        s(532.0),
-        s(320.0),
+        layout.list.x,
+        layout.list.y,
+        layout.list.width,
+        layout.list.height,
         hwnd,
         HMENU(ID_LIST as *mut c_void),
         instance,
@@ -361,18 +778,38 @@ unsafe fn open(owner: HWND) {
     }
     SendMessageW(edit, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
     SendMessageW(list, WM_SETFONT, WPARAM(font.0 as usize), LPARAM(1));
-    let _ = SetWindowTheme(edit, w!("DarkMode_CFD"), PCWSTR::null());
-    let _ = SetWindowTheme(list, w!("DarkMode_Explorer"), PCWSTR::null());
+    let _ = SetWindowTheme(
+        edit,
+        if light {
+            w!("Explorer")
+        } else {
+            w!("DarkMode_CFD")
+        },
+        PCWSTR::null(),
+    );
+    let _ = SetWindowTheme(
+        list,
+        if light {
+            w!("Explorer")
+        } else {
+            w!("DarkMode_Explorer")
+        },
+        PCWSTR::null(),
+    );
 
     let mut state = Box::new(Palette {
         edit,
         list,
-        entries: collect_entries(),
+        entries: Vec::new(),
         filtered: Vec::new(),
         bg,
         font,
+        material,
+        pending: None,
     });
-    refresh_list(&mut state);
+    collect_async(hwnd, &mut state);
+    crate::desktop_scan::refresh_async(owner, false);
+    refresh_list(&mut state, false);
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
     PALETTE_HWND.store(hwnd.0 as isize, Ordering::Relaxed);
 
@@ -385,6 +822,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
     unsafe {
         let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Palette;
         match msg {
+            WM_ENTRIES_READY if !ptr.is_null() => {
+                let state = &mut *ptr;
+                if let Some(entries) = state.pending.as_ref().and_then(|rx| rx.try_recv().ok()) {
+                    state.entries = entries;
+                    state.pending = None;
+                    refresh_list(state, true);
+                }
+                LRESULT(0)
+            }
             WM_ERASEBKGND if !ptr.is_null() => {
                 let hdc = HDC(wparam.0 as *mut c_void);
                 let mut rc = RECT::default();
@@ -394,8 +840,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX if !ptr.is_null() => {
                 let hdc = HDC(wparam.0 as *mut c_void);
-                SetTextColor(hdc, rgb(0xEC, 0xEC, 0xEC));
-                SetBkColor(hdc, rgb(0x20, 0x20, 0x24));
+                SetTextColor(hdc, material_color((*ptr).material.text_rgb));
+                SetBkColor(hdc, material_color((*ptr).material.rgb));
                 SetBkMode(hdc, TRANSPARENT);
                 LRESULT((*ptr).bg.0 as isize)
             }
@@ -403,7 +849,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let id = wparam.0 & 0xFFFF;
                 let code = (wparam.0 >> 16) & 0xFFFF;
                 if id == ID_EDIT && code == EN_CHANGE as usize {
-                    refresh_list(&mut *ptr);
+                    refresh_list(&mut *ptr, false);
                 } else if id == ID_LIST && code == LBN_DBLCLK as usize {
                     activate_selection(hwnd, &*ptr);
                 }
@@ -661,5 +1107,184 @@ mod tests {
                 "LISTBOX must still handle its native navigation key"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod search_regression_tests {
+    use super::*;
+
+    #[test]
+    fn chinese_and_english_aliases_match_in_either_order() {
+        for (primary, alias) in [("微信", "WeChat"), ("WeChat", "微信")] {
+            let merged = merge_entries(
+                vec![
+                    CommandEntry::open_path(primary, r"C:\WeChat.exe"),
+                    CommandEntry::open_path(alias, r"C:\WeChat.exe"),
+                ],
+                &[],
+            );
+            assert_eq!(merged.len(), 1);
+            for query in ["wx", "weixin", "wechat", alias] {
+                assert!(matches_query(&merged[0], query), "query: {query}");
+            }
+        }
+    }
+
+    #[test]
+    fn launch_aliases_merge_but_distinct_windows_remain_reachable() {
+        let a = CommandEntry::open_path("微信", r"C:\WeChat.exe");
+        let b = CommandEntry::open_path("WeChat", r"C:\WeChat.exe");
+        let mut first = CommandEntry::activate_window("聊天一", 1);
+        first.history_key = a.history_key.clone();
+        let mut second = CommandEntry::activate_window("聊天二", 2);
+        second.history_key = a.history_key.clone();
+        let merged = merge_entries(vec![a, b, first, second], &[]);
+        assert_eq!(merged.len(), 3);
+        assert!(matches_query(&merged[0], "wechat"));
+        assert!(matches_query(&merged[0], "wx"));
+        assert_ne!(merged[1].action_id, merged[2].action_id);
+        assert_eq!(merged[1].history_key, merged[2].history_key);
+    }
+
+    #[test]
+    fn links_with_the_same_target_keep_distinct_actions() {
+        let mut first = CommandEntry::open_path("微信", r"C:\Links\WeChat.lnk");
+        let mut second = CommandEntry::open_path("工作微信", r"C:\Links\WeChat Work.lnk");
+        first.history_key = crate::app_identity::normalize(r"C:\Apps\WeChat.exe");
+        second.history_key = first.history_key.clone();
+        let duplicate = CommandEntry::open_path("WeChat", first.detail.clone());
+
+        let merged = merge_entries(vec![first, second, duplicate], &[]);
+
+        assert_eq!(merged.len(), 2);
+        assert_ne!(merged[0].action_id, merged[1].action_id);
+        assert_eq!(merged[0].history_key, merged[1].history_key);
+        assert!(matches_query(&merged[0], "wechat"));
+        assert!(matches_query(&merged[1], "gongzuoweixin"));
+    }
+
+    #[test]
+    fn history_breaks_equal_match_ties_without_overriding_a_better_match() {
+        let mut recent = CommandEntry::open_path("Visual Studio Code", r"C:\Code.exe");
+        recent.used = 50;
+        let preferred = CommandEntry::open_path("Code Notes", r"C:\Notes.exe");
+        assert_eq!(
+            filter_entries(&[recent.clone(), preferred], "code", 10)[0].label,
+            "Code Notes"
+        );
+        let mut older = CommandEntry::open_path("Other", r"C:\Other.exe");
+        older.used = 1;
+        assert_eq!(filter_entries(&[older, recent], "", 10)[0].used, 50);
+    }
+
+    #[test]
+    fn async_refresh_preserves_the_second_action_but_query_changes_reset() {
+        let previous = vec![
+            CommandEntry::open_path("Alpha", r"C:\A.exe"),
+            CommandEntry::open_path("Beta", r"C:\B.exe"),
+            CommandEntry::open_path("Gamma", r"C:\C.exe"),
+        ];
+        let current = vec![
+            previous[2].clone(),
+            previous[0].clone(),
+            previous[1].clone(),
+        ];
+
+        let selected = refreshed_selection(&previous, 1, &current, true);
+        assert_eq!(selected, Some(2));
+        assert_eq!(current[selected.unwrap()].action_id, previous[1].action_id);
+        assert_eq!(refreshed_selection(&previous, 1, &current, false), Some(0));
+    }
+
+    #[test]
+    fn direct_exe_and_unique_app_id_share_history_without_merging_ambiguous_apps() {
+        let exe = r"C:\Tools\App.exe";
+        let running = |app_id: &str| crate::windows_list::RunningWindow {
+            hwnd: 1,
+            title: "App".into(),
+            exe_path: Some(exe.into()),
+            app_id: Some(app_id.into()),
+        };
+        let exe_key = crate::app_identity::normalize(exe);
+        let running_entry = |app_id: &str, hwnd| {
+            let mut entry = CommandEntry::activate_window("App window", hwnd);
+            entry.history_key = app_id.into();
+            entry
+        };
+        let mut entries = vec![
+            CommandEntry::open_path("App", exe),
+            running_entry("aumid:vendor.one", 1),
+        ];
+        unify_history_keys(&mut entries, &[running("aumid:vendor.one")]);
+        assert!(entries.iter().all(|entry| entry.history_key == exe_key));
+
+        let history = unified_history(
+            &[("aumid:vendor.one".to_string(), 100)],
+            &entries,
+            &[running("aumid:vendor.one")],
+        );
+        assert_eq!(history, vec![(exe_key.clone(), 100)]);
+        let launch_entries = vec![CommandEntry::open_path("App", exe)];
+        let helper = |hwnd| crate::windows_list::RunningWindow {
+            hwnd,
+            title: "Helper".into(),
+            exe_path: Some(r"C:\Tools\Helper.exe".into()),
+            app_id: Some("aumid:vendor.one".into()),
+        };
+        for windows in [
+            vec![helper(0), running("aumid:vendor.one")],
+            vec![running("aumid:vendor.one"), helper(2)],
+        ] {
+            let history = unified_history(
+                &[("aumid:vendor.one".to_string(), 100)],
+                &launch_entries,
+                &windows,
+            );
+            assert_eq!(history, vec![(exe_key.clone(), 100)]);
+        }
+        let merged = merge_entries(entries, &history);
+        assert!(merged.iter().all(|entry| entry.used == 100));
+
+        let after_exit = vec![CommandEntry::open_path("App", exe)];
+        let history = unified_history(&history, &after_exit, &[]);
+        let merged = merge_entries(after_exit, &history);
+        assert_eq!(merged[0].used, 100);
+
+        let mut entries = vec![
+            CommandEntry::open_path("App", exe),
+            running_entry("aumid:vendor.one", 1),
+            running_entry("aumid:vendor.two", 2),
+        ];
+        unify_history_keys(
+            &mut entries,
+            &[running("aumid:vendor.one"), running("aumid:vendor.two")],
+        );
+        assert_eq!(entries[0].history_key, exe_key);
+        assert_eq!(entries[1].history_key, "aumid:vendor.one");
+        assert_eq!(entries[2].history_key, "aumid:vendor.two");
+    }
+
+    #[test]
+    fn palette_controls_fit_scaled_and_tiny_client_areas() {
+        for (width, height, scale) in [
+            (560, 420, 1.0),
+            (840, 630, 1.5),
+            (300, 180, 2.0),
+            (24, 16, 3.0),
+            (1, 1, 1.0),
+        ] {
+            let layout = palette_layout(width, height, scale);
+            for control in [layout.edit, layout.list] {
+                assert!(control.x >= 0 && control.y >= 0);
+                assert!(control.width >= 0 && control.height >= 0);
+                assert!(control.x + control.width <= width);
+                assert!(control.y + control.height <= height);
+            }
+            assert!(layout.edit.y + layout.edit.height <= layout.list.y);
+            assert!(layout.font_height > 0);
+        }
+        assert_eq!(palette_layout(840, 630, 1.5).font_height, 20);
+        assert!(palette_layout(300, 180, 2.0).font_height < 27);
     }
 }

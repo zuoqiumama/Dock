@@ -6,6 +6,7 @@
 //! `graphics::Gpu` (which owns the dock's icon pipeline) so
 //! the panel can be built and torn down on demand without touching the dock.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Direct2D::Common::*;
@@ -15,6 +16,34 @@ use windows::Win32::Graphics::Direct3D11::*;
 use windows::Win32::Graphics::DirectComposition::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
+
+pub unsafe fn report_present_error(
+    owner: HWND,
+    source: HWND,
+    context: &str,
+    error: Error,
+    reported: &AtomicBool,
+) {
+    if reported.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    crate::error_log::write(context, &error);
+    if owner.is_invalid() {
+        reported.store(false, Ordering::Relaxed);
+        return;
+    }
+    if PostMessageW(
+        owner,
+        crate::WM_POPUP_RENDER_FAILED,
+        WPARAM(source.0 as usize),
+        LPARAM(0),
+    )
+    .is_err()
+    {
+        reported.store(false, Ordering::Relaxed);
+    }
+}
 
 const POPUP_PRESENT_SYNC_INTERVAL: u32 = 0;
 

@@ -6,7 +6,8 @@
 .DESCRIPTION
     Takes two CPU snapshots `-Seconds` apart for every running FeatherDock process (the
     dock + its watchdog) and reports, per process:
-        CPU%        average single-core-equivalent CPU over the window
+        CPU%        average CPU normalized across all logical processors
+        CoreCPU%    average single-core-equivalent CPU over the window
         WS(MB)      working set
         Private(MB) private bytes
         Handles     open handle count
@@ -61,6 +62,7 @@ $rows = foreach ($p in (Get-Process -Id ($procs.Id) -ErrorAction SilentlyContinu
         ProcessId     = $p.Id
         Name          = $p.ProcessName
         'CPU%'        = $pct
+        'CoreCPU%'    = if ($Seconds -gt 0) { [math]::Round(($delta / $Seconds) * 100, 3) } else { 0 }
         'WS(MB)'      = [math]::Round($p.WorkingSet64 / 1MB, 2)
         'Private(MB)' = [math]::Round($p.PrivateMemorySize64 / 1MB, 2)
         Handles       = $p.HandleCount

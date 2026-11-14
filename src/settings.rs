@@ -65,8 +65,35 @@ impl TaskbarMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Layout {
+    pub icon_size: u32,
+    pub magnification: u32,
+    pub bottom_gap: u32,
+    pub opacity: u32,
+    pub preview_delay_ms: u32,
+    pub reduce_motion: bool,
+}
+impl Default for Layout {
+    fn default() -> Self {
+        Self {
+            icon_size: 50,
+            magnification: (crate::dock::MAX_SCALE * 100.0) as u32,
+            bottom_gap: crate::dock::SHOWN_GAP as u32,
+            opacity: 48,
+            preview_delay_ms: 300,
+            reduce_motion: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Settings {
     pub dock_mode: DockMode,
+    pub layout: Layout,
+    pub monitor: u32,
+    pub search_hotkey: u32,
+    pub follow_system: bool,
+    pub intellihide: bool,
     /// In Always mode, FULLY hide the dock while a fullscreen app (game/video) is in
     /// front — and don't let a bottom-edge hover summon it (never disturb the game).
     pub hide_on_fullscreen: bool,
@@ -84,18 +111,60 @@ pub struct Settings {
     /// Visual preset for the dock pill and subtle cues. Kept intentionally small:
     /// presets change paint constants without starting a skin/plugin system.
     pub theme: ThemePreset,
+    /// Dedicated right-side Agent zone + status lights / hover session card.
+    pub agent_zone_enabled: bool,
+    /// Very subtle slow shimmer along Running Agent icons (honours `reduce_motion`).
+    pub agent_shimmer: bool,
+    /// Single light bounce when an Agent session newly enters Waiting (suppressed when fullscreen).
+    pub agent_bounce_waiting: bool,
+}
+
+impl Settings {
+    pub fn effective_theme(&self) -> ThemePreset {
+        if !self.follow_system {
+            return self.theme;
+        }
+        unsafe {
+            use windows::core::w;
+            use windows::Win32::System::Registry::*;
+            let mut light = 1u32;
+            let mut size = 4u32;
+            let _ = RegGetValueW(
+                HKEY_CURRENT_USER,
+                w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+                w!("AppsUseLightTheme"),
+                RRF_RT_REG_DWORD,
+                None,
+                Some(&mut light as *mut _ as *mut core::ffi::c_void),
+                Some(&mut size),
+            );
+            if light == 0 {
+                ThemePreset::Compact
+            } else {
+                ThemePreset::Glass
+            }
+        }
+    }
 }
 
 impl Default for Settings {
     fn default() -> Settings {
         Settings {
             dock_mode: DockMode::Always,
+            layout: Layout::default(),
+            monitor: 0,
+            search_hotkey: 1,
+            follow_system: false,
+            intellihide: false,
             hide_on_fullscreen: true,
             hide_on_maximized: true,
             taskbar_mode: TaskbarMode::Show,
             drawer_enabled: true,
             hide_desktop_icons: false,
             theme: ThemePreset::Glass,
+            agent_zone_enabled: true,
+            agent_shimmer: true,
+            agent_bounce_waiting: true,
         }
     }
 }
@@ -110,6 +179,9 @@ const HEADER: &str = "\
 # drawer_enabled = true | false  (show the app-drawer button on the dock)
 # hide_desktop_icons = true | false  (hide the Windows desktop icons while running)
 # theme = \"glass\" | \"compact\" | \"solid\" | \"macos\" | \"contrast\"
+# agent_zone_enabled = true | false  (group AI agents in the right-side Agent zone)
+# agent_shimmer = true | false       (faint slow shimmer on active Running agent icons)
+# agent_bounce_waiting = true | false (single gentle hop when an agent enters Waiting)
 ";
 
 fn settings_path() -> PathBuf {
@@ -141,7 +213,46 @@ fn parse_line_into(settings: &mut Settings, line: &str) {
         return;
     };
     let value = value.trim().trim_matches('"');
+    let number = |low: u32, high: u32| value.parse::<u32>().ok().map(|v| v.clamp(low, high));
     match key.trim() {
+        "icon_size" => {
+            if let Some(v) = number(24, 80) {
+                settings.layout.icon_size = v;
+            }
+        }
+        "magnification" => {
+            if let Some(v) = number(100, 220) {
+                settings.layout.magnification = v;
+            }
+        }
+        "bottom_gap" => {
+            if let Some(v) = number(0, 32) {
+                settings.layout.bottom_gap = v;
+            }
+        }
+        "opacity" => {
+            if let Some(v) = number(10, 100) {
+                settings.layout.opacity = v;
+            }
+        }
+        "preview_delay_ms" => {
+            if let Some(v) = number(0, 1500) {
+                settings.layout.preview_delay_ms = v;
+            }
+        }
+        "monitor" => {
+            if let Some(v) = number(0, 99) {
+                settings.monitor = v;
+            }
+        }
+        "search_hotkey" => {
+            if let Some(v) = number(0, 3) {
+                settings.search_hotkey = v;
+            }
+        }
+        "follow_system" => settings.follow_system = value.eq_ignore_ascii_case("true"),
+        "reduce_motion" => settings.layout.reduce_motion = value.eq_ignore_ascii_case("true"),
+        "intellihide" => settings.intellihide = value.eq_ignore_ascii_case("true"),
         "dock_mode" => {
             if let Some(mode) = DockMode::parse(value) {
                 settings.dock_mode = mode;
@@ -169,6 +280,15 @@ fn parse_line_into(settings: &mut Settings, line: &str) {
                 settings.theme = theme;
             }
         }
+        "agent_zone_enabled" => {
+            settings.agent_zone_enabled = value.eq_ignore_ascii_case("true");
+        }
+        "agent_shimmer" => {
+            settings.agent_shimmer = value.eq_ignore_ascii_case("true");
+        }
+        "agent_bounce_waiting" => {
+            settings.agent_bounce_waiting = value.eq_ignore_ascii_case("true");
+        }
         _ => {}
     }
 }
@@ -176,7 +296,7 @@ fn parse_line_into(settings: &mut Settings, line: &str) {
 /// Persist the current settings (creating the folder/file as needed).
 pub fn save(settings: &Settings) -> io::Result<()> {
     let path = settings_path();
-    let body = format!(
+    let mut body = format!(
         "{HEADER}\ndock_mode = \"{}\"\nhide_on_fullscreen = {}\nhide_on_maximized = {}\ntaskbar_mode = \"{}\"\ndrawer_enabled = {}\nhide_desktop_icons = {}\ntheme = \"{}\"\n",
         settings.dock_mode.as_str(),
         settings.hide_on_fullscreen,
@@ -186,6 +306,11 @@ pub fn save(settings: &Settings) -> io::Result<()> {
         settings.hide_desktop_icons,
         settings.theme.as_str()
     );
+    body.push_str(&format!(
+        "agent_zone_enabled = {}\nagent_shimmer = {}\nagent_bounce_waiting = {}\n",
+        settings.agent_zone_enabled, settings.agent_shimmer, settings.agent_bounce_waiting
+    ));
+    body.push_str(&format!("icon_size = {}\nmagnification = {}\nbottom_gap = {}\nopacity = {}\npreview_delay_ms = {}\nreduce_motion = {}\nmonitor = {}\nsearch_hotkey = {}\nfollow_system = {}\nintellihide = {}\n",settings.layout.icon_size,settings.layout.magnification,settings.layout.bottom_gap,settings.layout.opacity,settings.layout.preview_delay_ms,settings.layout.reduce_motion,settings.monitor,settings.search_hotkey,settings.follow_system,settings.intellihide));
     crate::atomic::write(&path, body.as_bytes())
 }
 
@@ -215,5 +340,64 @@ mod tests {
 
         assert_eq!(settings.theme, crate::theme::ThemePreset::Compact);
         assert!(!settings.hide_on_fullscreen);
+    }
+}
+
+#[cfg(test)]
+mod layout_settings_regression_tests {
+    use super::*;
+    #[test]
+    fn numeric_preferences_are_bounded_and_invalid_values_preserve_defaults() {
+        let mut s = Settings::default();
+        for line in [
+            "icon_size = 9999",
+            "magnification = 0",
+            "opacity = 500",
+            "bottom_gap = 99",
+            "preview_delay_ms = 99999",
+            "search_hotkey = 3",
+            "monitor = 2",
+            "reduce_motion = true",
+        ] {
+            parse_line_into(&mut s, line);
+        }
+        assert_eq!(s.layout.icon_size, 80);
+        assert_eq!(s.layout.magnification, 100);
+        assert_eq!(s.layout.opacity, 100);
+        assert_eq!(s.layout.bottom_gap, 32);
+        assert_eq!(s.layout.preview_delay_ms, 1500);
+        assert_eq!(s.monitor, 2);
+        assert!(s.layout.reduce_motion);
+        parse_line_into(&mut s, "icon_size = oops");
+        assert_eq!(s.layout.icon_size, 80);
+    }
+    #[test]
+    fn old_settings_gain_safe_defaults_without_changing_system_policy() {
+        let mut s = Settings::default();
+        for line in "theme = glass\ntaskbar_mode = show\nhide_desktop_icons = false".lines() {
+            parse_line_into(&mut s, line);
+        }
+        assert_eq!(s.layout, Layout::default());
+        assert_eq!(s.monitor, 0);
+        assert_eq!(s.search_hotkey, 1);
+        assert!(!s.intellihide);
+        assert!(!s.hide_desktop_icons);
+        assert!(s.agent_zone_enabled);
+        assert!(s.agent_shimmer);
+        assert!(s.agent_bounce_waiting);
+    }
+
+    #[test]
+    fn parses_agent_settings_flags() {
+        let mut s = Settings::default();
+        for line in
+            "agent_zone_enabled = false\nagent_shimmer = false\nagent_bounce_waiting = false"
+                .lines()
+        {
+            parse_line_into(&mut s, line);
+        }
+        assert!(!s.agent_zone_enabled);
+        assert!(!s.agent_shimmer);
+        assert!(!s.agent_bounce_waiting);
     }
 }

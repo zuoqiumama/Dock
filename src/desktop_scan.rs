@@ -11,6 +11,7 @@
 use core::ffi::c_void;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use windows::core::*;
@@ -25,12 +26,172 @@ use crate::content::{classify_path, ContentKind};
 
 const CACHE_TTL_SECS: u64 = 300;
 
+#[derive(Clone)]
+struct SnapshotEntry {
+    label: String,
+    key: String,
+    path: Option<String>,
+    kind: ContentKind,
+}
+#[derive(Default)]
+struct Snapshot {
+    entries: Vec<SnapshotEntry>,
+    active: bool,
+    generation: u64,
+    updated: Option<std::time::Instant>,
+}
+static SNAPSHOT: OnceLock<Mutex<Snapshot>> = OnceLock::new();
+pub const WM_DESKTOP_READY: u32 = 0x8037;
+
+/// Never calls COM, filesystem or an external window on the UI thread.
+pub fn snapshot() -> Vec<DesktopEntry> {
+    let state = SNAPSHOT
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if state.entries.is_empty() {
+        return [
+            ("knownfolder:computer", "此电脑"),
+            ("knownfolder:recycle-bin", "回收站"),
+            ("knownfolder:control-panel", "控制面板"),
+        ]
+        .into_iter()
+        .map(|(key, label)| DesktopEntry {
+            label: label.into(),
+            key: key.into(),
+            path: None,
+            pidl: None,
+            kind: ContentKind::Folder,
+        })
+        .collect();
+    }
+    state
+        .entries
+        .iter()
+        .map(|e| DesktopEntry {
+            label: e.label.clone(),
+            key: e.key.clone(),
+            path: e.path.clone(),
+            pidl: None,
+            kind: e.kind,
+        })
+        .collect()
+}
+
+pub fn refresh_async(owner: windows::Win32::Foundation::HWND, force: bool) {
+    let shared = SNAPSHOT.get_or_init(Default::default);
+    {
+        let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
+        if force {
+            state.generation = state.generation.wrapping_add(1);
+        }
+        if state.active || (!force && state.updated.is_some_and(|t| t.elapsed().as_secs() < 2)) {
+            return;
+        }
+        state.active = true;
+    }
+    let owner = owner.0 as isize;
+    std::thread::spawn(move || unsafe {
+        use windows::Win32::System::Com::{
+            CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED,
+        };
+        let initialized = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+        if force {
+            invalidate_cache();
+        }
+        loop {
+            let generation = shared.lock().unwrap_or_else(|e| e.into_inner()).generation;
+            let result = std::panic::catch_unwind(|| {
+                if let Ok(Some(config)) = crate::config::load() {
+                    for item in config.items {
+                        if let Some(path) = crate::apps::resolve_launch_path(&item) {
+                            crate::app_identity::resolve_launch_key(&path);
+                        }
+                    }
+                }
+                scan_programs_cached()
+                    .into_iter()
+                    .map(|e| {
+                        if let Some(path) = &e.path {
+                            crate::app_identity::resolve_launch_key(path);
+                        }
+                        let key = canonical_virtual_key(&e.key).unwrap_or(&e.key).to_string();
+                        SnapshotEntry {
+                            label: e.label,
+                            key,
+                            path: e.path,
+                            kind: e.kind,
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
+            if state.generation != generation {
+                drop(state);
+                invalidate_cache();
+                continue;
+            }
+            if let Ok(entries) = result {
+                state.entries = entries;
+            }
+            state.updated = Some(std::time::Instant::now());
+            state.active = false;
+            drop(state);
+            let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                HWND(owner as *mut c_void),
+                WM_DESKTOP_READY,
+                WPARAM(0),
+                LPARAM(0),
+            );
+            break;
+        }
+        if initialized {
+            CoUninitialize();
+        }
+    });
+}
+
+pub fn virtual_icon_source(key: &str) -> Option<&'static str> {
+    match key {
+        "knownfolder:computer" => Some("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}"),
+        "knownfolder:recycle-bin" => Some("::{645FF040-5081-101B-9F08-00AA002F954E}"),
+        "knownfolder:control-panel" => Some("::{26EE0668-A00A-44D7-9371-BEB064C98683}"),
+        _ => None,
+    }
+}
+
+pub(crate) fn canonical_virtual_key(key: &str) -> Option<&'static str> {
+    if !key.starts_with("::{") && !key.starts_with("knownfolder:") {
+        return None;
+    }
+    let lower = key.to_ascii_lowercase();
+    if lower.contains("20d04fe0-3aea-1069-a2d8-08002b30309d") || key == "knownfolder:computer" {
+        Some("knownfolder:computer")
+    } else if lower.contains("645ff040-5081-101b-9f08-00aa002f954e")
+        || key == "knownfolder:recycle-bin"
+    {
+        Some("knownfolder:recycle-bin")
+    } else if lower.contains("26ee0668-a00a-44d7-9371-beb064c98683")
+        || lower.contains("21ec2020-3aea-1069-a2dd-08002b30309d")
+        || key == "knownfolder:control-panel"
+    {
+        Some("knownfolder:control-panel")
+    } else {
+        None
+    }
+}
+
 /// An absolute PIDL we own; freed on drop. Held only for virtual (non-file) items.
 pub struct Pidl(*mut ITEMIDLIST);
 
 impl Pidl {
     pub fn as_ptr(&self) -> *const ITEMIDLIST {
         self.0
+    }
+
+    pub fn try_clone(&self) -> Option<Self> {
+        let copy = unsafe { ILClone(self.0) };
+        (!copy.is_null()).then_some(Self(copy))
     }
 }
 
@@ -559,5 +720,34 @@ mod tests {
         assert!(keys.contains(&"knownfolder:computer"));
         assert!(keys.contains(&"knownfolder:recycle-bin"));
         assert!(keys.contains(&"knownfolder:control-panel"));
+    }
+}
+
+#[cfg(test)]
+mod virtual_identity_regression_tests {
+    use super::*;
+    #[test]
+    fn legacy_virtual_ids_keep_distinct_launch_and_icon_targets() {
+        for key in [
+            "knownfolder:computer",
+            "knownfolder:recycle-bin",
+            "knownfolder:control-panel",
+        ] {
+            let source = virtual_icon_source(key).unwrap();
+            assert_eq!(canonical_virtual_key(source), Some(key));
+            assert!(known_virtual_shell_uri(key).is_some());
+        }
+        assert_ne!(
+            virtual_icon_source("knownfolder:computer"),
+            virtual_icon_source("knownfolder:recycle-bin")
+        );
+    }
+
+    #[test]
+    fn filesystem_paths_containing_a_known_guid_remain_filesystem_items() {
+        assert_eq!(
+            canonical_virtual_key(r"C:\Apps\20d04fe0-3aea-1069-a2d8-08002b30309d\app.exe"),
+            None
+        );
     }
 }

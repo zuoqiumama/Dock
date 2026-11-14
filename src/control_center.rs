@@ -8,7 +8,7 @@
 //! when it loses focus (click-away), on Esc, or when its toggle button is hit again.
 
 use core::ffi::c_void;
-use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use windows::core::*;
@@ -79,6 +79,11 @@ const BUTTON_LABELS: [&str; 3] = ["网络", "蓝牙", "输入法"];
 
 static PANEL_HWND: AtomicIsize = AtomicIsize::new(0);
 static CLICK_AWAY_CLOSED_TICK: AtomicU32 = AtomicU32::new(0);
+static RENDER_ERROR_POSTED: AtomicBool = AtomicBool::new(false);
+
+pub fn owns_window(hwnd: HWND) -> bool {
+    PANEL_HWND.load(Ordering::Relaxed) == hwnd.0 as isize && unsafe { IsWindow(hwnd).as_bool() }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PanelView {
@@ -168,6 +173,7 @@ struct Panel {
     height: f32,
     hovered: PanelAction,
     dragging: bool,
+    reduced_motion: bool,
     anim_start: Instant,
     view_anim_start: Instant,
     view_direction: f32,
@@ -1754,7 +1760,16 @@ unsafe fn render(panel: &Panel) {
     }
 
     dc.SetTransform(&Matrix3x2::identity());
-    let _ = panel.glass.present();
+    if let Err(error) = panel.glass.present() {
+        let source = HWND(PANEL_HWND.load(Ordering::Relaxed) as *mut c_void);
+        crate::glass::report_present_error(
+            panel.owner,
+            source,
+            "控制中心 GPU 呈现失败",
+            error,
+            &RENDER_ERROR_POSTED,
+        );
+    }
 }
 
 unsafe fn wake_owner(panel: &Panel) {
@@ -2152,11 +2167,8 @@ unsafe fn set_panel_view(hwnd: HWND, panel: &mut Panel, view: PanelView) {
         );
         if GetMonitorInfoW(monitor, &mut info).as_bool() {
             let margin = (8.0 * panel.dpi) as i32;
-            x = x.clamp(
-                info.rcWork.left + margin,
-                info.rcWork.right - width_i - margin,
-            );
-            y = y.max(info.rcWork.top + margin);
+            x = crate::geometry::fit_axis(x, width_i, info.rcWork.left, info.rcWork.right, margin);
+            y = crate::geometry::fit_axis(y, height_i, info.rcWork.top, info.rcWork.bottom, margin);
         }
         let _ = SetWindowPos(hwnd, HWND_TOPMOST, x, y, width_i, height_i, SWP_NOACTIVATE);
     } else {
@@ -2177,8 +2189,12 @@ unsafe fn set_panel_view(hwnd: HWND, panel: &mut Panel, view: PanelView) {
     panel.height = height_i as f32;
     panel.hovered = PanelAction::None;
     panel.dragging = false;
-    panel.view_anim_start =
-        Instant::now() - Duration::from_secs_f32(view_switch_initial_animation_elapsed_secs());
+    panel.view_anim_start = Instant::now()
+        - Duration::from_secs_f32(if panel.reduced_motion {
+            1.0
+        } else {
+            view_switch_initial_animation_elapsed_secs()
+        });
     render(panel);
     wake_owner(panel);
 }
@@ -2200,6 +2216,7 @@ unsafe fn handle_move(panel: &mut Panel, x: f32, y: f32) {
 /// Open the panel (or, if it's already up, this is a no-op — `toggle` handles the
 /// close path). Anchors above the dock button, centered on it and clamped on-screen.
 unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
+    RENDER_ERROR_POSTED.store(false, Ordering::Relaxed);
     let instance: HINSTANCE = match GetModuleHandleW(None) {
         Ok(module) => module.into(),
         Err(_) => return,
@@ -2215,7 +2232,10 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
     };
     RegisterClassExW(&wc); // ignore "already registered"
 
-    let dpi = (GetDpiForWindow(dock_hwnd).max(96) as f32) / 96.0;
+    let work = crate::geometry::work_area(anchor_cx, anchor_top);
+    let dpi = ((GetDpiForWindow(dock_hwnd).max(96) as f32) / 96.0)
+        .min((work.right - work.left - 24).max(1) as f32 / PANEL_W)
+        .min((work.bottom - work.top - 24).max(1) as f32 / 480.0);
     let (logical_w, logical_h) = panel_size(PanelView::Main, dpi);
     let width = logical_w.round() as i32;
     let height = logical_h.round() as i32;
@@ -2236,11 +2256,8 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
     );
     if GetMonitorInfoW(monitor, &mut info).as_bool() {
         let margin = (8.0 * dpi) as i32;
-        x = x.clamp(
-            info.rcWork.left + margin,
-            info.rcWork.right - width - margin,
-        );
-        y = y.max(info.rcWork.top + margin);
+        x = crate::geometry::fit_axis(x, width, info.rcWork.left, info.rcWork.right, margin);
+        y = crate::geometry::fit_axis(y, height, info.rcWork.top, info.rcWork.bottom, margin);
     }
 
     let Ok(hwnd) = CreateWindowExW(
@@ -2317,8 +2334,17 @@ unsafe fn open(dock_hwnd: HWND, anchor_cx: i32, anchor_top: i32) {
         height: height as f32,
         hovered: PanelAction::None,
         dragging: false,
-        anim_start: Instant::now(),
-        view_anim_start: Instant::now(),
+        reduced_motion: crate::dock_layout(dock_hwnd).reduce_motion,
+        anim_start: if crate::dock_layout(dock_hwnd).reduce_motion {
+            Instant::now() - Duration::from_secs(1)
+        } else {
+            Instant::now()
+        },
+        view_anim_start: if crate::dock_layout(dock_hwnd).reduce_motion {
+            Instant::now() - Duration::from_secs(1)
+        } else {
+            Instant::now()
+        },
         view_direction: 1.0,
     }));
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, panel as isize);
@@ -2398,6 +2424,7 @@ pub unsafe fn hide() {
 
 /// Release the popup's GPU resources before the owner enters exit cleanup.
 pub unsafe fn shutdown() {
+    RENDER_ERROR_POSTED.store(false, Ordering::Relaxed);
     let raw = PANEL_HWND.swap(0, Ordering::Relaxed);
     if raw == 0 {
         return;
@@ -2536,6 +2563,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             WM_NCDESTROY => {
+                RENDER_ERROR_POSTED.store(false, Ordering::Relaxed);
                 SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                 if !ptr.is_null() {
                     drop(Box::from_raw(ptr));

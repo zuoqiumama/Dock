@@ -112,6 +112,34 @@ impl IconLoader {
 }
 
 pub unsafe fn source_icon(path: &str, size: u32) -> Option<OwnedIcon> {
+    if path.starts_with("::{") {
+        let name: Vec<u16> = path.encode_utf16().chain(Some(0)).collect();
+        let mut pidl = std::ptr::null_mut();
+        if windows::Win32::UI::Shell::SHParseDisplayName(
+            PCWSTR(name.as_ptr()),
+            None,
+            &mut pidl,
+            0,
+            None,
+        )
+        .is_ok()
+            && !pidl.is_null()
+        {
+            let mut info = SHFILEINFOW::default();
+            let ok = SHGetFileInfoW(
+                PCWSTR(pidl as *const u16),
+                FILE_ATTRIBUTE_NORMAL,
+                Some(&mut info),
+                std::mem::size_of::<SHFILEINFOW>() as u32,
+                SHGFI_ICON | SHGFI_LARGEICON | windows::Win32::UI::Shell::SHGFI_PIDL,
+            );
+            CoTaskMemFree(Some(pidl as *const core::ffi::c_void));
+            if ok != 0 && !info.hIcon.is_invalid() {
+                return Some(OwnedIcon { hicon: info.hIcon });
+            }
+        }
+        return None;
+    }
     extract(path, size)
         .or_else(|| jumbo_icon(path))
         .or_else(|| shell_icon(path))

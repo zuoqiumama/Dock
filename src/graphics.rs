@@ -32,18 +32,60 @@ pub struct Gpu {
     dc: ID2D1DeviceContext,
     swapchain: IDXGISwapChain1,
     _dcomp: IDCompositionDevice,
-    _target: IDCompositionTarget,
+    target: Option<IDCompositionTarget>,
     _visual: IDCompositionVisual,
     brush: ID2D1SolidColorBrush,
+    dwrite: IDWriteFactory,
     format: IDWriteTextFormat,
+    glyph_px: f32,
     materials: render::MaterialBrushes,
     icons: Vec<Option<ID2D1Bitmap1>>,
+    icon_sources: Vec<Option<String>>,
     surface_size: (u32, u32),
     backdrop: Option<Backdrop>,
 }
 
 fn surface_resize_needed(current: (u32, u32), requested: (u32, u32)) -> bool {
     current != requested
+}
+
+fn glyph_pixel_size(base_icon: f32) -> f32 {
+    base_icon * 0.58
+}
+
+fn bitmap_source_matches(previous: &Option<String>, current: &Option<String>) -> bool {
+    previous == current
+}
+
+fn retain_except<T>(values: &mut Vec<T>, removed: &[usize]) {
+    let mut removed = removed.iter().copied().peekable();
+    let mut index = 0;
+    values.retain(|_| {
+        let drop = removed.peek() == Some(&index);
+        if drop {
+            removed.next();
+        }
+        index += 1;
+        !drop
+    });
+}
+
+unsafe fn create_glyph_format(
+    factory: &IDWriteFactory,
+    glyph_px: f32,
+) -> Result<IDWriteTextFormat> {
+    let format = factory.CreateTextFormat(
+        w!("Segoe UI Emoji"),
+        None,
+        DWRITE_FONT_WEIGHT_NORMAL,
+        DWRITE_FONT_STYLE_NORMAL,
+        DWRITE_FONT_STRETCH_NORMAL,
+        glyph_px,
+        w!(""),
+    )?;
+    format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
+    format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+    Ok(format)
 }
 
 /// The shell-extraction source path for an item's icon (job key == source), or None
@@ -53,11 +95,15 @@ fn surface_resize_needed(current: (u32, u32), requested: (u32, u32)) -> bool {
 unsafe fn icon_source(it: &DockItem) -> Option<String> {
     match it.role {
         ItemRole::Pinned => it.icon.clone().or_else(|| it.path.clone()),
-        ItemRole::Running => it.icon.clone().or_else(|| {
-            it.hwnd
-                .map(|raw| HWND(raw as *mut core::ffi::c_void))
-                .and_then(|hwnd| windows_list::process_exe_path(hwnd))
-        }),
+        ItemRole::Running => it
+            .icon
+            .clone()
+            .or_else(|| {
+                it.hwnd
+                    .map(|raw| HWND(raw as *mut core::ffi::c_void))
+                    .and_then(|hwnd| windows_list::process_exe_path(hwnd))
+            })
+            .or_else(|| it.agent.as_ref().and_then(|_| it.path.clone())),
         _ => None,
     }
 }
@@ -65,6 +111,7 @@ unsafe fn icon_source(it: &DockItem) -> Option<String> {
 const ICON_DECODE_BATCH: usize = 4;
 
 struct IconExtractionPayload {
+    generation: u64,
     requested: Vec<String>,
     results: Vec<(String, PathBuf)>,
 }
@@ -76,6 +123,8 @@ struct IconExtractionPayload {
 struct IconPipeline {
     owner: isize,
     active: bool,
+    generation: u64,
+    active_generation: u64,
     pending_extraction: VecDeque<String>,
     queued_sources: BTreeSet<String>,
     pending_decode: VecDeque<(String, PathBuf)>,
@@ -85,10 +134,28 @@ std::thread_local! {
     static ICON_PIPELINE: RefCell<IconPipeline> = RefCell::new(IconPipeline::default());
 }
 
+fn payload_generation_status(pipeline: &mut IconPipeline, generation: u64) -> Option<bool> {
+    if pipeline.active_generation != generation {
+        return None;
+    }
+    pipeline.active = false;
+    Some(pipeline.generation == generation)
+}
+
+fn invalidate_pipeline_sources(pipeline: &mut IconPipeline, sources: &[String]) {
+    pipeline.generation = pipeline.generation.wrapping_add(1);
+    pipeline
+        .pending_decode
+        .retain(|(source, _)| !sources.contains(source));
+    for source in sources {
+        pipeline.queued_sources.remove(source);
+    }
+}
+
 /// Start at most one helper batch. Only owned job strings and the raw owner address
 /// cross the thread boundary; COM, D2D and `Gpu` itself stay on the UI thread.
 fn pump_icon_pipeline() {
-    let Some((owner, requested, jobs)) = ICON_PIPELINE.with(|pipeline| {
+    let Some((owner, generation, requested, jobs)) = ICON_PIPELINE.with(|pipeline| {
         let mut pipeline = pipeline.borrow_mut();
         if pipeline.active || pipeline.pending_extraction.is_empty() {
             return None;
@@ -98,8 +165,10 @@ fn pump_icon_pipeline() {
             .iter()
             .map(|source| (source.clone(), source.clone()))
             .collect();
+        let generation = pipeline.generation;
         pipeline.active = true;
-        Some((pipeline.owner, requested, jobs))
+        pipeline.active_generation = generation;
+        Some((pipeline.owner, generation, requested, jobs))
     }) else {
         return;
     };
@@ -111,7 +180,11 @@ fn pump_icon_pipeline() {
             drawer_icons::extract(&jobs)
         }))
         .unwrap_or_default();
-        let payload = Box::into_raw(Box::new(IconExtractionPayload { requested, results }));
+        let payload = Box::into_raw(Box::new(IconExtractionPayload {
+            generation,
+            requested,
+            results,
+        }));
         let posted = unsafe {
             PostMessageW(
                 HWND(owner as *mut core::ffi::c_void),
@@ -237,18 +310,8 @@ impl Gpu {
             None,
         )?;
         let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
-        let glyph_px = BASE_ICON * 0.58 * dpi;
-        let format = dwrite.CreateTextFormat(
-            w!("Segoe UI Emoji"),
-            None,
-            DWRITE_FONT_WEIGHT_NORMAL,
-            DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL,
-            glyph_px,
-            w!(""),
-        )?;
-        format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER)?;
-        format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER)?;
+        let glyph_px = glyph_pixel_size(BASE_ICON * dpi);
+        let format = create_glyph_format(&dwrite, glyph_px)?;
         let materials = render::MaterialBrushes::new(&dc)?;
 
         Ok(Gpu {
@@ -257,20 +320,22 @@ impl Gpu {
             dc,
             swapchain,
             _dcomp: dcomp,
-            _target: target,
+            target: Some(target),
             _visual: visual,
             brush,
+            dwrite,
             format,
+            glyph_px,
             materials,
             icons: Vec::new(),
+            icon_sources: Vec::new(),
             surface_size: (w, h),
             backdrop: Backdrop::try_new(hwnd),
         })
     }
 
     /// The shared Direct2D device. Popup surfaces (`Glass`) created with this device
-    /// can draw bitmaps that were created on it — so icons decoded once at startup
-    /// (see `drawer::warm_cache`) are reused by the drawer's own surface instead of
+    /// can draw bitmaps created on it, so decoded drawer icons can be reused without
     /// being re-uploaded every time the drawer opens.
     pub fn d2d_device(&self) -> &ID2D1Device {
         &self.d2device
@@ -282,16 +347,17 @@ impl Gpu {
         &self._d3d
     }
 
-    /// The dock's Direct2D device context (bound to the dock swapchain), also used
-    /// to decode completed icon batches on the UI thread.
-    pub fn dc(&self) -> &ID2D1DeviceContext {
-        &self.dc
+    /// A HWND has only one topmost composition slot. Release its old binding
+    /// before constructing a replacement device, including on recovery failure.
+    pub fn release_window_target(&mut self) {
+        drop(self.target.take());
+        self.backdrop = None;
     }
 
     /// Decode one item's icon from a completed helper batch. Never touches the
     /// shell, so a crashing shell extension can only cost this icon, not the dock.
-    /// The running-window WM_GETICON fallback is still synchronous and may block on
-    /// an unresponsive owner; moving that fallback off the UI thread is future work.
+    /// The running-window fallback reads cached window-class metadata; it never
+    /// waits for a foreign application's WM_GETICON response.
     unsafe fn decode_icon(
         &self,
         loader: Option<&IconLoader>,
@@ -306,9 +372,14 @@ impl Gpu {
         };
         match it.role {
             // Start + Control + Drawer use custom vector glyphs; the divider draws a line.
-            ItemRole::Start | ItemRole::Divider | ItemRole::Control | ItemRole::Drawer => None,
+            ItemRole::Start
+            | ItemRole::Divider
+            | ItemRole::AgentDivider
+            | ItemRole::Control
+            | ItemRole::Drawer
+            | ItemRole::Overflow => None,
             // Running window: its app exe's helper-extracted icon, else the window's
-            // own icon (WM_GETICON, owned by the app — don't free).
+            // window-class icon (owned by the app — don't free).
             ItemRole::Running => {
                 if let Some(src) = icon_source(it) {
                     if let Some(bmp) = bmp_from_jobs(&src) {
@@ -341,30 +412,54 @@ impl Gpu {
         }
     }
 
+    pub fn invalidate_icon_sources(&mut self, sources: &[String]) {
+        for source in sources {
+            for (bitmap, item_source) in self.icons.iter_mut().zip(&self.icon_sources) {
+                if item_source.as_deref() == Some(source.as_str()) {
+                    *bitmap = None;
+                }
+            }
+        }
+        ICON_PIPELINE.with(|pipeline| {
+            invalidate_pipeline_sources(&mut pipeline.borrow_mut(), sources);
+        });
+    }
+
     /// Start loading every missing icon without waiting for the shell. Bitmap slots
     /// are filled later by `decode_pending_icons`, including after device recovery.
     pub unsafe fn load_icons(&mut self, items: &[DockItem], _dpi: f32) {
         self.icons.clear();
         self.icons.resize_with(items.len(), || None);
+        self.icon_sources = items.iter().map(|item| icon_source(item)).collect();
         ICON_PIPELINE.with(|pipeline| {
             enqueue_missing_sources(&mut pipeline.borrow_mut(), items, &self.icons);
         });
         pump_icon_pipeline();
     }
 
-    /// Realign the icon set to a reconciled item list (see `Dock::reconcile`). For
-    /// each merged slot, reuse the existing bitmap (`Some(old_index)`) — including a
-    /// closing window's, so it stays drawn while it collapses. New and still-empty
-    /// slots join the shared background extraction queue instead of blocking here.
+    /// Realign the icon set to a reconciled item list (see `Dock::reconcile`). A bitmap
+    /// is reused only when its source is unchanged; a new icon override must reload even
+    /// when the pinned launch path and slot identity stay the same.
     pub unsafe fn remap_icons(&mut self, remap: &[Option<usize>], items: &[DockItem]) {
         let mut old = std::mem::take(&mut self.icons);
+        let old_sources = std::mem::take(&mut self.icon_sources);
+        let sources: Vec<Option<String>> = items.iter().map(|item| icon_source(item)).collect();
         self.icons = remap
             .iter()
-            .map(|src| match src {
-                Some(oi) => old.get_mut(*oi).and_then(Option::take),
-                None => None,
+            .enumerate()
+            .map(|(index, src)| match src {
+                Some(oi)
+                    if bitmap_source_matches(
+                        old_sources.get(*oi).unwrap_or(&None),
+                        &sources[index],
+                    ) =>
+                {
+                    old.get_mut(*oi).and_then(Option::take)
+                }
+                _ => None,
             })
             .collect();
+        self.icon_sources = sources;
         ICON_PIPELINE.with(|pipeline| {
             enqueue_missing_sources(&mut pipeline.borrow_mut(), items, &self.icons);
         });
@@ -374,15 +469,24 @@ impl Gpu {
     /// Take ownership of a worker's private completion payload. Extraction failures
     /// become retryable on a later remap; successful BMPs stay deduplicated until
     /// their decode is applied or discarded because the item disappeared.
-    pub unsafe fn icons_ready(&mut self, _items: &[DockItem], payload: isize) {
+    pub unsafe fn icons_ready(&mut self, items: &[DockItem], payload: isize) {
         if payload == 0 {
             return;
         }
-        let IconExtractionPayload { requested, results } =
-            *Box::from_raw(payload as *mut IconExtractionPayload);
-        ICON_PIPELINE.with(|pipeline| {
+        let IconExtractionPayload {
+            generation,
+            requested,
+            results,
+        } = *Box::from_raw(payload as *mut IconExtractionPayload);
+        let accepted = ICON_PIPELINE.with(|pipeline| {
             let mut pipeline = pipeline.borrow_mut();
-            pipeline.active = false;
+            let current = payload_generation_status(&mut pipeline, generation)?;
+            if !current {
+                for source in &requested {
+                    pipeline.queued_sources.remove(source);
+                }
+                return Some(false);
+            }
             let succeeded: BTreeSet<&str> =
                 results.iter().map(|(source, _)| source.as_str()).collect();
             for source in &requested {
@@ -392,7 +496,13 @@ impl Gpu {
             }
             drop(succeeded);
             pipeline.pending_decode.extend(results);
+            Some(true)
         });
+        if accepted == Some(false) {
+            ICON_PIPELINE.with(|pipeline| {
+                enqueue_missing_sources(&mut pipeline.borrow_mut(), items, &self.icons);
+            });
+        }
         pump_icon_pipeline();
     }
 
@@ -438,16 +548,8 @@ impl Gpu {
         if removed.is_empty() {
             return;
         }
-        let mut keep = removed.iter().copied().peekable();
-        let mut idx = 0;
-        self.icons.retain(|_| {
-            let drop = keep.peek() == Some(&idx);
-            if drop {
-                keep.next();
-            }
-            idx += 1;
-            !drop
-        });
+        retain_except(&mut self.icons, removed);
+        retain_except(&mut self.icon_sources, removed);
     }
 
     pub unsafe fn resize(&mut self, width: u32, height: u32) -> Result<()> {
@@ -469,7 +571,12 @@ impl Gpu {
         Ok(())
     }
 
-    pub unsafe fn render(&self, dock: &Dock) -> Result<()> {
+    pub unsafe fn render(&mut self, dock: &Dock) -> Result<()> {
+        let glyph_px = glyph_pixel_size(dock.base_icon());
+        if (self.glyph_px - glyph_px).abs() > 0.01 {
+            self.format = create_glyph_format(&self.dwrite, glyph_px)?;
+            self.glyph_px = glyph_px;
+        }
         let frame = dock.frame();
         let backdrop_enabled = if let Some(backdrop) = &self.backdrop {
             backdrop
@@ -564,6 +671,7 @@ mod tests {
             hwnd: None,
             group_key: None,
             windows: Vec::new(),
+            agent: None,
         }
     }
 
@@ -588,10 +696,77 @@ mod tests {
     }
 
     #[test]
+    fn changed_icon_override_cannot_reuse_the_old_bitmap() {
+        let original = item(ItemRole::Pinned, Some(r"C:\Apps\Tool.exe"), None);
+        let changed = item(
+            ItemRole::Pinned,
+            Some(r"C:\Apps\Tool.exe"),
+            Some(r"C:\Icons\Custom.png"),
+        );
+        let original_source = unsafe { icon_source(&original) };
+        let changed_source = unsafe { icon_source(&changed) };
+        assert!(bitmap_source_matches(&original_source, &original_source));
+        assert!(!bitmap_source_matches(&original_source, &changed_source));
+    }
+
+    #[test]
+    fn explicit_icon_change_invalidates_old_batches_without_touching_newer_work() {
+        let source = r"C:\Icons\App.png".to_string();
+        let mut pipeline = IconPipeline {
+            active: true,
+            generation: 1,
+            active_generation: 1,
+            ..Default::default()
+        };
+        pipeline.queued_sources.insert(source.clone());
+        pipeline.queued_sources.insert("other".into());
+        pipeline
+            .pending_decode
+            .push_back((source.clone(), PathBuf::new()));
+        pipeline
+            .pending_decode
+            .push_back(("other".into(), PathBuf::new()));
+
+        invalidate_pipeline_sources(&mut pipeline, std::slice::from_ref(&source));
+        assert_eq!(pipeline.generation, 2);
+        assert_eq!(pipeline.pending_decode.len(), 1);
+        assert_eq!(pipeline.pending_decode[0].0, "other");
+        assert!(!pipeline.queued_sources.contains(&source));
+        assert!(pipeline.queued_sources.contains("other"));
+
+        pipeline.active = true;
+        pipeline.active_generation = 1;
+        assert_eq!(payload_generation_status(&mut pipeline, 1), Some(false));
+        assert!(!pipeline.active);
+
+        pipeline.active = true;
+        pipeline.active_generation = 2;
+        assert_eq!(payload_generation_status(&mut pipeline, 1), None);
+        assert!(pipeline.active);
+        assert_eq!(payload_generation_status(&mut pipeline, 2), Some(true));
+        assert!(!pipeline.active);
+    }
+
+    #[test]
+    fn glyph_metrics_and_source_slots_follow_layout_changes() {
+        for (actual, expected) in [
+            (glyph_pixel_size(24.0), 13.92),
+            (glyph_pixel_size(50.0), 29.0),
+            (glyph_pixel_size(80.0), 46.4),
+        ] {
+            assert!((actual - expected).abs() < 0.0001);
+        }
+        let mut values = vec!["a", "b", "c", "d"];
+        retain_except(&mut values, &[1, 3]);
+        assert_eq!(values, ["a", "c"]);
+    }
+
+    #[test]
     fn icon_source_skips_vector_and_windowless_items() {
         for role in [
             ItemRole::Start,
             ItemRole::Divider,
+            ItemRole::AgentDivider,
             ItemRole::Control,
             ItemRole::Drawer,
         ] {
@@ -601,6 +776,13 @@ mod tests {
         assert_eq!(
             unsafe { icon_source(&item(ItemRole::Running, None, None)) },
             None
+        );
+        // An active headless Agent running item falls back to its known launcher path if present.
+        let mut agent_running = item(ItemRole::Running, Some(r"C:\Apps\Antigravity.exe"), None);
+        agent_running.agent = Some(crate::dock::AgentSlotInfo::idle("antigravity"));
+        assert_eq!(
+            unsafe { icon_source(&agent_running) },
+            Some(r"C:\Apps\Antigravity.exe".to_string())
         );
     }
 

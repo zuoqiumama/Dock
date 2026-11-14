@@ -25,30 +25,53 @@ const IDOK: usize = 1;
 const IDCANCEL: usize = 2;
 const ID_EDIT: usize = 3;
 const EM_SETSEL: u32 = 0x00B1;
+const INPUT_LOGICAL_WIDTH: f32 = 300.0;
+const INPUT_LOGICAL_HEIGHT: f32 = 132.0;
+
+type InputRect = (i32, i32, i32, i32);
+
+fn effective_input_scale(dpi_scale: f32, client_width: i32, client_height: i32) -> f32 {
+    dpi_scale
+        .min(client_width.max(0) as f32 / INPUT_LOGICAL_WIDTH)
+        .min(client_height.max(0) as f32 / INPUT_LOGICAL_HEIGHT)
+        .max(0.0)
+}
+
+fn input_child_rects(scale: f32) -> [InputRect; 3] {
+    [(14, 14, 272, 26), (132, 54, 70, 28), (216, 54, 70, 28)].map(|(x, y, width, height)| {
+        (
+            (x as f32 * scale) as i32,
+            (y as f32 * scale) as i32,
+            (width as f32 * scale) as i32,
+            (height as f32 * scale) as i32,
+        )
+    })
+}
+
+fn input_font_height(scale: f32) -> i32 {
+    (9.0 * scale * 96.0 / 72.0).max(1.0) as i32
+}
 
 struct InputState {
     edit: HWND,
     result: Option<String>,
     done: bool,
     bg: HBRUSH,
+    material: crate::theme::SurfaceTheme,
 }
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-fn rgb(r: u8, g: u8, b: u8) -> COLORREF {
-    COLORREF(r as u32 | ((g as u32) << 8) | ((b as u32) << 16))
-}
-fn bg_color() -> COLORREF {
-    rgb(0x22, 0x22, 0x26)
-}
-fn text_color() -> COLORREF {
-    rgb(0xEC, 0xEC, 0xEC)
+fn material_color(rgb: (f32, f32, f32)) -> COLORREF {
+    COLORREF(
+        (rgb.0 * 255.0).round() as u32
+            | (((rgb.1 * 255.0).round() as u32) << 8)
+            | (((rgb.2 * 255.0).round() as u32) << 16),
+    )
 }
 
-/// Show the prompt centred on screen, anchored above the dock like the drawer. Returns
-/// the trimmed text on OK/Enter, or None on Cancel/Esc/close. Runs a modal loop.
 pub unsafe fn prompt(parent: HWND, title: &str, initial: &str) -> Option<String> {
     let instance: HINSTANCE = match GetModuleHandleW(None) {
         Ok(module) => module.into(),
@@ -76,10 +99,13 @@ pub unsafe fn prompt(parent: HWND, title: &str, initial: &str) -> Option<String>
         bottom: s(132.0),
     };
     let _ = AdjustWindowRectEx(&mut rc, style, false, WS_EX_DLGMODALFRAME);
-    let win_w = rc.right - rc.left;
-    let win_h = rc.bottom - rc.top;
-    let x = (GetSystemMetrics(SM_CXSCREEN) - win_w) / 2;
-    let y = (GetSystemMetrics(SM_CYSCREEN) - win_h) / 2;
+    let mut parent_rect = RECT::default();
+    let _ = GetWindowRect(parent, &mut parent_rect);
+    let area = crate::geometry::work_area(parent_rect.left, parent_rect.top);
+    let win_w = (rc.right - rc.left).min((area.right - area.left - 16).max(1));
+    let win_h = (rc.bottom - rc.top).min((area.bottom - area.top - 16).max(1));
+    let x = area.left + (area.right - area.left - win_w) / 2;
+    let y = area.top + (area.bottom - area.top - win_h) / 3;
 
     let Ok(hwnd) = CreateWindowExW(
         WS_EX_DLGMODALFRAME | WS_EX_TOPMOST | WS_EX_CONTROLPARENT,
@@ -98,7 +124,17 @@ pub unsafe fn prompt(parent: HWND, title: &str, initial: &str) -> Option<String>
         return None;
     };
 
-    let dark: i32 = 1;
+    let mut client_rect = RECT::default();
+    let _ = GetClientRect(hwnd, &mut client_rect);
+    let scale = effective_input_scale(
+        scale,
+        client_rect.right - client_rect.left,
+        client_rect.bottom - client_rect.top,
+    );
+
+    let material = crate::settings::load().effective_theme().surface();
+    let light = material.rgb.0 > 0.5;
+    let dark: i32 = i32::from(!light);
     let _ = DwmSetWindowAttribute(
         hwnd,
         DWMWA_USE_IMMERSIVE_DARK_MODE,
@@ -106,7 +142,7 @@ pub unsafe fn prompt(parent: HWND, title: &str, initial: &str) -> Option<String>
         4,
     );
 
-    let height = -((9.0 * scale * 96.0 / 72.0) as i32);
+    let height = -input_font_height(scale);
     let face = wide("Microsoft YaHei UI");
     let font = CreateFontW(
         height,
@@ -124,13 +160,14 @@ pub unsafe fn prompt(parent: HWND, title: &str, initial: &str) -> Option<String>
         0,
         PCWSTR(face.as_ptr()),
     );
-    let bg = CreateSolidBrush(bg_color());
+    let bg = CreateSolidBrush(material_color(material.rgb));
 
     let mut state = InputState {
         edit: HWND::default(),
         result: None,
         done: false,
         bg,
+        material,
     };
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut state as *mut _ as isize);
 
@@ -139,7 +176,7 @@ pub unsafe fn prompt(parent: HWND, title: &str, initial: &str) -> Option<String>
               exstyle: WINDOW_EX_STYLE,
               style: u32,
               id: usize,
-              (cx, cy, cw, ch): (i32, i32, i32, i32)|
+              (x, y, width, height): InputRect|
      -> HWND {
         let label = wide(text);
         let h = CreateWindowExW(
@@ -147,10 +184,10 @@ pub unsafe fn prompt(parent: HWND, title: &str, initial: &str) -> Option<String>
             class,
             PCWSTR(label.as_ptr()),
             WS_CHILD | WS_VISIBLE | WINDOW_STYLE(style),
-            s(cx as f32),
-            s(cy as f32),
-            s(cw as f32),
-            s(ch as f32),
+            x,
+            y,
+            width,
+            height,
             hwnd,
             HMENU(id as *mut c_void),
             instance,
@@ -161,15 +198,24 @@ pub unsafe fn prompt(parent: HWND, title: &str, initial: &str) -> Option<String>
         h
     };
 
+    let [edit_rect, ok_rect, cancel_rect] = input_child_rects(scale);
     let edit = mk(
         w!("EDIT"),
         initial,
         WS_EX_CLIENTEDGE,
         ES_AUTOHSCROLL as u32 | WS_TABSTOP.0,
         ID_EDIT,
-        (14, 14, 272, 26),
+        edit_rect,
     );
-    let _ = SetWindowTheme(edit, w!("DarkMode_CFD"), PCWSTR::null());
+    let _ = SetWindowTheme(
+        edit,
+        if light {
+            w!("Explorer")
+        } else {
+            w!("DarkMode_CFD")
+        },
+        PCWSTR::null(),
+    );
     state.edit = edit;
     let btn = w!("BUTTON");
     mk(
@@ -178,7 +224,7 @@ pub unsafe fn prompt(parent: HWND, title: &str, initial: &str) -> Option<String>
         WINDOW_EX_STYLE(0),
         BS_DEFPUSHBUTTON as u32 | WS_TABSTOP.0,
         IDOK,
-        (132, 54, 70, 28),
+        ok_rect,
     );
     mk(
         btn,
@@ -186,7 +232,7 @@ pub unsafe fn prompt(parent: HWND, title: &str, initial: &str) -> Option<String>
         WINDOW_EX_STYLE(0),
         BS_PUSHBUTTON as u32 | WS_TABSTOP.0,
         IDCANCEL,
-        (216, 54, 70, 28),
+        cancel_rect,
     );
 
     let _ = ShowWindow(hwnd, SW_SHOW);
@@ -245,8 +291,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_CTLCOLORSTATIC | WM_CTLCOLORBTN if !ptr.is_null() => {
                 let hdc = HDC(wparam.0 as *mut c_void);
-                SetTextColor(hdc, text_color());
-                SetBkColor(hdc, bg_color());
+                SetTextColor(hdc, material_color((*ptr).material.text_rgb));
+                SetBkColor(hdc, material_color((*ptr).material.rgb));
                 SetBkMode(hdc, TRANSPARENT);
                 LRESULT((*ptr).bg.0 as isize)
             }
@@ -271,6 +317,45 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 LRESULT(0)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{effective_input_scale, input_child_rects, input_font_height};
+
+    #[test]
+    fn actual_client_area_bounds_every_child_and_font() {
+        let cases: [(i32, i32, f32); 5] = [
+            (600, 264, 2.0),
+            (120, 264, 0.4),
+            (600, 66, 0.5),
+            (120, 90, 0.4),
+            (1, 1, 1.0 / 300.0),
+        ];
+        for (client_width, client_height, expected_scale) in cases {
+            let scale = effective_input_scale(2.0, client_width, client_height);
+            assert!((scale - expected_scale).abs() < 1e-4);
+            for (x, y, width, height) in input_child_rects(scale) {
+                assert!(x >= 0 && y >= 0 && width >= 0 && height >= 0);
+                assert!(x + width <= client_width, "edit/button exceeds width");
+                assert!(y + height <= client_height, "edit/button exceeds height");
+            }
+            let font_height = input_font_height(scale);
+            assert!(font_height > 0);
+            assert!(font_height <= input_font_height(2.0));
+            assert!(font_height <= client_height);
+        }
+    }
+
+    #[test]
+    fn empty_client_area_collapses_instead_of_using_the_original_dpi_scale() {
+        for (width, height) in [(0, 100), (100, 0), (-1, -1)] {
+            assert_eq!(effective_input_scale(2.0, width, height), 0.0);
+            assert!(input_child_rects(0.0)
+                .iter()
+                .all(|&(x, y, width, height)| x == 0 && y == 0 && width == 0 && height == 0));
         }
     }
 }

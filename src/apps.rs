@@ -6,8 +6,9 @@ use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Registry::*;
 
+use crate::agent_state::{self, AgentDockSummary};
 use crate::content::{classify_path, fallback_visual, ContentKind};
-use crate::dock::{DockItem, ItemRole, RunningWindowRef};
+use crate::dock::{AgentSlotInfo, DockItem, ItemRole, RunningWindowRef};
 
 /// The leading Start button — opens the Windows Start menu. Drawn as a custom
 /// 4-pane glyph (see render.rs), so it needs no extracted icon.
@@ -23,6 +24,7 @@ pub fn start_item() -> DockItem {
         hwnd: None,
         group_key: None,
         windows: Vec::new(),
+        agent: None,
     }
 }
 
@@ -40,6 +42,7 @@ pub fn control_item() -> DockItem {
         hwnd: None,
         group_key: None,
         windows: Vec::new(),
+        agent: None,
     }
 }
 
@@ -58,7 +61,16 @@ pub fn drawer_item() -> DockItem {
         hwnd: None,
         group_key: None,
         windows: Vec::new(),
+        agent: None,
     }
+}
+
+pub fn overflow_item() -> DockItem {
+    let mut item = control_item();
+    item.role = ItemRole::Overflow;
+    item.label = "更多应用".into();
+    item.glyph = "⋯";
+    item
 }
 
 /// The vertical separator between pinned apps (left) and open windows (right).
@@ -74,7 +86,40 @@ pub fn divider_item() -> DockItem {
         hwnd: None,
         group_key: None,
         windows: Vec::new(),
+        agent: None,
     }
+}
+
+/// Subtle zone separator between regular apps and the dedicated Agent Zone.
+pub fn agent_divider_item() -> DockItem {
+    DockItem {
+        label: String::new(),
+        glyph: "",
+        color: (1.0, 1.0, 1.0),
+        path: None,
+        icon: None,
+        kind: ContentKind::File,
+        role: ItemRole::AgentDivider,
+        hwnd: None,
+        group_key: None,
+        windows: Vec::new(),
+        agent: None,
+    }
+}
+
+fn running_group_launch_path(group: &crate::windows_list::RunningGroup) -> Option<String> {
+    let first = group.windows.first()?.exe_path.clone()?;
+    let key = crate::app_identity::normalize(&first);
+    group
+        .windows
+        .iter()
+        .all(|window| {
+            window
+                .exe_path
+                .as_deref()
+                .is_some_and(|path| crate::app_identity::normalize(path) == key)
+        })
+        .then_some(first)
 }
 
 /// A currently-open window; clicking it activates (or minimizes) that window.
@@ -85,7 +130,7 @@ pub fn running_item(group: &crate::windows_list::RunningGroup) -> DockItem {
         label: group.label.clone(),
         glyph,
         color,
-        path: None,
+        path: running_group_launch_path(group),
         icon: group.icon_path.clone(),
         kind: ContentKind::Application,
         role: ItemRole::Running,
@@ -99,6 +144,70 @@ pub fn running_item(group: &crate::windows_list::RunningGroup) -> DockItem {
                 title: window.title.clone(),
             })
             .collect(),
+        agent: None,
+    }
+}
+
+/// Unpinned active Agent item shown in the right-hand Agent Zone, combining GUI
+/// windows (Track A) and event/file sessions (Track B).
+pub fn agent_running_item(
+    summary: &AgentDockSummary,
+    group: Option<&crate::windows_list::RunningGroup>,
+    launch_hint: Option<String>,
+) -> DockItem {
+    let (glyph, color) = agent_state::fallback_visual(&summary.agent_id);
+    let path = group.and_then(running_group_launch_path).or(launch_hint);
+    let icon = group
+        .and_then(|g| g.icon_path.clone())
+        .or_else(|| path.clone());
+    let windows: Vec<RunningWindowRef> = group
+        .map(|g| {
+            g.windows
+                .iter()
+                .map(|w| RunningWindowRef {
+                    hwnd: w.hwnd,
+                    title: w.title.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let hwnd = windows.first().map(|w| w.hwnd);
+    DockItem {
+        label: summary.display_name.clone(),
+        glyph,
+        color,
+        path,
+        icon,
+        kind: ContentKind::Application,
+        role: ItemRole::Running,
+        hwnd,
+        group_key: group
+            .map(|g| g.key.clone())
+            .or_else(|| Some(format!("agent:{}", summary.agent_id))),
+        windows,
+        agent: Some(AgentSlotInfo {
+            agent_id: summary.agent_id.clone(),
+            state: summary.aggregate_state,
+            badge: summary.badge_text.clone(),
+            active_sessions: summary.active_count,
+            total_sessions: summary.total_sessions,
+            waiting_sessions: summary.waiting_count,
+        }),
+    }
+}
+
+pub fn known_agent_launch_hint(agent_id: &str) -> Option<String> {
+    match agent_id {
+        "antigravity" => first_existing(&[
+            local("Programs\\Antigravity\\Antigravity.exe"),
+            pf("Antigravity\\Antigravity.exe"),
+        ]),
+        "dsh" => first_existing(&[
+            local("Programs\\dsh\\dsh.exe"),
+            pf("dsh\\dsh.exe"),
+            format!("{}\\.dsh-purge-pocket\\dsh.exe", env("USERPROFILE")),
+        ]),
+        _ => None,
     }
 }
 
@@ -107,20 +216,17 @@ pub fn running_item(group: &crate::windows_list::RunningGroup) -> DockItem {
 /// file name — so a packaged app whose versioned WindowsApps path drifts after an
 /// update (e.g. `Claude_1.15200…\app\claude.exe`) still pairs with its running process.
 pub fn exe_matches(pinned_path: &str, group_key: &str) -> bool {
-    let pinned = pinned_path.trim().trim_matches('"').to_ascii_lowercase();
+    let pinned = crate::app_identity::cached_launch_key(pinned_path);
     if pinned == group_key {
         return true;
     }
-    let file_of = |s: &str| {
-        Path::new(s)
+    // Bare App Paths names can match a filename. Two full paths never merge just
+    // because they end in app.exe (different installs often share that name).
+    !pinned.contains('\\')
+        && !pinned.contains(':')
+        && Path::new(group_key)
             .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name.to_string())
-    };
-    match (file_of(&pinned), file_of(group_key)) {
-        (Some(a), Some(b)) => a == b,
-        _ => false,
-    }
+            .is_some_and(|name| name.to_string_lossy() == pinned)
 }
 
 /// Some launchers expose their real UI from a helper process whose executable does not
@@ -216,6 +322,7 @@ fn item(
         hwnd: None,
         group_key: None,
         windows: Vec::new(),
+        agent: None,
     }
 }
 
@@ -237,30 +344,43 @@ pub fn from_config(specs: &[crate::config::ItemSpec]) -> Vec<DockItem> {
         .iter()
         .filter_map(|s| {
             let path = resolve_launch_path(s);
-            if path.is_none() && s.icon.is_none() {
+            let agent_id = agent_state::infer_agent_id_for_spec(s, path.as_deref());
+            if path.is_none() && s.icon.is_none() && agent_id.is_none() {
                 return None; // nothing to show or launch
             }
-            let label = s
-                .label
-                .clone()
-                .unwrap_or_else(|| label_from(path.as_deref()));
-            let kind = path
-                .as_deref()
-                .map(Path::new)
-                .map(classify_path)
-                .unwrap_or(ContentKind::File);
-            let (glyph, color) = fallback_visual(kind);
+            let kind = path.as_deref().map(Path::new).map(classify_path).unwrap_or(
+                if agent_id.is_some() {
+                    ContentKind::Application
+                } else {
+                    ContentKind::File
+                },
+            );
+            let (glyph, color, default_label) = if let Some(ref id) = agent_id {
+                let (g, c) = agent_state::fallback_visual(id);
+                let name = path
+                    .as_deref()
+                    .filter(|p| !p.to_ascii_lowercase().starts_with("aumid:"))
+                    .map(|p| label_from(Some(p)))
+                    .unwrap_or_else(|| agent_state::display_name(id));
+                (g, c, name)
+            } else {
+                let (g, c) = fallback_visual(kind);
+                (g, c, label_from(path.as_deref()))
+            };
+            let label = s.label.clone().unwrap_or(default_label);
+            let icon = s.icon.clone();
             Some(DockItem {
                 label,
                 glyph,
                 color,
                 path,
-                icon: s.icon.clone(),
+                icon,
                 kind,
                 role: ItemRole::Pinned,
                 hwnd: None,
                 group_key: None,
                 windows: Vec::new(),
+                agent: agent_id.map(AgentSlotInfo::idle),
             })
         })
         .collect()
@@ -403,6 +523,7 @@ mod tests {
                 hwnd: 42,
                 title: "WeGame".to_string(),
                 exe_path: Some(r"C:\Program Files\WeGame\browser.exe".to_string()),
+                app_id: None,
             }],
         };
 
