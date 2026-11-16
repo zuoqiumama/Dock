@@ -1328,14 +1328,15 @@ fn run() -> Result<()> {
         let running = windows_list::enumerate_sorted();
         let dock_settings = settings::load();
         let mut agent_registry = agent_state::AgentRegistry::default();
-        let initial_sessions = sanitize_incoming_sessions(
-            agent_state::load_sessions_with_meta_from_dir(&agent_state::sessions_dir()),
-            Some(&running),
-            &[],
-        );
+        let session_dir = agent_state::sessions_dir();
+        let _ = std::fs::create_dir_all(&session_dir);
+        let initial_snapshot =
+            agent_state::load_sessions_preserving(&session_dir).unwrap_or_default();
+        let initial_sessions =
+            sanitize_incoming_sessions(initial_snapshot.1.clone(), Some(&running), &[]);
         let init_fg = Some(GetForegroundWindow().0 as isize);
         let init_fg_agents = foreground_agents_for(init_fg, &[]);
-        let (_, _, initial_pids) = agent_registry.replace_file_sessions_with_meta(
+        let (_, _, initial_requests) = agent_registry.replace_file_sessions_with_meta(
             initial_sessions,
             init_fg,
             &init_fg_agents,
@@ -1371,10 +1372,14 @@ fn run() -> Result<()> {
 
         let mut agent_pids = agent_state::PidMonitor::default();
         let mut pruned_initial_pid = false;
-        for pid in initial_pids {
+        for request in initial_requests {
+            let pid = request.pid;
             match agent_pids.ensure_watching(hwnd, pid) {
-                agent_state::PidWatchResult::Watching { proc_start } => {
-                    agent_registry.set_pid_proc_start(pid, proc_start);
+                agent_state::PidWatchResult::Watching {
+                    proc_start,
+                    generation,
+                } => {
+                    agent_registry.bind_pid_watch(&request, proc_start, generation);
                 }
                 agent_state::PidWatchResult::Exited => {
                     if agent_registry.prune_pid_with_start(pid, None) {
@@ -1425,7 +1430,7 @@ fn run() -> Result<()> {
         let tray = Tray::new(hwnd);
         // Track open windows event-driven (no polling) so the right zone stays live.
         let hooks = windows_list::install_hooks(hwnd);
-        let agent_watcher = agent_state::SessionDirWatcher::start(hwnd);
+        let agent_watcher = agent_state::SessionDirWatcher::start(hwnd, initial_snapshot);
         let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
         let fullscreen_active = windows_list::is_fullscreen_present(monitor);
         let maximized_active = windows_list::is_maximized_present(monitor);
@@ -2252,11 +2257,16 @@ unsafe fn sanitize_incoming_sessions(
     sessions
 }
 
-unsafe fn watch_agent_pids(hwnd: HWND, app: &mut App, pids: Vec<u32>) {
-    for pid in pids {
+unsafe fn watch_agent_pids(hwnd: HWND, app: &mut App, requests: Vec<agent_state::PidWatchRequest>) {
+    for request in requests {
+        let pid = request.pid;
         match app.agent_pids.ensure_watching(hwnd, pid) {
-            agent_state::PidWatchResult::Watching { proc_start } => {
-                app.agent_registry.set_pid_proc_start(pid, proc_start);
+            agent_state::PidWatchResult::Watching {
+                proc_start,
+                generation,
+            } => {
+                app.agent_registry
+                    .bind_pid_watch(&request, proc_start, generation);
             }
             agent_state::PidWatchResult::Exited => {
                 app.agent_registry.prune_pid_with_start(pid, None);
@@ -2331,10 +2341,10 @@ unsafe fn refresh_agent_views(
     hwnd: HWND,
     app: &mut App,
     bounces: &[String],
-    pids: Vec<u32>,
+    watch_requests: Vec<agent_state::PidWatchRequest>,
     running: Option<&[windows_list::RunningWindow]>,
 ) {
-    watch_agent_pids(hwnd, app, pids);
+    watch_agent_pids(hwnd, app, watch_requests);
     if fullscreen_app_present(hwnd) {
         app.pending_rebuild = true;
         return;
@@ -3549,11 +3559,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     let effect = app
                         .agent_registry
                         .apply_event_with_meta(payload, meta, fg, &fg_agents);
-                    if effect.changed || effect.bounce_agent.is_some() || effect.watch_pid.is_some()
-                    {
+                    if effect.changed || effect.bounce_agent.is_some() || effect.watch.is_some() {
                         let bounces: Vec<String> = effect.bounce_agent.into_iter().collect();
-                        let pids: Vec<u32> = effect.watch_pid.into_iter().collect();
-                        refresh_agent_views(hwnd, app, &bounces, pids, None);
+                        let requests: Vec<agent_state::PidWatchRequest> =
+                            effect.watch.into_iter().collect();
+                        refresh_agent_views(hwnd, app, &bounces, requests, None);
                     }
                     LRESULT(1)
                 } else if agent_state::is_agent_copydata(lparam) {
@@ -3570,18 +3580,21 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 );
                 let fg = Some(GetForegroundWindow().0 as isize);
                 let fg_agents = foreground_agents_for(fg, &app.dock.items);
-                let (changed, bounces, pids) = app
+                let (changed, bounces, watch_requests) = app
                     .agent_registry
                     .replace_file_sessions_with_meta(snapshot, fg, &fg_agents);
-                if changed || !bounces.is_empty() || !pids.is_empty() {
-                    refresh_agent_views(hwnd, app, &bounces, pids, None);
+                if changed || !bounces.is_empty() || !watch_requests.is_empty() {
+                    refresh_agent_views(hwnd, app, &bounces, watch_requests, None);
                 }
                 LRESULT(0)
             }
             agent_state::WM_AGENT_PROCESS_EXITED => {
                 let pid = wparam.0 as u32;
-                let proc_start = app.agent_pids.complete(pid);
-                if app.agent_registry.prune_pid_with_start(pid, proc_start) {
+                let generation = lparam.0 as usize;
+                if app
+                    .agent_pids
+                    .complete_and_prune(&mut app.agent_registry, pid, generation)
+                {
                     refresh_agent_views(hwnd, app, &[], Vec::new(), None);
                 }
                 LRESULT(0)

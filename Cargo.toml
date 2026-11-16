@@ -1,6 +1,6 @@
 [package]
 name = "featherdock"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "An ultra-light, GPU-composited macOS-style dock for Windows"
 license = "MIT"

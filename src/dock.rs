@@ -1614,14 +1614,29 @@ mod tests {
         for step in 1..=steps {
             let cx = rest[0] - span * 0.5 + span * 1.5 * (step as f32 / steps as f32);
             dock.cursor_x = Some(cx);
-            for _ in 0..200 {
-                if !dock.tick() {
-                    break;
-                }
+            dock.cursor_smooth = cx;
+            // Settle magnification directly: this is a geometry regression, not a
+            // wall-clock timing test. Parallel test load must not change the result.
+            let rest_now = dock.rest_centers();
+            let targets: Vec<f32> = (0..dock.items.len())
+                .map(|i| {
+                    if dock.items[i].role.is_divider() {
+                        1.0
+                    } else {
+                        dock.target(rest_now[i])
+                    }
+                })
+                .collect();
+            for (slot, target) in dock.slots.iter_mut().zip(targets) {
+                slot.scale = target;
             }
             let now: Vec<f32> = dock.frame().icons.iter().map(|ic| ic.cx).collect();
-            for (a, b) in now.iter().zip(&prev) {
-                max_jump = max_jump.max((a - b).abs());
+            if step > 1 {
+                // The first sample establishes the initial hover magnification; only
+                // subsequent samples measure continuity during the actual sweep.
+                for (a, b) in now.iter().zip(&prev) {
+                    max_jump = max_jump.max((a - b).abs());
+                }
             }
             prev = now;
         }

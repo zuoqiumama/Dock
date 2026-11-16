@@ -2,7 +2,7 @@
 //! `--agent-event` (`WM_COPYDATA`) IPC, `%LOCALAPPDATA%\FeatherDock\agent-sessions`
 //! kernel-event watcher, and zombie lifecycle cleanup.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -45,6 +45,7 @@ const MAX_JSON_DEPTH: usize = 64;
 const MAX_TOTAL_SESSIONS: usize = 128;
 const MAX_SESSIONS_PER_AGENT: usize = 32;
 const MAX_TOMBSTONES: usize = 512;
+const MAX_RETIRED_PID_GENERATIONS: usize = 128;
 const MAX_ID_CHARS: usize = 96;
 const MAX_INSTANCE_CHARS: usize = 64;
 const MAX_TITLE_CHARS: usize = 120;
@@ -52,6 +53,7 @@ const MAX_DETAIL_CHARS: usize = 240;
 const MAX_PATH_CHARS: usize = 512;
 const MAX_DEEP_LINK_CHARS: usize = 512;
 const IPC_TIMEOUT_MS: u32 = 2000;
+const WATCH_LOAD_RETRY_MS: u32 = 100;
 const ALLOWED_DEEP_LINK_SCHEMES: [&str; 5] = [
     "antigravity://",
     "codex://",
@@ -166,10 +168,36 @@ pub struct AgentDockSummary {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PidWatchRequest {
+    pub pid: u32,
+    agent: String,
+    session_id: String,
+    instance: Option<String>,
+    source: SessionSource,
+    seq: u64,
+    updated_at: u64,
+}
+
+impl PidWatchRequest {
+    fn for_session(session: &AgentSession, stamp: &VersionStamp) -> Option<Self> {
+        let pid = session.pid.filter(|&pid| pid != 0)?;
+        (!matches!(session.source, SessionSource::Window)).then_some(Self {
+            pid,
+            agent: session.agent.clone(),
+            session_id: session.session_id.clone(),
+            instance: stamp.instance.clone(),
+            source: session.source,
+            seq: stamp.seq,
+            updated_at: stamp.updated_at,
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventEffect {
     pub changed: bool,
     pub bounce_agent: Option<String>,
-    pub watch_pid: Option<u32>,
+    pub watch: Option<PidWatchRequest>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -214,6 +242,9 @@ struct VersionStamp {
     instance: Option<String>,
     pid: Option<u32>,
     proc_start: Option<u64>,
+    watch_generation: Option<usize>,
+    // (seq, updated_at) of the version whose OS watch observation set proc_start.
+    proc_bind_version: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -238,7 +269,7 @@ struct DeadHwndRecord {
 pub struct AgentRegistry {
     event_sessions: Vec<AgentSession>,
     file_sessions: Vec<AgentSession>,
-    read_file_versions: HashMap<(String, String), u64>,
+    read_file_versions: HashMap<(String, String), VersionStamp>,
     waiting_bounce_acked: HashSet<(String, String)>,
     event_versions: HashMap<(String, String), VersionStamp>,
     file_versions: HashMap<(String, String), VersionStamp>,
@@ -262,6 +293,31 @@ fn is_older_stamp(existing: &VersionStamp, incoming: &VersionStamp) -> bool {
             existing.seq > 0 && incoming.seq > 0 && incoming.seq < existing.seq
         }
     }
+}
+
+fn should_inherit_process_identity(
+    existing: &VersionStamp,
+    pid: Option<u32>,
+    instance: Option<&str>,
+    seq: u64,
+    updated_at: u64,
+) -> bool {
+    if existing.pid.is_none() || existing.pid != pid {
+        return false;
+    }
+    match (existing.instance.as_deref(), instance) {
+        (Some(existing), Some(incoming)) => existing == incoming,
+        // Legacy duplicates carry no instance proof. Preserve the process binding only
+        // for the exact same event version; any newer legacy version must use the OS watch.
+        (None, None) => existing.seq == seq && existing.updated_at == updated_at,
+        _ => false,
+    }
+}
+
+fn file_read_marker_covers(read: &VersionStamp, incoming: &VersionStamp) -> bool {
+    // A read marker belongs to one producer instance. Within that instance use the
+    // same seq-first ordering as live events; a different instance is always unread.
+    read.instance == incoming.instance && !is_older_stamp(incoming, read)
 }
 
 fn newest_channel_stamp<'a>(file: &'a VersionStamp, event: &'a VersionStamp) -> &'a VersionStamp {
@@ -298,6 +354,14 @@ fn is_blocked_by_tombstone(tomb: &SessionTombstone, incoming: &VersionStamp) -> 
             true
         }
         TombstoneKind::DeadLifecycle => {
+            // A producer's explicit new instance is authoritative even when it restarts
+            // in the same second, reuses the PID, and resets its sequence to one.
+            if matches!(
+                (&tomb.stamp.instance, &incoming.instance),
+                (Some(old), Some(new)) if old != new
+            ) {
+                return false;
+            }
             // An unchanged disk snapshot after process exit or dead window must not resurrect.
             let same_pid = tomb.stamp.pid.is_some()
                 && incoming.pid == tomb.stamp.pid
@@ -333,6 +397,8 @@ impl AgentRegistry {
                 .and_then(sanitize_instance),
             pid: session.pid.filter(|&p| p != 0),
             proc_start: None,
+            watch_generation: None,
+            proc_bind_version: None,
         }
     }
 
@@ -392,7 +458,65 @@ impl AgentRegistry {
         .unwrap_or_else(|| Self::session_stamp(session, None))
     }
 
-    pub fn set_pid_proc_start(&mut self, pid: u32, proc_start: Option<u64>) {
+    pub fn bind_pid_watch(
+        &mut self,
+        request: &PidWatchRequest,
+        proc_start: Option<u64>,
+        generation: usize,
+    ) {
+        self.bind_pid_identity(request, proc_start, Some(generation));
+    }
+
+    #[cfg(test)]
+    fn bind_pid_proc_start(&mut self, request: &PidWatchRequest, proc_start: Option<u64>) {
+        self.bind_pid_identity(request, proc_start, None);
+    }
+
+    fn bind_pid_identity(
+        &mut self,
+        request: &PidWatchRequest,
+        proc_start: Option<u64>,
+        watch_generation: Option<usize>,
+    ) {
+        if request.pid == 0 || request.source == SessionSource::Window {
+            return;
+        }
+        let key = (request.agent.clone(), request.session_id.clone());
+        let session_exists = match request.source {
+            SessionSource::Event => &self.event_sessions,
+            SessionSource::File => &self.file_sessions,
+            SessionSource::Window => return,
+        }
+        .iter()
+        .any(|session| {
+            session.agent == request.agent
+                && session.session_id == request.session_id
+                && session.pid == Some(request.pid)
+        });
+        if !session_exists {
+            return;
+        }
+        let stamp = match request.source {
+            SessionSource::Event => self.event_versions.get_mut(&key),
+            SessionSource::File => self.file_versions.get_mut(&key),
+            SessionSource::Window => None,
+        };
+        if let Some(stamp) = stamp {
+            let request_version = (request.seq, request.updated_at);
+            if stamp.instance.as_deref() == request.instance.as_deref()
+                && stamp.proc_bind_version != Some(request_version)
+            {
+                // Rebind only a genuinely new event version. An equal delayed snapshot
+                // must retain its original process identity when a numeric PID is reused.
+                stamp.proc_start = proc_start;
+                stamp.watch_generation = watch_generation;
+                stamp.proc_bind_version = Some(request_version);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn set_pid_proc_start(&mut self, pid: u32, proc_start: Option<u64>) {
         if pid == 0 || proc_start.is_none() {
             return;
         }
@@ -407,6 +531,7 @@ impl AgentRegistry {
                 if let Some(stamp) = stamp {
                     if stamp.proc_start.is_none() {
                         stamp.proc_start = proc_start;
+                        stamp.proc_bind_version = Some((stamp.seq, stamp.updated_at));
                     }
                 }
             }
@@ -434,14 +559,14 @@ impl AgentRegistry {
             return EventEffect {
                 changed: false,
                 bounce_agent: None,
-                watch_pid: None,
+                watch: None,
             };
         };
         let Some(session_id) = sanitize_id(&payload.session_id, MAX_ID_CHARS) else {
             return EventEffect {
                 changed: false,
                 bounce_agent: None,
-                watch_pid: None,
+                watch: None,
             };
         };
         let key = (agent.clone(), session_id.clone());
@@ -457,16 +582,27 @@ impl AgentRegistry {
             .pid
             .filter(|&p| p != 0)
             .or_else(|| prev.as_ref().and_then(|p| p.pid));
-        let inherited_proc_start = existing_stamp
-            .as_ref()
-            .filter(|s| s.pid.is_some() && s.pid == pid_final)
-            .and_then(|s| s.proc_start);
+        let instance = meta.instance.as_deref().and_then(sanitize_instance);
+        let inherited_process = existing_stamp.as_ref().filter(|stamp| {
+            should_inherit_process_identity(
+                stamp,
+                pid_final,
+                instance.as_deref(),
+                meta.seq.unwrap_or(0),
+                incoming_ts,
+            )
+        });
+        let inherited_proc_start = inherited_process.and_then(|s| s.proc_start);
+        let inherited_watch_generation = inherited_process.and_then(|s| s.watch_generation);
+        let inherited_proc_bind_version = inherited_process.and_then(|s| s.proc_bind_version);
         let incoming_stamp = VersionStamp {
             updated_at: incoming_ts,
             seq: meta.seq.unwrap_or(0),
-            instance: meta.instance.as_deref().and_then(sanitize_instance),
+            instance,
             pid: pid_final,
             proc_start: inherited_proc_start,
+            watch_generation: inherited_watch_generation,
+            proc_bind_version: inherited_proc_bind_version,
         };
 
         // Every event, including Closed, passes the same tombstone and latest-version gate
@@ -476,7 +612,7 @@ impl AgentRegistry {
                 return EventEffect {
                     changed: false,
                     bounce_agent: None,
-                    watch_pid: None,
+                    watch: None,
                 };
             }
         }
@@ -485,7 +621,7 @@ impl AgentRegistry {
                 return EventEffect {
                     changed: false,
                     bounce_agent: None,
-                    watch_pid: None,
+                    watch: None,
                 };
             }
         }
@@ -513,7 +649,7 @@ impl AgentRegistry {
                 changed: self.event_sessions.len() != before_event
                     || self.file_sessions.len() != before_file,
                 bounce_agent: None,
-                watch_pid: None,
+                watch: None,
             };
         };
 
@@ -573,6 +709,7 @@ impl AgentRegistry {
             source: SessionSource::Event,
         };
 
+        let watch = PidWatchRequest::for_session(&updated, &incoming_stamp);
         let mut changed = true;
         if let Some(idx) = existing_pos {
             changed = self.event_sessions[idx] != updated;
@@ -595,7 +732,7 @@ impl AgentRegistry {
         EventEffect {
             changed,
             bounce_agent,
-            watch_pid: pid,
+            watch,
         }
     }
 
@@ -636,7 +773,7 @@ impl AgentRegistry {
         incoming: Vec<AgentSession>,
         foreground_hwnd: Option<isize>,
         fg_agents: &[String],
-    ) -> (bool, Vec<String>, Vec<u32>) {
+    ) -> (bool, Vec<String>, Vec<PidWatchRequest>) {
         let with_meta = incoming
             .into_iter()
             .map(|s| (s, EventMeta::default()))
@@ -649,10 +786,10 @@ impl AgentRegistry {
         incoming: Vec<(AgentSession, EventMeta)>,
         foreground_hwnd: Option<isize>,
         fg_agents: &[String],
-    ) -> (bool, Vec<String>, Vec<u32>) {
+    ) -> (bool, Vec<String>, Vec<PidWatchRequest>) {
         let old = std::mem::replace(&mut self.file_sessions, Vec::with_capacity(incoming.len()));
         let mut bounces = Vec::new();
-        let mut pids = Vec::new();
+        let mut watch_requests = Vec::new();
         let mut incoming_keys = HashSet::with_capacity(incoming.len());
 
         for (mut session, meta) in incoming {
@@ -666,22 +803,53 @@ impl AgentRegistry {
                 }
             }
 
-            if let Some(event_stamp) = self.event_versions.get(&key).cloned().or_else(|| {
-                self.event_sessions
-                    .iter()
-                    .find(|s| s.agent == key.0 && s.session_id == key.1)
-                    .map(|s| Self::session_stamp(s, None))
-            }) {
+            let prev = old
+                .iter()
+                .find(|s| s.agent == session.agent && s.session_id == session.session_id);
+            let event = self
+                .event_sessions
+                .iter()
+                .find(|session| session.agent == key.0 && session.session_id == key.1)
+                .map(|session| {
+                    let stamp = self
+                        .event_versions
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_else(|| Self::session_stamp(session, None));
+                    (session, stamp)
+                });
+            let previous_visible_state = match (event.as_ref(), prev) {
+                (Some((event, event_stamp)), Some(file)) => {
+                    let file_stamp = self
+                        .file_versions
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_else(|| Self::session_stamp(file, None));
+                    if is_older_stamp(&file_stamp, event_stamp) {
+                        file.state
+                    } else {
+                        event.state
+                    }
+                }
+                (Some((event, _)), None) => event.state,
+                (None, Some(file)) => file.state,
+                (None, None) => AgentState::Idle,
+            };
+            if let Some((_, event_stamp)) = event.as_ref() {
                 // `is_older_stamp(&stamp, event_stamp)` is true precisely when the file is
                 // strictly newer. Equal versions belong to IPC by deterministic tie-break.
-                if !is_older_stamp(&stamp, &event_stamp) {
+                if !is_older_stamp(&stamp, event_stamp) {
+                    // The hidden file channel still owns its read/ack and process identity.
+                    // Preserve its last accepted row without applying delayed side effects.
+                    if let Some(previous) = prev {
+                        // The newer IPC channel owns the current OS watch request. Keep the
+                        // hidden file row/metadata without rebinding it to that process.
+                        self.file_sessions.push(previous.clone());
+                    }
                     continue;
                 }
             }
 
-            let prev = old
-                .iter()
-                .find(|s| s.agent == session.agent && s.session_id == session.session_id);
             if let Some(existing) = self
                 .file_versions
                 .get(&key)
@@ -692,8 +860,8 @@ impl AgentRegistry {
                     // A delayed directory snapshot must not roll back this channel. Keep the
                     // last accepted row and its original version stamp.
                     if let Some(previous) = prev {
-                        if let Some(pid) = previous.pid.filter(|&p| p != 0) {
-                            pids.push(pid);
+                        if let Some(request) = PidWatchRequest::for_session(previous, &existing) {
+                            watch_requests.push(request);
                         }
                         self.file_sessions.push(previous.clone());
                     }
@@ -702,13 +870,29 @@ impl AgentRegistry {
             }
 
             self.tombstones.remove(&key);
-            if let Some(prev_start) = self
+            if let Some((prev_start, prev_generation, prev_bind_version)) = self
                 .file_versions
                 .get(&key)
-                .filter(|prev| prev.pid.is_some() && prev.pid == stamp.pid)
-                .and_then(|prev| prev.proc_start)
+                .filter(|prev| {
+                    should_inherit_process_identity(
+                        prev,
+                        stamp.pid,
+                        stamp.instance.as_deref(),
+                        stamp.seq,
+                        stamp.updated_at,
+                    )
+                })
+                .map(|prev| {
+                    (
+                        prev.proc_start,
+                        prev.watch_generation,
+                        prev.proc_bind_version,
+                    )
+                })
             {
-                stamp.proc_start = Some(prev_start);
+                stamp.proc_start = prev_start;
+                stamp.watch_generation = prev_generation;
+                stamp.proc_bind_version = prev_bind_version;
             }
 
             if let Some(dead) = self.dead_hwnds.get(&key) {
@@ -723,12 +907,11 @@ impl AgentRegistry {
                 let already_read = self
                     .read_file_versions
                     .get(&key)
-                    .is_some_and(|&ver| ver >= session.updated_at);
+                    .is_some_and(|read| file_read_marker_covers(read, &stamp));
                 if already_read || (session_fg && prev.is_none_or(|p| p.state != AgentState::Done))
                 {
                     session.state = AgentState::Idle;
-                    self.read_file_versions
-                        .insert(key.clone(), session.updated_at);
+                    self.read_file_versions.insert(key.clone(), stamp.clone());
                 }
             } else {
                 self.read_file_versions.remove(&key);
@@ -736,15 +919,17 @@ impl AgentRegistry {
 
             if session.state != AgentState::Waiting {
                 self.waiting_bounce_acked.remove(&key);
-            } else if prev.is_none_or(|p| p.state != AgentState::Waiting)
+            } else if previous_visible_state != AgentState::Waiting
                 && !session_fg
                 && self.waiting_bounce_acked.insert(key.clone())
             {
+                // Compare against the previously visible merged channel, not a hidden old
+                // file row. IPC Running in between must permit exactly one new bounce.
                 bounces.push(session.agent.clone());
             }
 
-            if let Some(pid) = session.pid.filter(|&p| p != 0) {
-                pids.push(pid);
+            if let Some(request) = PidWatchRequest::for_session(&session, &stamp) {
+                watch_requests.push(request);
             }
             self.file_versions.insert(key, stamp);
             self.file_sessions.push(session);
@@ -771,7 +956,7 @@ impl AgentRegistry {
         // Tombstones are released only by a genuinely newer event or bounded LRU eviction.
 
         let changed = old != self.file_sessions;
-        (changed, bounces, pids)
+        (changed, bounces, watch_requests)
     }
 
     pub fn on_foreground_changed(
@@ -795,9 +980,14 @@ impl AgentRegistry {
         for s in &mut self.file_sessions {
             if is_session_foreground(&s.agent, s.hwnd, foreground_hwnd, fg_agents) {
                 if s.state == AgentState::Done {
+                    let key = (s.agent.clone(), s.session_id.clone());
+                    let stamp = self
+                        .file_versions
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_else(|| Self::session_stamp(s, None));
                     s.state = AgentState::Idle;
-                    self.read_file_versions
-                        .insert((s.agent.clone(), s.session_id.clone()), s.updated_at);
+                    self.read_file_versions.insert(key, stamp);
                     changed = true;
                 }
                 if s.state == AgentState::Waiting {
@@ -823,9 +1013,14 @@ impl AgentRegistry {
         }
         for s in &mut self.file_sessions {
             if s.agent == agent_id && s.state == AgentState::Done {
+                let key = (s.agent.clone(), s.session_id.clone());
+                let stamp = self
+                    .file_versions
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| Self::session_stamp(s, None));
                 s.state = AgentState::Idle;
-                self.read_file_versions
-                    .insert((s.agent.clone(), s.session_id.clone()), s.updated_at);
+                self.read_file_versions.insert(key, stamp);
                 changed = true;
             }
             if s.agent == agent_id && s.state == AgentState::Waiting {
@@ -853,9 +1048,14 @@ impl AgentRegistry {
         for s in &mut self.file_sessions {
             if s.agent == agent_id && s.session_id == session_id {
                 if s.state == AgentState::Done {
+                    let key = (s.agent.clone(), s.session_id.clone());
+                    let stamp = self
+                        .file_versions
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_else(|| Self::session_stamp(s, None));
                     s.state = AgentState::Idle;
-                    self.read_file_versions
-                        .insert((s.agent.clone(), s.session_id.clone()), s.updated_at);
+                    self.read_file_versions.insert(key, stamp);
                     changed = true;
                 }
                 if s.state == AgentState::Waiting {
@@ -913,21 +1113,23 @@ impl AgentRegistry {
             self.dead_hwnds.insert(key, rec);
         }
         for (key, stamp) in drop_keys {
-            self.waiting_bounce_acked.remove(&key);
-            self.read_file_versions.remove(&key);
-            if !self
+            let event_alive = self
                 .event_sessions
                 .iter()
-                .any(|s| s.agent == key.0 && s.session_id == key.1)
-            {
-                self.event_versions.remove(&key);
-            }
-            if !self
+                .any(|s| s.agent == key.0 && s.session_id == key.1);
+            let file_alive = self
                 .file_sessions
                 .iter()
-                .any(|s| s.agent == key.0 && s.session_id == key.1)
-            {
+                .any(|s| s.agent == key.0 && s.session_id == key.1);
+            if !event_alive && !file_alive {
+                self.waiting_bounce_acked.remove(&key);
+            }
+            if !file_alive {
+                self.read_file_versions.remove(&key);
                 self.file_versions.remove(&key);
+            }
+            if !event_alive {
+                self.event_versions.remove(&key);
             }
             self.insert_tombstone(
                 key,
@@ -946,6 +1148,19 @@ impl AgentRegistry {
     }
 
     pub fn prune_pid_with_start(&mut self, pid: u32, proc_start: Option<u64>) -> bool {
+        self.prune_pid_with_identity(pid, proc_start, None)
+    }
+
+    fn prune_pid_with_generation(&mut self, pid: u32, generation: usize) -> bool {
+        self.prune_pid_with_identity(pid, None, Some(generation))
+    }
+
+    fn prune_pid_with_identity(
+        &mut self,
+        pid: u32,
+        proc_start: Option<u64>,
+        watch_generation: Option<usize>,
+    ) -> bool {
         if pid == 0 {
             return false;
         }
@@ -966,8 +1181,16 @@ impl AgentRegistry {
                 }
                 .cloned()
                 .unwrap_or_else(|| Self::session_stamp(&list[idx], None));
-                if let (Some(expected), Some(recorded)) = (proc_start, stamp.proc_start) {
-                    if expected != recorded {
+                if let Some(expected) = watch_generation {
+                    // Unknown OS start times still have an exact in-process watch identity.
+                    if stamp.watch_generation != Some(expected) {
+                        idx += 1;
+                        continue;
+                    }
+                } else if let Some(expected) = proc_start {
+                    // A known exited generation must not remove a newer or not-yet-bound
+                    // process instance that happens to reuse the same numeric PID.
+                    if stamp.proc_start != Some(expected) {
                         idx += 1;
                         continue;
                     }
@@ -978,22 +1201,24 @@ impl AgentRegistry {
             }
         }
         for (key, stamp) in tombstones {
-            self.waiting_bounce_acked.remove(&key);
-            self.read_file_versions.remove(&key);
-            self.dead_hwnds.remove(&key);
-            if !self
+            let event_alive = self
                 .event_sessions
                 .iter()
-                .any(|s| s.agent == key.0 && s.session_id == key.1)
-            {
-                self.event_versions.remove(&key);
-            }
-            if !self
+                .any(|s| s.agent == key.0 && s.session_id == key.1);
+            let file_alive = self
                 .file_sessions
                 .iter()
-                .any(|s| s.agent == key.0 && s.session_id == key.1)
-            {
+                .any(|s| s.agent == key.0 && s.session_id == key.1);
+            if !event_alive && !file_alive {
+                self.waiting_bounce_acked.remove(&key);
+                self.dead_hwnds.remove(&key);
+            }
+            if !file_alive {
+                self.read_file_versions.remove(&key);
                 self.file_versions.remove(&key);
+            }
+            if !event_alive {
+                self.event_versions.remove(&key);
             }
             self.insert_tombstone(
                 key,
@@ -1378,25 +1603,25 @@ pub fn sessions_dir() -> PathBuf {
 
 #[cfg(test)]
 pub fn load_sessions_from_dir(dir: &Path) -> Vec<AgentSession> {
-    load_sessions_with_meta_from_dir(dir)
-        .into_iter()
-        .map(|(s, _)| s)
-        .collect()
-}
-
-pub fn load_sessions_with_meta_from_dir(dir: &Path) -> Vec<(AgentSession, EventMeta)> {
-    let empty = HashMap::new();
-    load_sessions_preserving(dir, &empty)
-        .map(|(_, sessions)| sessions)
+    load_sessions_preserving(dir)
+        .map(|(_, sessions)| sessions.into_iter().map(|(s, _)| s).collect())
         .unwrap_or_default()
 }
 
-type CachedFileMap = HashMap<PathBuf, (AgentSession, EventMeta)>;
+pub(crate) type CachedFileMap = HashMap<PathBuf, (AgentSession, EventMeta)>;
+pub(crate) type SessionSnapshot = (CachedFileMap, Vec<(AgentSession, EventMeta)>);
 
-fn load_sessions_preserving(
+pub(crate) fn load_sessions_preserving(dir: &Path) -> std::io::Result<SessionSnapshot> {
+    load_sessions_preserving_with(dir, |path| fs::read_to_string(path))
+}
+
+fn load_sessions_preserving_with<F>(
     dir: &Path,
-    prev: &CachedFileMap,
-) -> std::io::Result<(CachedFileMap, Vec<(AgentSession, EventMeta)>)> {
+    mut read_file: F,
+) -> std::io::Result<(CachedFileMap, Vec<(AgentSession, EventMeta)>)>
+where
+    F: FnMut(&Path) -> std::io::Result<String>,
+{
     let entries = fs::read_dir(dir)?;
     let mut next_cache: CachedFileMap = HashMap::new();
     let mut out = Vec::new();
@@ -1414,31 +1639,14 @@ fn load_sessions_preserving(
         {
             continue;
         }
-        let Ok(meta) = entry.metadata() else {
-            if let Some(cached) = prev.get(&path).cloned() {
-                next_cache.insert(path, cached.clone());
-                out.push(cached);
-            }
-            continue;
-        };
+        // A snapshot containing an unreadable live file is not authoritative. Return
+        // the error so the watcher retains its previous complete cache/snapshot and
+        // suppresses READY instead of treating that file as deleted.
+        let meta = entry.metadata()?;
         if !meta.is_file() || meta.len() > MAX_PAYLOAD_BYTES as u64 {
             continue;
         }
-        let text = match fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(err)
-                if err.kind() == std::io::ErrorKind::PermissionDenied
-                    || matches!(err.raw_os_error(), Some(32 | 33)) =>
-            {
-                // Keep last valid snapshot across transient sharing/write locks on Windows.
-                if let Some(cached) = prev.get(&path).cloned() {
-                    next_cache.insert(path, cached.clone());
-                    out.push(cached);
-                }
-                continue;
-            }
-            Err(_) => continue,
-        };
+        let text = read_file(&path)?;
         let Some((payload, event_meta)) = parse_agent_event_json_with_meta(&text) else {
             continue;
         };
@@ -2070,16 +2278,13 @@ pub struct SessionDirWatcher {
     stop_event: HANDLE,
     thread: Option<JoinHandle<()>>,
     latest: Arc<Mutex<Vec<(AgentSession, EventMeta)>>>,
-    dir: PathBuf,
 }
 
 impl SessionDirWatcher {
-    pub unsafe fn start(dock_hwnd: HWND) -> Self {
+    pub unsafe fn start(dock_hwnd: HWND, initial: SessionSnapshot) -> Self {
         let dir = sessions_dir();
         let _ = fs::create_dir_all(&dir);
-        let empty = HashMap::new();
-        let (init_cache, init_sessions) =
-            load_sessions_preserving(&dir, &empty).unwrap_or_default();
+        let (init_cache, init_sessions) = initial;
         let latest = Arc::new(Mutex::new(init_sessions));
         let stop_event = CreateEventW(None, true, false, None).unwrap_or_default();
         if stop_event.is_invalid() {
@@ -2087,7 +2292,6 @@ impl SessionDirWatcher {
                 stop_event: HANDLE::default(),
                 thread: None,
                 latest,
-                dir,
             };
         }
         let dock_raw = dock_hwnd.0 as isize;
@@ -2107,7 +2311,6 @@ impl SessionDirWatcher {
             stop_event,
             thread: Some(thread),
             latest,
-            dir,
         }
     }
 
@@ -2127,16 +2330,6 @@ impl SessionDirWatcher {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
-
-    #[allow(dead_code)]
-    pub fn refresh_now(&self) -> Vec<AgentSession> {
-        let empty = HashMap::new();
-        let Ok((_, fresh)) = load_sessions_preserving(&self.dir, &empty) else {
-            return self.take_snapshot();
-        };
-        *self.latest.lock().unwrap_or_else(|e| e.into_inner()) = fresh.clone();
-        fresh.into_iter().map(|(s, _)| s).collect()
-    }
 }
 
 impl Drop for SessionDirWatcher {
@@ -2155,13 +2348,101 @@ impl Drop for SessionDirWatcher {
     }
 }
 
+fn publish_loaded_sessions(
+    loaded: std::io::Result<(CachedFileMap, Vec<(AgentSession, EventMeta)>)>,
+    cached_files: &mut CachedFileMap,
+    latest: &Arc<Mutex<Vec<(AgentSession, EventMeta)>>>,
+    mut post_ready: impl FnMut(),
+) -> bool {
+    let Ok((next_cache, snapshot)) = loaded else {
+        return false;
+    };
+    *cached_files = next_cache;
+    *latest.lock().unwrap_or_else(|e| e.into_inner()) = snapshot;
+    post_ready();
+    true
+}
+
 unsafe fn watch_dir_loop(
     dock_hwnd: HWND,
     stop_event: HANDLE,
     dir: &Path,
     latest: &Arc<Mutex<Vec<(AgentSession, EventMeta)>>>,
-    mut cached_files: CachedFileMap,
+    cached_files: CachedFileMap,
 ) {
+    watch_dir_loop_with_loader(dock_hwnd, stop_event, dir, latest, cached_files, || {
+        load_sessions_preserving(dir)
+    });
+}
+
+unsafe fn reload_watcher_sessions<F>(
+    dock_hwnd: HWND,
+    stop_event: HANDLE,
+    cached_files: &mut CachedFileMap,
+    latest: &Arc<Mutex<Vec<(AgentSession, EventMeta)>>>,
+    load: &mut F,
+) -> bool
+where
+    F: FnMut() -> std::io::Result<SessionSnapshot>,
+{
+    let mut post_ready = || {
+        if !dock_hwnd.is_invalid() {
+            let _ = PostMessageW(dock_hwnd, WM_AGENT_SESSIONS_READY, WPARAM(0), LPARAM(0));
+        }
+    };
+    if publish_loaded_sessions(load(), cached_files, latest, &mut post_ready) {
+        return true;
+    }
+    // A consumed notification gets exactly one delayed retry. Stop remains interruptible;
+    // persistent failures return to the infinite kernel-directory wait, never polling.
+    if WaitForSingleObject(stop_event, WATCH_LOAD_RETRY_MS) == WAIT_OBJECT_0 {
+        return false;
+    }
+    publish_loaded_sessions(load(), cached_files, latest, post_ready)
+}
+
+unsafe fn arm_directory_watch(
+    dir_handle: HANDLE,
+    io_event: HANDLE,
+    buffer: &mut [u8],
+    overlapped: &mut OVERLAPPED,
+) -> bool {
+    let _ = ResetEvent(io_event);
+    *overlapped = OVERLAPPED {
+        hEvent: io_event,
+        ..Default::default()
+    };
+    ReadDirectoryChangesW(
+        dir_handle,
+        buffer.as_mut_ptr() as *mut c_void,
+        buffer.len() as u32,
+        false,
+        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE,
+        None,
+        Some(overlapped),
+        None,
+    )
+    .is_ok()
+}
+
+unsafe fn cancel_armed_directory_watch(dir_handle: HANDLE, overlapped: &mut OVERLAPPED) {
+    let _ = CancelIoEx(dir_handle, Some(overlapped));
+    // Keep the overlapped request and its stack buffer alive until cancellation has
+    // actually completed; CancelIoEx alone does not wait for the async operation.
+    let mut bytes = 0u32;
+    let _ = GetOverlappedResult(dir_handle, overlapped, &mut bytes, true);
+}
+
+unsafe fn watch_dir_loop_with_loader<F>(
+    dock_hwnd: HWND,
+    stop_event: HANDLE,
+    dir: &Path,
+    latest: &Arc<Mutex<Vec<(AgentSession, EventMeta)>>>,
+    mut cached_files: CachedFileMap,
+    mut load: F,
+) where
+    F: FnMut() -> std::io::Result<SessionSnapshot>,
+{
     let wide_dir: Vec<u16> = dir
         .to_string_lossy()
         .encode_utf16()
@@ -2184,37 +2465,21 @@ unsafe fn watch_dir_loop(
     };
 
     let mut buffer = [0u8; 4096];
-    let filter =
-        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE;
+    let mut overlapped = OVERLAPPED::default();
+    if !arm_directory_watch(dir_handle, io_event, &mut buffer, &mut overlapped) {
+        let _ = CloseHandle(io_event);
+        let _ = CloseHandle(dir_handle);
+        return;
+    }
+
+    // The first load happens only after the kernel watch is armed. Updates before arm
+    // are captured by this load; updates during it already have a pending watch.
+    reload_watcher_sessions(dock_hwnd, stop_event, &mut cached_files, latest, &mut load);
 
     loop {
-        let _ = ResetEvent(io_event);
-        let mut overlapped = OVERLAPPED {
-            hEvent: io_event,
-            ..Default::default()
-        };
-        if ReadDirectoryChangesW(
-            dir_handle,
-            buffer.as_mut_ptr() as *mut c_void,
-            buffer.len() as u32,
-            false,
-            filter,
-            None,
-            Some(&mut overlapped),
-            None,
-        )
-        .is_err()
-        {
-            break;
-        }
-
         let wait = WaitForMultipleObjects(&[stop_event, io_event], false, INFINITE);
-        if wait == WAIT_OBJECT_0 {
-            let _ = CancelIoEx(dir_handle, Some(&overlapped));
-            break;
-        }
         if wait.0 != WAIT_OBJECT_0.0 + 1 {
-            let _ = CancelIoEx(dir_handle, Some(&overlapped));
+            cancel_armed_directory_watch(dir_handle, &mut overlapped);
             break;
         }
 
@@ -2222,20 +2487,21 @@ unsafe fn watch_dir_loop(
         if GetOverlappedResult(dir_handle, &overlapped, &mut bytes, false).is_err() {
             break;
         }
+        // Close the steady-state gap before any coalescing, disk I/O, or retry wait.
+        // Any update during those operations completes this newly armed request.
+        if !arm_directory_watch(dir_handle, io_event, &mut buffer, &mut overlapped) {
+            break;
+        }
 
         // Briefly coalesce bursts of atomic temp-file writes/renames into one reload.
         if WaitForSingleObject(stop_event, 60) == WAIT_OBJECT_0 {
+            cancel_armed_directory_watch(dir_handle, &mut overlapped);
             break;
         }
-        if let Ok((next_cache, snapshot)) = load_sessions_preserving(dir, &cached_files) {
-            cached_files = next_cache;
-            *latest.lock().unwrap_or_else(|e| e.into_inner()) = snapshot;
-            if !dock_hwnd.is_invalid() {
-                let _ = PostMessageW(dock_hwnd, WM_AGENT_SESSIONS_READY, WPARAM(0), LPARAM(0));
-            }
-        }
-        // A failed enumeration keeps both the cache and last published snapshot. The next
-        // directory event retries; only a successful empty enumeration confirms deletion.
+        reload_watcher_sessions(dock_hwnd, stop_event, &mut cached_files, latest, &mut load);
+        // A failed enumeration keeps the last complete cache/snapshot, sends no READY,
+        // and receives one delayed retry. Persistent failures wait for the next directory
+        // event; only a successful empty enumeration confirms deletion.
     }
 
     let _ = CloseHandle(io_event);
@@ -2246,7 +2512,10 @@ unsafe fn watch_dir_loop(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PidWatchResult {
-    Watching { proc_start: Option<u64> },
+    Watching {
+        proc_start: Option<u64>,
+        generation: usize,
+    },
     Exited,
     AccessDenied,
 }
@@ -2293,16 +2562,28 @@ struct PidWaitEntry {
     wait_handle: HANDLE,
     ctx: *mut PidWaitContext,
     proc_start: Option<u64>,
+    generation: usize,
 }
 
 struct PidWaitContext {
     dock_raw: isize,
     pid: u32,
+    generation: usize,
 }
 
 #[derive(Default)]
 pub struct PidMonitor {
     entries: HashMap<u32, PidWaitEntry>,
+    retired: HashMap<(u32, usize), Option<u64>>,
+    retired_order: VecDeque<(u32, usize)>,
+    next_generation: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PidCompletion {
+    Matched { proc_start: Option<u64> },
+    Retired { proc_start: Option<u64> },
+    Ignored,
 }
 
 impl PidMonitor {
@@ -2314,10 +2595,11 @@ impl PidMonitor {
             if !process_has_exited(existing.proc_handle) {
                 return PidWatchResult::Watching {
                     proc_start: existing.proc_start,
+                    generation: existing.generation,
                 };
             }
             if let Some(old) = self.entries.remove(&pid) {
-                cleanup_pid_entry(old);
+                self.retire_entry(pid, old);
             }
         }
         let proc_handle = match OpenProcess(
@@ -2357,9 +2639,12 @@ impl PidMonitor {
             return PidWatchResult::Exited;
         }
         let proc_start = query_process_start(proc_handle);
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.wrapping_add(1);
         let ctx = Box::into_raw(Box::new(PidWaitContext {
             dock_raw: dock_hwnd.0 as isize,
             pid,
+            generation,
         }));
         let mut wait_handle = HANDLE::default();
         if RegisterWaitForSingleObject(
@@ -2383,23 +2668,74 @@ impl PidMonitor {
                 wait_handle,
                 ctx,
                 proc_start,
+                generation,
             },
         );
-        PidWatchResult::Watching { proc_start }
+        PidWatchResult::Watching {
+            proc_start,
+            generation,
+        }
     }
 
-    pub unsafe fn complete(&mut self, pid: u32) -> Option<u64> {
-        self.entries.remove(&pid).and_then(|entry| {
-            let start = entry.proc_start;
+    unsafe fn retire_entry(&mut self, pid: u32, entry: PidWaitEntry) {
+        let key = (pid, entry.generation);
+        self.retired.insert(key, entry.proc_start);
+        self.retired_order.push_back(key);
+        while self.retired_order.len() > MAX_RETIRED_PID_GENERATIONS {
+            if let Some(oldest) = self.retired_order.pop_front() {
+                self.retired.remove(&oldest);
+            }
+        }
+        cleanup_pid_entry(entry);
+    }
+
+    unsafe fn complete(&mut self, pid: u32, generation: usize) -> PidCompletion {
+        if self
+            .entries
+            .get(&pid)
+            .is_some_and(|entry| entry.generation == generation)
+        {
+            let entry = self.entries.remove(&pid).expect("entry was just present");
+            let proc_start = entry.proc_start;
             cleanup_pid_entry(entry);
-            start
-        })
+            return PidCompletion::Matched { proc_start };
+        }
+        if let Some(proc_start) = self.retired.remove(&(pid, generation)) {
+            return PidCompletion::Retired { proc_start };
+        }
+        PidCompletion::Ignored
+    }
+
+    /// A current-generation exit unregisters that watch and prunes its process identity.
+    /// A queued retired-generation exit may prune only its old `proc_start` or watch
+    /// generation; it never unregisters or wildcard-prunes a reused PID's current state.
+    pub unsafe fn complete_and_prune(
+        &mut self,
+        registry: &mut AgentRegistry,
+        pid: u32,
+        generation: usize,
+    ) -> bool {
+        match self.complete(pid, generation) {
+            PidCompletion::Matched {
+                proc_start: Some(proc_start),
+            }
+            | PidCompletion::Retired {
+                proc_start: Some(proc_start),
+            } => registry.prune_pid_with_start(pid, Some(proc_start)),
+            PidCompletion::Matched { proc_start: None }
+            | PidCompletion::Retired { proc_start: None } => {
+                registry.prune_pid_with_generation(pid, generation)
+            }
+            PidCompletion::Ignored => false,
+        }
     }
 
     pub unsafe fn clear(&mut self) {
         for (_, entry) in self.entries.drain() {
             cleanup_pid_entry(entry);
         }
+        self.retired.clear();
+        self.retired_order.clear();
     }
 }
 
@@ -2428,7 +2764,7 @@ unsafe extern "system" fn pid_exit_callback(ctx: *mut c_void, _timed_out: BOOLEA
             hwnd,
             WM_AGENT_PROCESS_EXITED,
             WPARAM(ctx.pid as usize),
-            LPARAM(0),
+            LPARAM(ctx.generation as isize),
         );
     }
 }
@@ -2436,6 +2772,13 @@ unsafe extern "system" fn pid_exit_callback(ctx: *mut c_void, _timed_out: BOOLEA
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::{Child, Command, Stdio};
+    use std::time::{Duration, Instant};
+    use windows::core::w;
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DestroyWindow, PeekMessageW, HWND_MESSAGE, MSG, PM_REMOVE, WS_OVERLAPPED,
+    };
 
     fn temp_dir(name: &str) -> PathBuf {
         let nonce = SystemTime::now()
@@ -2443,6 +2786,73 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("featherdock-agent-{nonce}-{name}"))
+    }
+
+    struct TestWindow(HWND);
+
+    impl TestWindow {
+        fn new() -> Self {
+            let instance = unsafe { GetModuleHandleW(None) }.unwrap();
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    Default::default(),
+                    w!("Static"),
+                    w!("FeatherDock watcher test"),
+                    WS_OVERLAPPED,
+                    0,
+                    0,
+                    1,
+                    1,
+                    HWND_MESSAGE,
+                    None,
+                    instance,
+                    None,
+                )
+            }
+            .unwrap();
+            Self(hwnd)
+        }
+    }
+
+    impl Drop for TestWindow {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DestroyWindow(self.0);
+            }
+        }
+    }
+
+    struct TestWatcher {
+        stop_event: HANDLE,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl Drop for TestWatcher {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = SetEvent(self.stop_event);
+                if let Some(thread) = self.thread.take() {
+                    let _ = thread.join();
+                }
+                let _ = CloseHandle(self.stop_event);
+            }
+        }
+    }
+
+    fn wait_for_test_message(hwnd: HWND, message_id: u32) -> Option<MSG> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut message = MSG::default();
+            if unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+                if message.hwnd == hwnd && message.message == message_id {
+                    return Some(message);
+                }
+            } else if Instant::now() >= deadline {
+                return None;
+            } else {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
     }
 
     fn p0_event(session_id: &str, state: ParsedEventState, updated_at: u64) -> AgentEventPayload {
@@ -2483,6 +2893,31 @@ mod tests {
         }
     }
 
+    fn pid_test_entry(generation: usize, proc_start: Option<u64>) -> PidWaitEntry {
+        // Register a real wait on an owned unsignalled event so UnregisterWaitEx and
+        // handle cleanup follow the same valid Win32 path as production entries.
+        unsafe {
+            let proc_handle = CreateEventW(None, true, false, None).unwrap();
+            let mut wait_handle = HANDLE::default();
+            RegisterWaitForSingleObject(
+                &mut wait_handle,
+                proc_handle,
+                Some(pid_exit_callback),
+                None,
+                INFINITE,
+                WT_EXECUTEONLYONCE,
+            )
+            .unwrap();
+            PidWaitEntry {
+                proc_handle,
+                wait_handle,
+                ctx: std::ptr::null_mut(),
+                proc_start,
+                generation,
+            }
+        }
+    }
+
     #[test]
     fn parses_agent_event_json_with_windows_paths_and_unicode() {
         let json = r#"{
@@ -2506,10 +2941,7 @@ mod tests {
             parsed.detail.as_deref(),
             Some("等待确认执行 \"cargo test\"")
         );
-        assert_eq!(
-            parsed.cwd.as_deref(),
-            Some(r"C:\Work\Dock")
-        );
+        assert_eq!(parsed.cwd.as_deref(), Some(r"C:\Work\Dock"));
         assert_eq!(parsed.state, ParsedEventState::State(AgentState::Waiting));
         assert_eq!(parsed.hwnd, Some(131420));
         assert_eq!(parsed.pid, Some(24816));
@@ -2884,6 +3316,9 @@ mod tests {
         assert_eq!(summary.sessions[0].hwnd, None);
         // Stale snapshot still referencing the closed HWND must not re-attach it.
         reg.replace_file_sessions(vec![session.clone()], None, &[]);
+        // Legacy snapshots have no instance proof, so production immediately rebinds
+        // the returned PID through the existing watcher before handling its exit.
+        reg.set_pid_proc_start(4242, Some(777_000));
         assert_eq!(
             reg.summarize_agent("codex", "Codex", &[]).sessions[0].hwnd,
             None
@@ -2988,8 +3423,7 @@ mod tests {
         let json = r#"{"agent":"codex","session_id":"file1","state":"running","pid":4242,"updated_at":100,"instance":"inst-a","seq":7}"#;
         fs::write(&path, json).unwrap();
 
-        let empty = CachedFileMap::new();
-        let (cache, snapshot) = load_sessions_preserving(&dir, &empty).unwrap();
+        let (_, snapshot) = load_sessions_preserving(&dir).unwrap();
         let mut reg = AgentRegistry::default();
         reg.replace_file_sessions_with_meta(snapshot, None, &[]);
         assert!(reg.prune_pid(4242));
@@ -2998,7 +3432,7 @@ mod tests {
             .contains_key(&("codex".into(), "file1".into())));
 
         fs::remove_file(&path).unwrap();
-        let (_, confirmed_empty) = load_sessions_preserving(&dir, &cache).unwrap();
+        let (_, confirmed_empty) = load_sessions_preserving(&dir).unwrap();
         assert!(confirmed_empty.is_empty());
         reg.replace_file_sessions_with_meta(confirmed_empty, None, &[]);
         let key = ("codex".to_string(), "file1".to_string());
@@ -3009,7 +3443,7 @@ mod tests {
 
         // The exact same producer version reappears after a confirmed missing-file snapshot.
         fs::write(&path, json).unwrap();
-        let (_, reappeared) = load_sessions_preserving(&dir, &cache).unwrap();
+        let (_, reappeared) = load_sessions_preserving(&dir).unwrap();
         assert_eq!(reappeared[0].1.seq, Some(7));
         reg.replace_file_sessions_with_meta(reappeared, None, &[]);
         assert_eq!(reg.summarize_agent("codex", "Codex", &[]).total_sessions, 0);
@@ -3026,17 +3460,16 @@ mod tests {
             r#"{"agent":"codex","session_id":"file1","state":"running","pid":4242,"updated_at":100,"instance":"inst-a","seq":7}"#,
         )
         .unwrap();
-        let empty = CachedFileMap::new();
-        let (cache, snapshot) = load_sessions_preserving(&dir, &empty).unwrap();
+        let (cache, snapshot) = load_sessions_preserving(&dir).unwrap();
         assert_eq!(snapshot.len(), 1);
 
         fs::remove_dir_all(&dir).unwrap();
-        assert!(load_sessions_preserving(&dir, &cache).is_err());
+        assert!(load_sessions_preserving(&dir).is_err());
         assert_eq!(cache.len(), 1);
 
         // Only a successful enumeration may publish an empty list and clear live file rows.
         fs::create_dir_all(&dir).unwrap();
-        let (_, confirmed_empty) = load_sessions_preserving(&dir, &cache).unwrap();
+        let (_, confirmed_empty) = load_sessions_preserving(&dir).unwrap();
         assert!(confirmed_empty.is_empty());
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -3272,6 +3705,1217 @@ mod tests {
             .unwrap();
         assert_eq!(session.state, AgentState::Waiting);
         assert_eq!(session.source, SessionSource::File);
+    }
+
+    #[test]
+    fn queued_old_exit_after_pid_reuse_preserves_new_watch_and_running_session() {
+        let mut reg = AgentRegistry::default();
+        let key = ("codex".to_string(), "pid-reuse".to_string());
+        reg.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("pid-reuse", AgentState::Running, 100),
+                p0_meta("inst-old", 1),
+            )],
+            None,
+            &[],
+        );
+        reg.set_pid_proc_start(4242, Some(1_000));
+
+        let mut new_event = p0_event(
+            "pid-reuse",
+            ParsedEventState::State(AgentState::Running),
+            200,
+        );
+        new_event.pid = Some(4242);
+        reg.apply_event_with_meta(new_event, p0_meta("inst-new", 1), None, &[]);
+        assert_eq!(
+            reg.event_versions
+                .get(&key)
+                .and_then(|stamp| stamp.proc_start),
+            None,
+            "a new instance must not inherit the old process start"
+        );
+        reg.set_pid_proc_start(4242, Some(2_000));
+        assert_eq!(
+            reg.file_versions
+                .get(&key)
+                .and_then(|stamp| stamp.proc_start),
+            Some(1_000)
+        );
+        assert_eq!(
+            reg.event_versions
+                .get(&key)
+                .and_then(|stamp| stamp.proc_start),
+            Some(2_000)
+        );
+
+        // generation 1 has already queued its exit; generation 2 now owns the same PID.
+        let mut monitor = PidMonitor::default();
+        unsafe { monitor.retire_entry(4242, pid_test_entry(1, Some(1_000))) };
+        monitor.entries.insert(4242, pid_test_entry(2, Some(2_000)));
+        assert!(unsafe { monitor.complete_and_prune(&mut reg, 4242, 1) });
+        assert_eq!(
+            monitor.entries.get(&4242).map(|entry| entry.generation),
+            Some(2)
+        );
+        assert!(reg.file_sessions.is_empty());
+        assert_eq!(reg.event_sessions.len(), 1);
+        assert!(!reg.file_versions.contains_key(&key));
+        assert_eq!(
+            reg.event_versions
+                .get(&key)
+                .and_then(|stamp| stamp.proc_start),
+            Some(2_000)
+        );
+        let current = reg.summarize_agent("codex", "Codex", &[]);
+        assert_eq!(current.aggregate_state, AgentState::Running);
+        assert_eq!(current.sessions[0].source, SessionSource::Event);
+
+        // Only the new generation's own exit may unregister and prune it.
+        assert!(unsafe { monitor.complete_and_prune(&mut reg, 4242, 2) });
+        assert!(!monitor.entries.contains_key(&4242));
+        assert!(reg.file_sessions.is_empty());
+        assert!(reg.event_sessions.is_empty());
+        assert!(!reg.file_versions.contains_key(&key));
+        assert!(!reg.event_versions.contains_key(&key));
+        assert_eq!(reg.summarize_agent("codex", "Codex", &[]).total_sessions, 0);
+    }
+
+    #[test]
+    fn new_file_instance_same_pid_does_not_inherit_old_proc_start() {
+        let mut reg = AgentRegistry::default();
+        let key = ("codex".to_string(), "file-pid-reuse".to_string());
+        reg.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("file-pid-reuse", AgentState::Running, 100),
+                p0_meta("inst-old", 1),
+            )],
+            None,
+            &[],
+        );
+        reg.set_pid_proc_start(4242, Some(1_000));
+        reg.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("file-pid-reuse", AgentState::Running, 200),
+                p0_meta("inst-new", 1),
+            )],
+            None,
+            &[],
+        );
+        assert_eq!(
+            reg.file_versions
+                .get(&key)
+                .and_then(|stamp| stamp.proc_start),
+            None
+        );
+        reg.set_pid_proc_start(4242, Some(2_000));
+        assert_eq!(
+            reg.file_versions
+                .get(&key)
+                .and_then(|stamp| stamp.proc_start),
+            Some(2_000)
+        );
+
+        assert!(!reg.prune_pid_with_start(4242, Some(1_000)));
+        assert!(!reg.tombstones.contains_key(&key));
+        assert_eq!(reg.file_sessions.len(), 1);
+        assert!(reg.prune_pid_with_start(4242, Some(2_000)));
+        assert_eq!(reg.summarize_agent("codex", "Codex", &[]).total_sessions, 0);
+    }
+
+    #[test]
+    fn missing_instance_rebinds_process_start_from_os_for_ipc_and_file() {
+        let mut ipc = AgentRegistry::default();
+        let ipc_key = ("codex".to_string(), "legacy-ipc".to_string());
+        let mut old = p0_event(
+            "legacy-ipc",
+            ParsedEventState::State(AgentState::Running),
+            100,
+        );
+        old.pid = Some(4242);
+        ipc.apply_event(old.clone(), None, &[]);
+        ipc.set_pid_proc_start(4242, Some(1_000));
+        let mut new = old;
+        new.updated_at = Some(200);
+        ipc.apply_event(new, None, &[]);
+        // Legacy events have no producer generation proof, so the OS watcher must
+        // rebind process identity instead of inheriting the previous PID's start.
+        assert_eq!(
+            ipc.event_versions
+                .get(&ipc_key)
+                .and_then(|stamp| stamp.proc_start),
+            None
+        );
+        ipc.set_pid_proc_start(4242, Some(2_000));
+        assert_eq!(
+            ipc.event_versions
+                .get(&ipc_key)
+                .and_then(|stamp| stamp.proc_start),
+            Some(2_000)
+        );
+
+        let mut files = AgentRegistry::default();
+        let file_key = ("codex".to_string(), "legacy-file".to_string());
+        files.replace_file_sessions(
+            vec![p0_file_session("legacy-file", AgentState::Running, 100)],
+            None,
+            &[],
+        );
+        files.set_pid_proc_start(4242, Some(1_000));
+        files.replace_file_sessions(
+            vec![p0_file_session("legacy-file", AgentState::Running, 200)],
+            None,
+            &[],
+        );
+        assert_eq!(
+            files
+                .file_versions
+                .get(&file_key)
+                .and_then(|stamp| stamp.proc_start),
+            None
+        );
+        files.set_pid_proc_start(4242, Some(2_000));
+        assert_eq!(
+            files
+                .file_versions
+                .get(&file_key)
+                .and_then(|stamp| stamp.proc_start),
+            Some(2_000)
+        );
+
+        // Exact legacy duplicates retain both the start and its binding version. A
+        // reused PID's newer OS observation must not overwrite that old identity.
+        let mut duplicate = p0_event(
+            "legacy-ipc",
+            ParsedEventState::State(AgentState::Running),
+            200,
+        );
+        duplicate.pid = Some(4242);
+        let effect = ipc.apply_event(duplicate, None, &[]);
+        assert_eq!(
+            ipc.event_versions
+                .get(&ipc_key)
+                .and_then(|stamp| stamp.proc_bind_version),
+            Some((0, 200))
+        );
+        ipc.bind_pid_proc_start(&effect.watch.unwrap(), Some(3_000));
+        assert_eq!(
+            ipc.event_versions
+                .get(&ipc_key)
+                .and_then(|stamp| stamp.proc_start),
+            Some(2_000)
+        );
+        assert!(ipc.prune_pid_with_start(4242, Some(2_000)));
+
+        let (_, _, requests) = files.replace_file_sessions(
+            vec![p0_file_session("legacy-file", AgentState::Running, 200)],
+            None,
+            &[],
+        );
+        assert_eq!(
+            files
+                .file_versions
+                .get(&file_key)
+                .and_then(|stamp| stamp.proc_bind_version),
+            Some((0, 200))
+        );
+        files.bind_pid_proc_start(&requests[0], Some(3_000));
+        assert_eq!(
+            files
+                .file_versions
+                .get(&file_key)
+                .and_then(|stamp| stamp.proc_start),
+            Some(2_000)
+        );
+        assert!(files.prune_pid_with_start(4242, Some(2_000)));
+    }
+
+    #[test]
+    fn ensure_watching_retires_exited_entry_before_registering_reused_pid() {
+        let pid = std::process::id();
+        let mut monitor = PidMonitor::default();
+        let old = pid_test_entry(3, Some(1));
+        let exited_handle = old.proc_handle;
+        monitor.entries.insert(pid, old);
+        monitor.next_generation = 7;
+        unsafe { SetEvent(exited_handle) }.unwrap();
+
+        let result =
+            unsafe { monitor.ensure_watching(HWND(std::ptr::dangling_mut::<c_void>()), pid) };
+        let PidWatchResult::Watching {
+            proc_start,
+            generation,
+        } = result
+        else {
+            panic!("current test process should be watchable");
+        };
+        assert_eq!(generation, 7);
+        assert!(proc_start.is_some());
+        assert_eq!(monitor.retired.get(&(pid, 3)), Some(&Some(1)));
+        assert_eq!(
+            monitor.entries.get(&pid).map(|entry| entry.generation),
+            Some(7)
+        );
+        assert_eq!(
+            monitor.entries.get(&pid).and_then(|entry| entry.proc_start),
+            proc_start
+        );
+        unsafe { monitor.clear() };
+    }
+
+    #[test]
+    fn live_child_exit_posts_generation_and_prunes_only_the_matching_process() {
+        struct ChildGuard(Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        struct WindowGuard(HWND);
+        impl Drop for WindowGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = DestroyWindow(self.0);
+                }
+            }
+        }
+
+        let instance = unsafe { GetModuleHandleW(None) }.unwrap();
+        let hwnd = unsafe {
+            CreateWindowExW(
+                Default::default(),
+                w!("Static"),
+                w!("FeatherDock PID test"),
+                WS_OVERLAPPED,
+                0,
+                0,
+                1,
+                1,
+                HWND_MESSAGE,
+                None,
+                instance,
+                None,
+            )
+        }
+        .unwrap();
+        let window = WindowGuard(hwnd);
+        let child = Command::new("ping.exe")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut child = ChildGuard(child);
+        let pid = child.0.id();
+        let mut monitor = PidMonitor::default();
+        let PidWatchResult::Watching {
+            proc_start,
+            generation,
+        } = (unsafe { monitor.ensure_watching(hwnd, pid) })
+        else {
+            panic!("owned child process should be watchable");
+        };
+        assert!(proc_start.is_some());
+        assert_eq!(
+            monitor.entries.get(&pid).map(|entry| entry.generation),
+            Some(generation)
+        );
+
+        let mut registry = AgentRegistry::default();
+        let mut event = p0_event(
+            "live-exit",
+            ParsedEventState::State(AgentState::Running),
+            200,
+        );
+        event.pid = Some(pid);
+        let effect = registry.apply_event_with_meta(event, p0_meta("inst-live", 1), None, &[]);
+        registry.bind_pid_watch(&effect.watch.unwrap(), proc_start, generation);
+        assert_eq!(registry.event_sessions.len(), 1);
+
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let received = loop {
+            let mut message = MSG::default();
+            if unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool() {
+                if message.hwnd == hwnd && message.message == WM_AGENT_PROCESS_EXITED {
+                    break Some((message.wParam.0 as u32, message.lParam.0 as usize));
+                }
+            } else if Instant::now() >= deadline {
+                break None;
+            } else {
+                thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let (received_pid, received_generation) =
+            received.expect("real process callback should post to the message-only window");
+        assert_eq!(received_pid, pid);
+        assert_eq!(received_generation, generation);
+        assert!(unsafe {
+            monitor.complete_and_prune(&mut registry, received_pid, received_generation)
+        });
+        assert!(!monitor.entries.contains_key(&pid));
+        assert!(registry.event_sessions.is_empty());
+        drop(window);
+    }
+
+    #[test]
+    fn stale_or_missing_completion_never_prunes_by_pid() {
+        let mut reg = AgentRegistry::default();
+        let mut event = p0_event(
+            "missing-watch",
+            ParsedEventState::State(AgentState::Running),
+            200,
+        );
+        event.pid = Some(4242);
+        reg.apply_event_with_meta(event, p0_meta("inst-new", 1), None, &[]);
+        let key = ("codex".to_string(), "missing-watch".to_string());
+        let mut monitor = PidMonitor::default();
+        monitor.entries.insert(4242, pid_test_entry(9, None));
+
+        assert!(!unsafe { monitor.complete_and_prune(&mut reg, 4242, 8) });
+        assert!(monitor.entries.contains_key(&4242));
+        assert_eq!(reg.summarize_agent("codex", "Codex", &[]).total_sessions, 1);
+        assert!(!reg.tombstones.contains_key(&key));
+
+        // Even a matching callback without an OS process start is not a PID wildcard.
+        assert!(!unsafe { monitor.complete_and_prune(&mut reg, 4242, 9) });
+        assert!(!monitor.entries.contains_key(&4242));
+        assert_eq!(reg.summarize_agent("codex", "Codex", &[]).total_sessions, 1);
+        assert!(!reg.tombstones.contains_key(&key));
+
+        // A duplicate/missing completion remains a no-op as well.
+        assert!(!unsafe { monitor.complete_and_prune(&mut reg, 4242, 9) });
+        assert_eq!(reg.summarize_agent("codex", "Codex", &[]).total_sessions, 1);
+        assert!(!reg.tombstones.contains_key(&key));
+
+        unsafe { monitor.retire_entry(4242, pid_test_entry(10, None)) };
+        assert!(!unsafe { monitor.complete_and_prune(&mut reg, 4242, 10) });
+        assert_eq!(reg.summarize_agent("codex", "Codex", &[]).total_sessions, 1);
+        assert!(!reg.tombstones.contains_key(&key));
+    }
+
+    #[test]
+    fn proc_start_backfill_does_not_cross_instance_or_channel() {
+        let mut reg = AgentRegistry::default();
+        let key = ("codex".to_string(), "targeted-bind".to_string());
+        reg.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("targeted-bind", AgentState::Running, 100),
+                p0_meta("inst-old", 1),
+            )],
+            None,
+            &[],
+        );
+        let mut event = p0_event(
+            "targeted-bind",
+            ParsedEventState::State(AgentState::Running),
+            200,
+        );
+        event.pid = Some(4242);
+        let effect = reg.apply_event_with_meta(event, p0_meta("inst-new", 1), None, &[]);
+        assert_eq!(
+            reg.file_versions
+                .get(&key)
+                .and_then(|stamp| stamp.proc_start),
+            None
+        );
+        assert_eq!(
+            reg.event_versions
+                .get(&key)
+                .and_then(|stamp| stamp.proc_start),
+            None
+        );
+
+        reg.bind_pid_proc_start(&effect.watch.unwrap(), Some(2_000));
+        assert_eq!(
+            reg.file_versions
+                .get(&key)
+                .and_then(|stamp| stamp.proc_start),
+            None
+        );
+        assert_eq!(
+            reg.event_versions
+                .get(&key)
+                .and_then(|stamp| stamp.proc_start),
+            Some(2_000)
+        );
+
+        // The hidden old file row survives with its own metadata, but emits no request
+        // that could bind it to the newer IPC process.
+        let (_, _, requests) = reg.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("targeted-bind", AgentState::Running, 100),
+                p0_meta("inst-old", 1),
+            )],
+            None,
+            &[],
+        );
+        assert!(requests.is_empty());
+        assert_eq!(
+            reg.file_versions
+                .get(&key)
+                .and_then(|stamp| stamp.proc_start),
+            None
+        );
+        assert!(!reg.prune_pid_with_start(4242, Some(1_000)));
+        assert_eq!(reg.file_sessions.len(), 1);
+        assert_eq!(reg.event_sessions.len(), 1);
+        assert!(!reg.tombstones.contains_key(&key));
+    }
+
+    #[test]
+    fn dual_channel_prune_preserves_surviving_ack_and_read_markers() {
+        let mut waiting = AgentRegistry::default();
+        let waiting_key = ("codex".to_string(), "waiting-survives".to_string());
+        let mut event = p0_event(
+            "waiting-survives",
+            ParsedEventState::State(AgentState::Waiting),
+            100,
+        );
+        event.pid = Some(4242);
+        let effect = waiting.apply_event_with_meta(event, p0_meta("inst-a", 100), None, &[]);
+        waiting.bind_pid_proc_start(&effect.watch.unwrap(), Some(2_000));
+        let (_, _, requests) = waiting.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("waiting-survives", AgentState::Waiting, 200),
+                p0_meta("inst-a", 200),
+            )],
+            None,
+            &[],
+        );
+        waiting.bind_pid_proc_start(&requests[0], Some(1_000));
+        waiting.mark_session_read("codex", "waiting-survives");
+        assert!(waiting.waiting_bounce_acked.contains(&waiting_key));
+        assert!(waiting.prune_pid_with_start(4242, Some(2_000)));
+        assert!(waiting.event_sessions.is_empty());
+        assert_eq!(waiting.file_sessions.len(), 1);
+        assert!(waiting.waiting_bounce_acked.contains(&waiting_key));
+        assert_eq!(
+            waiting
+                .summarize_agent("codex", "Codex", &[])
+                .aggregate_state,
+            AgentState::Waiting
+        );
+        assert!(waiting.prune_pid_with_start(4242, Some(1_000)));
+        assert!(!waiting.waiting_bounce_acked.contains(&waiting_key));
+
+        let mut read = AgentRegistry::default();
+        let read_key = ("codex".to_string(), "read-survives".to_string());
+        let mut event = p0_event(
+            "read-survives",
+            ParsedEventState::State(AgentState::Running),
+            100,
+        );
+        event.pid = Some(4242);
+        let effect = read.apply_event_with_meta(event, p0_meta("inst-a", 100), None, &[]);
+        read.bind_pid_proc_start(&effect.watch.unwrap(), Some(2_000));
+        let (_, _, requests) = read.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("read-survives", AgentState::Done, 200),
+                p0_meta("inst-a", 200),
+            )],
+            None,
+            &[],
+        );
+        read.bind_pid_proc_start(&requests[0], Some(1_000));
+        assert!(read.mark_session_read("codex", "read-survives"));
+        assert!(read.read_file_versions.contains_key(&read_key));
+        assert!(read.prune_pid_with_start(4242, Some(2_000)));
+        assert!(read.event_sessions.is_empty());
+        assert_eq!(read.file_sessions[0].state, AgentState::Idle);
+        assert!(read.read_file_versions.contains_key(&read_key));
+
+        let (_, bounces, _) = read.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("read-survives", AgentState::Done, 200),
+                p0_meta("inst-a", 200),
+            )],
+            None,
+            &[],
+        );
+        assert!(bounces.is_empty());
+        assert_eq!(read.file_sessions[0].state, AgentState::Idle);
+        assert!(read.read_file_versions.contains_key(&read_key));
+        assert!(read.prune_pid_with_start(4242, Some(1_000)));
+        assert!(!read.read_file_versions.contains_key(&read_key));
+    }
+
+    #[test]
+    fn delayed_same_file_version_does_not_rebind_reused_pid_start() {
+        let pid = std::process::id();
+        let key = ("codex".to_string(), "delayed-rebind".to_string());
+        let mut reg = AgentRegistry::default();
+        let mut event = p0_event(
+            "delayed-rebind",
+            ParsedEventState::State(AgentState::Running),
+            100,
+        );
+        event.pid = Some(pid);
+        let effect = reg.apply_event_with_meta(event, p0_meta("inst-a", 100), None, &[]);
+        reg.bind_pid_proc_start(&effect.watch.unwrap(), Some(1_000));
+        let file = p0_file_session("delayed-rebind", AgentState::Running, 200);
+        let file = AgentSession {
+            pid: Some(pid),
+            ..file
+        };
+        let (_, _, requests) = reg.replace_file_sessions_with_meta(
+            vec![(file.clone(), p0_meta("inst-a", 200))],
+            None,
+            &[],
+        );
+        reg.bind_pid_proc_start(&requests[0], Some(1_000));
+        assert_eq!(
+            reg.file_versions
+                .get(&key)
+                .and_then(|stamp| stamp.proc_start),
+            Some(1_000)
+        );
+        assert_eq!(
+            reg.event_versions
+                .get(&key)
+                .and_then(|stamp| stamp.proc_start),
+            Some(1_000)
+        );
+
+        let (_, _, delayed_requests) = reg.replace_file_sessions_with_meta(
+            vec![(file.clone(), p0_meta("inst-a", 200))],
+            None,
+            &[],
+        );
+        assert_eq!(delayed_requests.len(), 1);
+
+        // The old watch has exited and queued gen1; the current test process now
+        // supplies a different real OS start for the same numeric PID fixture.
+        let mut monitor = PidMonitor::default();
+        let old = pid_test_entry(1, Some(1_000));
+        let exited_handle = old.proc_handle;
+        monitor.entries.insert(pid, old);
+        monitor.next_generation = 2;
+        unsafe { SetEvent(exited_handle) }.unwrap();
+        let PidWatchResult::Watching {
+            proc_start: Some(new_start),
+            generation: 2,
+        } = (unsafe { monitor.ensure_watching(HWND(std::ptr::dangling_mut::<c_void>()), pid) })
+        else {
+            panic!("current test process should be watchable");
+        };
+        assert_ne!(new_start, 1_000);
+        reg.bind_pid_proc_start(&delayed_requests[0], Some(new_start));
+        assert_eq!(
+            reg.file_versions
+                .get(&key)
+                .and_then(|stamp| stamp.proc_start),
+            Some(1_000)
+        );
+        assert_eq!(
+            reg.event_versions
+                .get(&key)
+                .and_then(|stamp| stamp.proc_start),
+            Some(1_000)
+        );
+
+        assert!(unsafe { monitor.complete_and_prune(&mut reg, pid, 1) });
+        assert_eq!(
+            monitor.entries.get(&pid).map(|entry| entry.generation),
+            Some(2)
+        );
+        assert!(reg.file_sessions.is_empty());
+        assert!(reg.event_sessions.is_empty());
+        assert!(!reg.file_versions.contains_key(&key));
+        assert!(!reg.event_versions.contains_key(&key));
+        assert_eq!(reg.summarize_agent("codex", "Codex", &[]).total_sessions, 0);
+        unsafe { monitor.clear() };
+    }
+
+    #[test]
+    fn same_process_start_prunes_both_channels_once() {
+        let mut reg = AgentRegistry::default();
+        let key = ("codex".to_string(), "same-start".to_string());
+        let mut event = p0_event(
+            "same-start",
+            ParsedEventState::State(AgentState::Running),
+            100,
+        );
+        event.pid = Some(4242);
+        let effect = reg.apply_event_with_meta(event, p0_meta("inst-a", 100), None, &[]);
+        reg.bind_pid_proc_start(&effect.watch.unwrap(), Some(1_000));
+        let (_, _, requests) = reg.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("same-start", AgentState::Running, 200),
+                p0_meta("inst-a", 200),
+            )],
+            None,
+            &[],
+        );
+        reg.bind_pid_proc_start(&requests[0], Some(1_000));
+        assert_eq!(reg.event_sessions.len(), 1);
+        assert_eq!(reg.file_sessions.len(), 1);
+
+        assert!(reg.prune_pid_with_start(4242, Some(1_000)));
+        assert!(reg.event_sessions.is_empty());
+        assert!(reg.file_sessions.is_empty());
+        assert!(!reg.event_versions.contains_key(&key));
+        assert!(!reg.file_versions.contains_key(&key));
+        assert_eq!(reg.tombstones.len(), 1);
+        assert!(!reg.prune_pid_with_start(4242, Some(1_000)));
+    }
+
+    #[test]
+    fn delayed_file_snapshots_preserve_read_and_waiting_ack() {
+        let mut reg = AgentRegistry::default();
+        let done_key = ("codex".to_string(), "done-read".to_string());
+        reg.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("done-read", AgentState::Done, 200),
+                p0_meta("inst-a", 200),
+            )],
+            None,
+            &[],
+        );
+        assert!(reg.mark_session_read("codex", "done-read"));
+        assert_eq!(reg.file_sessions[0].state, AgentState::Idle);
+        assert_eq!(
+            reg.read_file_versions.get(&done_key).map(|stamp| stamp.seq),
+            Some(200)
+        );
+
+        let (_, bounces, _) = reg.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("done-read", AgentState::Done, 100),
+                p0_meta("inst-a", 100),
+            )],
+            None,
+            &[],
+        );
+        assert!(bounces.is_empty());
+        assert_eq!(reg.file_sessions[0].state, AgentState::Idle);
+        assert_eq!(
+            reg.file_versions.get(&done_key).map(|stamp| stamp.seq),
+            Some(200)
+        );
+        assert_eq!(
+            reg.read_file_versions.get(&done_key).map(|stamp| stamp.seq),
+            Some(200)
+        );
+
+        let waiting_key = ("codex".to_string(), "waiting-ack".to_string());
+        let (_, bounces, _) = reg.replace_file_sessions_with_meta(
+            vec![
+                (
+                    p0_file_session("done-read", AgentState::Done, 200),
+                    p0_meta("inst-a", 200),
+                ),
+                (
+                    p0_file_session("waiting-ack", AgentState::Waiting, 200),
+                    p0_meta("inst-a", 200),
+                ),
+            ],
+            None,
+            &[],
+        );
+        assert_eq!(bounces, vec!["codex".to_string()]);
+        reg.mark_session_read("codex", "waiting-ack");
+        assert!(reg.waiting_bounce_acked.contains(&waiting_key));
+        let (_, bounces, _) = reg.replace_file_sessions_with_meta(
+            vec![
+                (
+                    p0_file_session("done-read", AgentState::Done, 200),
+                    p0_meta("inst-a", 200),
+                ),
+                (
+                    p0_file_session("waiting-ack", AgentState::Waiting, 100),
+                    p0_meta("inst-a", 100),
+                ),
+            ],
+            None,
+            &[],
+        );
+        assert!(bounces.is_empty());
+        assert!(reg.waiting_bounce_acked.contains(&waiting_key));
+        assert_eq!(
+            reg.file_versions.get(&waiting_key).map(|stamp| stamp.seq),
+            Some(200)
+        );
+    }
+
+    #[test]
+    fn newer_ipc_preserves_hidden_file_channel_and_ack() {
+        let mut reg = AgentRegistry::default();
+        let key = ("codex".to_string(), "shared-ack".to_string());
+        let (_, bounces, _) = reg.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("shared-ack", AgentState::Waiting, 100),
+                p0_meta("inst-a", 100),
+            )],
+            None,
+            &[],
+        );
+        assert_eq!(bounces, vec!["codex".to_string()]);
+        reg.mark_session_read("codex", "shared-ack");
+        reg.apply_event_with_meta(
+            p0_event(
+                "shared-ack",
+                ParsedEventState::State(AgentState::Waiting),
+                200,
+            ),
+            p0_meta("inst-a", 200),
+            None,
+            &[],
+        );
+        let (_, bounces, _) = reg.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("shared-ack", AgentState::Waiting, 100),
+                p0_meta("inst-a", 100),
+            )],
+            None,
+            &[],
+        );
+        assert!(bounces.is_empty());
+        assert_eq!(reg.file_sessions.len(), 1);
+        assert_eq!(
+            reg.file_versions.get(&key).map(|stamp| stamp.seq),
+            Some(100)
+        );
+        assert!(reg.waiting_bounce_acked.contains(&key));
+    }
+
+    #[test]
+    fn file_read_marker_uses_instance_and_sequence_not_only_timestamp() {
+        let mut reg = AgentRegistry::default();
+        let key = ("codex".to_string(), "versioned-read".to_string());
+        reg.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("versioned-read", AgentState::Done, 200),
+                p0_meta("inst-a", 200),
+            )],
+            None,
+            &[],
+        );
+        reg.mark_session_read("codex", "versioned-read");
+
+        // Higher seq is newer even when its wall-clock second is lower.
+        reg.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("versioned-read", AgentState::Done, 100),
+                p0_meta("inst-a", 201),
+            )],
+            None,
+            &[],
+        );
+        assert_eq!(reg.file_sessions[0].state, AgentState::Done);
+        reg.mark_session_read("codex", "versioned-read");
+        assert_eq!(
+            reg.read_file_versions.get(&key).map(|stamp| stamp.seq),
+            Some(201)
+        );
+
+        // Same timestamp under a new producer instance is a new unread completion.
+        reg.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("versioned-read", AgentState::Done, 100),
+                p0_meta("inst-b", 1),
+            )],
+            None,
+            &[],
+        );
+        assert_eq!(reg.file_sessions[0].state, AgentState::Done);
+    }
+
+    #[test]
+    fn explicit_new_instance_same_second_pid_passes_dead_tombstone_for_ipc_and_file() {
+        let mut ipc = AgentRegistry::default();
+        let mut old = p0_event(
+            "restart-ipc",
+            ParsedEventState::State(AgentState::Running),
+            100,
+        );
+        old.pid = Some(4242);
+        ipc.apply_event_with_meta(old, p0_meta("old", 9), None, &[]);
+        ipc.set_pid_proc_start(4242, Some(1_000));
+        assert!(ipc.prune_pid_with_start(4242, Some(1_000)));
+
+        let mut legacy = p0_event(
+            "restart-ipc",
+            ParsedEventState::State(AgentState::Running),
+            100,
+        );
+        legacy.pid = Some(4242);
+        assert!(ipc.apply_event(legacy, None, &[]).watch.is_none());
+        let mut new = p0_event(
+            "restart-ipc",
+            ParsedEventState::State(AgentState::Running),
+            100,
+        );
+        new.pid = Some(4242);
+        let effect = ipc.apply_event_with_meta(new, p0_meta("new", 1), None, &[]);
+        assert!(effect.changed);
+        assert!(effect.watch.is_some());
+        assert_eq!(
+            ipc.summarize_agent("codex", "Codex", &[]).aggregate_state,
+            AgentState::Running
+        );
+
+        let mut files = AgentRegistry::default();
+        files.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("restart-file", AgentState::Running, 100),
+                p0_meta("old", 9),
+            )],
+            None,
+            &[],
+        );
+        files.set_pid_proc_start(4242, Some(1_000));
+        assert!(files.prune_pid_with_start(4242, Some(1_000)));
+        let (_, _, legacy_requests) = files.replace_file_sessions(
+            vec![p0_file_session("restart-file", AgentState::Running, 100)],
+            None,
+            &[],
+        );
+        assert!(legacy_requests.is_empty());
+        let (_, _, requests) = files.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("restart-file", AgentState::Running, 100),
+                p0_meta("new", 1),
+            )],
+            None,
+            &[],
+        );
+        assert_eq!(files.file_sessions.len(), 1);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            files.summarize_agent("codex", "Codex", &[]).aggregate_state,
+            AgentState::Running
+        );
+    }
+
+    #[test]
+    fn file_waiting_reentry_uses_previous_visible_merged_state() {
+        let mut reg = AgentRegistry::default();
+        let (_, bounces, _) = reg.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("waiting-visible", AgentState::Waiting, 100),
+                p0_meta("inst-a", 100),
+            )],
+            None,
+            &[],
+        );
+        assert_eq!(bounces, vec!["codex".to_string()]);
+        reg.apply_event_with_meta(
+            p0_event(
+                "waiting-visible",
+                ParsedEventState::State(AgentState::Running),
+                200,
+            ),
+            p0_meta("inst-a", 200),
+            None,
+            &[],
+        );
+        let (_, bounces, _) = reg.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("waiting-visible", AgentState::Waiting, 100),
+                p0_meta("inst-a", 100),
+            )],
+            None,
+            &[],
+        );
+        assert!(bounces.is_empty());
+        let (_, bounces, _) = reg.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("waiting-visible", AgentState::Waiting, 300),
+                p0_meta("inst-a", 300),
+            )],
+            None,
+            &[],
+        );
+        assert_eq!(bounces, vec!["codex".to_string()]);
+        let (_, bounces, _) = reg.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("waiting-visible", AgentState::Waiting, 300),
+                p0_meta("inst-a", 300),
+            )],
+            None,
+            &[],
+        );
+        assert!(bounces.is_empty());
+        assert_eq!(
+            reg.summarize_agent("codex", "Codex", &[]).sessions[0].source,
+            SessionSource::File
+        );
+
+        // Preserve the legacy foreground rule: an already visible Waiting snapshot
+        // does not gain a delayed bounce merely because focus later disappears.
+        let mut foreground = AgentRegistry::default();
+        let (_, bounces, _) = foreground.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("foreground-waiting", AgentState::Waiting, 100),
+                p0_meta("inst-a", 100),
+            )],
+            Some(77),
+            &["codex".to_string()],
+        );
+        assert!(bounces.is_empty());
+        let (_, bounces, _) = foreground.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("foreground-waiting", AgentState::Waiting, 100),
+                p0_meta("inst-a", 100),
+            )],
+            None,
+            &[],
+        );
+        assert!(bounces.is_empty());
+    }
+
+    #[test]
+    fn current_none_exit_prunes_exact_watch_generation() {
+        let mut reg = AgentRegistry::default();
+        let key = ("codex".to_string(), "none-generation".to_string());
+        let mut event = p0_event(
+            "none-generation",
+            ParsedEventState::State(AgentState::Running),
+            100,
+        );
+        event.pid = Some(4242);
+        let effect = reg.apply_event_with_meta(event, p0_meta("inst-a", 1), None, &[]);
+        reg.bind_pid_watch(&effect.watch.unwrap(), None, 9);
+        assert_eq!(
+            reg.event_versions
+                .get(&key)
+                .and_then(|stamp| stamp.watch_generation),
+            Some(9)
+        );
+        let mut monitor = PidMonitor::default();
+        monitor.entries.insert(4242, pid_test_entry(9, None));
+        assert!(!unsafe { monitor.complete_and_prune(&mut reg, 4242, 8) });
+        assert_eq!(reg.event_sessions.len(), 1);
+        assert!(unsafe { monitor.complete_and_prune(&mut reg, 4242, 9) });
+        assert!(reg.event_sessions.is_empty());
+        assert_eq!(
+            reg.tombstones
+                .get(&key)
+                .and_then(|tomb| tomb.stamp.watch_generation),
+            Some(9)
+        );
+        assert!(!unsafe { monitor.complete_and_prune(&mut reg, 4242, 9) });
+
+        // Retired None remains a no-op and cannot remove a newer current generation.
+        let mut current = AgentRegistry::default();
+        let mut event = p0_event(
+            "none-current",
+            ParsedEventState::State(AgentState::Running),
+            200,
+        );
+        event.pid = Some(4242);
+        let effect = current.apply_event_with_meta(event, p0_meta("inst-b", 1), None, &[]);
+        current.bind_pid_watch(&effect.watch.unwrap(), None, 2);
+        let mut monitor = PidMonitor::default();
+        unsafe { monitor.retire_entry(4242, pid_test_entry(1, None)) };
+        monitor.entries.insert(4242, pid_test_entry(2, None));
+        assert!(!unsafe { monitor.complete_and_prune(&mut current, 4242, 1) });
+        assert_eq!(current.event_sessions.len(), 1);
+        assert!(monitor.entries.contains_key(&4242));
+    }
+
+    #[test]
+    fn retired_none_prunes_old_file_generation_without_old_instance_revival() {
+        let mut reg = AgentRegistry::default();
+        let key = ("codex".to_string(), "retired-none".to_string());
+        let (_, _, requests) = reg.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("retired-none", AgentState::Running, 100),
+                p0_meta("old", 9),
+            )],
+            None,
+            &[],
+        );
+        reg.bind_pid_watch(&requests[0], None, 1);
+        let mut event = p0_event(
+            "retired-none",
+            ParsedEventState::State(AgentState::Running),
+            100,
+        );
+        event.pid = Some(4242);
+        let effect = reg.apply_event_with_meta(event, p0_meta("new", 1), None, &[]);
+        reg.bind_pid_watch(&effect.watch.unwrap(), None, 2);
+        assert_eq!(reg.file_sessions.len(), 1);
+        assert_eq!(reg.event_sessions.len(), 1);
+
+        let mut monitor = PidMonitor::default();
+        unsafe { monitor.retire_entry(4242, pid_test_entry(1, None)) };
+        monitor.entries.insert(4242, pid_test_entry(2, None));
+        assert!(unsafe { monitor.complete_and_prune(&mut reg, 4242, 1) });
+        assert!(reg.file_sessions.is_empty());
+        assert_eq!(reg.event_sessions.len(), 1);
+        assert_eq!(
+            monitor.entries.get(&4242).map(|entry| entry.generation),
+            Some(2)
+        );
+        assert_eq!(
+            reg.summarize_agent("codex", "Codex", &[]).sessions[0].source,
+            SessionSource::Event
+        );
+
+        assert!(unsafe { monitor.complete_and_prune(&mut reg, 4242, 2) });
+        assert!(reg.event_sessions.is_empty());
+        assert!(!reg.event_versions.contains_key(&key));
+        assert!(!reg.file_versions.contains_key(&key));
+        assert_eq!(reg.summarize_agent("codex", "Codex", &[]).total_sessions, 0);
+    }
+
+    #[test]
+    fn watcher_load_failure_preserves_cache_snapshot_and_suppresses_ready() {
+        let dir = temp_dir("watcher-file-read-failure");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("codex__cached.json");
+        fs::write(
+            &path,
+            r#"{"agent":"codex","session_id":"cached","state":"running","pid":4242,"updated_at":100,"instance":"inst-a","seq":1}"#,
+        )
+        .unwrap();
+        let (mut cache, snapshot) = load_sessions_preserving(&dir).unwrap();
+        let cache_before = cache.clone();
+        let latest = Arc::new(Mutex::new(snapshot.clone()));
+        let mut registry = AgentRegistry::default();
+        registry.replace_file_sessions_with_meta(snapshot, None, &[]);
+        let registry_before = (
+            registry.file_sessions.clone(),
+            registry.file_versions.clone(),
+        );
+        let mut ready_count = 0;
+
+        // Inject an error in the real per-file read path, after directory enumeration
+        // and metadata have succeeded. No partial snapshot may reach the Registry.
+        let failed = load_sessions_preserving_with(&dir, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected read failure",
+            ))
+        });
+        let published = publish_loaded_sessions(failed, &mut cache, &latest, || ready_count += 1);
+        if published {
+            let snapshot = latest.lock().unwrap().clone();
+            registry.replace_file_sessions_with_meta(snapshot, None, &[]);
+        }
+        assert!(!published);
+        assert_eq!(ready_count, 0);
+        assert_eq!(cache, cache_before);
+        assert_eq!(latest.lock().unwrap().len(), 1);
+        assert_eq!(registry.file_sessions, registry_before.0);
+        assert_eq!(registry.file_versions, registry_before.1);
+
+        // A later confirmed empty enumeration is authoritative and publishes one READY.
+        fs::remove_file(&path).unwrap();
+        let loaded = load_sessions_preserving(&dir);
+        let published = publish_loaded_sessions(loaded, &mut cache, &latest, || ready_count += 1);
+        if published {
+            let snapshot = latest.lock().unwrap().clone();
+            registry.replace_file_sessions_with_meta(snapshot, None, &[]);
+        }
+        assert!(published);
+        assert_eq!(ready_count, 1);
+        assert!(cache.is_empty());
+        assert!(latest.lock().unwrap().is_empty());
+        assert!(registry.file_sessions.is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn watcher_publishes_post_arm_snapshot_without_a_directory_event() {
+        let dir = temp_dir("watcher-post-arm-ready");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("codex__post-arm.json"),
+            r#"{"agent":"codex","session_id":"post-arm","state":"running","title":"post-arm","pid":4242,"updated_at":100,"instance":"inst-a","seq":1}"#,
+        )
+        .unwrap();
+        let window = TestWindow::new();
+        let stop_event = unsafe { CreateEventW(None, true, false, None) }.unwrap();
+        let latest = Arc::new(Mutex::new(Vec::new()));
+        let latest_ref = Arc::clone(&latest);
+        let dir_clone = dir.clone();
+        let dock_raw = window.0 .0 as isize;
+        let stop_raw = stop_event.0 as isize;
+        let thread = thread::spawn(move || unsafe {
+            watch_dir_loop_with_loader(
+                HWND(dock_raw as *mut c_void),
+                HANDLE(stop_raw as *mut c_void),
+                &dir_clone,
+                &latest_ref,
+                CachedFileMap::new(),
+                || load_sessions_preserving(&dir_clone),
+            );
+        });
+        let watcher = TestWatcher {
+            stop_event,
+            thread: Some(thread),
+        };
+
+        // The file appeared before arm and no further write occurs. Only the forced
+        // post-arm load can publish it and close the startup load/arm window.
+        assert!(wait_for_test_message(window.0, WM_AGENT_SESSIONS_READY).is_some());
+        let snapshot = latest.lock().unwrap().clone();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].0.session_id, "post-arm");
+        let mut registry = AgentRegistry::default();
+        registry.replace_file_sessions_with_meta(snapshot, None, &[]);
+        assert_eq!(registry.file_sessions.len(), 1);
+        drop(watcher);
+        drop(window);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn watcher_notification_failure_retries_without_a_second_directory_event() {
+        let dir = temp_dir("watcher-notification-retry");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("codex__retry.json");
+        fs::write(
+            &path,
+            r#"{"agent":"codex","session_id":"retry","state":"running","title":"old","pid":4242,"updated_at":100,"instance":"inst-a","seq":1}"#,
+        )
+        .unwrap();
+        let (mut cache, initial) = load_sessions_preserving(&dir).unwrap();
+        let latest = Arc::new(Mutex::new(initial.clone()));
+        let mut registry = AgentRegistry::default();
+        registry.replace_file_sessions_with_meta(initial, None, &[]);
+        fs::write(
+            &path,
+            r#"{"agent":"codex","session_id":"retry","state":"running","title":"new","pid":4242,"updated_at":200,"instance":"inst-a","seq":2}"#,
+        )
+        .unwrap();
+
+        let window = TestWindow::new();
+        let stop_event = unsafe { CreateEventW(None, true, false, None) }.unwrap();
+        let mut attempts = 0usize;
+        let mut load = || {
+            attempts += 1;
+            if attempts == 1 {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected fail-once consumed-notification load",
+                ))
+            } else {
+                load_sessions_preserving(&dir)
+            }
+        };
+        // This is the production seam after a directory notification is consumed. No
+        // second write/event occurs: the single delayed retry itself must publish READY.
+        assert!(unsafe {
+            reload_watcher_sessions(window.0, stop_event, &mut cache, &latest, &mut load)
+        });
+        assert_eq!(attempts, 2);
+        assert!(wait_for_test_message(window.0, WM_AGENT_SESSIONS_READY).is_some());
+        let snapshot = latest.lock().unwrap().clone();
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].0.updated_at, 200);
+        registry.replace_file_sessions_with_meta(snapshot, None, &[]);
+        assert_eq!(registry.file_sessions[0].updated_at, 200);
+        unsafe {
+            let _ = CloseHandle(stop_event);
+        }
+        drop(window);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
