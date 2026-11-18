@@ -23,7 +23,7 @@ use crate::dock::{Dock, DockItem, ItemRole, BASE_ICON};
 use crate::drawer_icons;
 use crate::icons::IconLoader;
 use crate::render;
-use crate::theme::ThemePreset;
+use crate::theme::DockStyle;
 use crate::windows_list;
 
 pub struct Gpu {
@@ -312,7 +312,7 @@ impl Gpu {
         let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
         let glyph_px = glyph_pixel_size(BASE_ICON * dpi);
         let format = create_glyph_format(&dwrite, glyph_px)?;
-        let materials = render::MaterialBrushes::new(&dc)?;
+        let materials = render::MaterialBrushes::new(&dc, &factory.cast()?)?;
 
         Ok(Gpu {
             _d3d: d3d,
@@ -578,18 +578,23 @@ impl Gpu {
             self.glyph_px = glyph_px;
         }
         let frame = dock.frame();
+        let wants_backdrop = dock.style.uses_backdrop(dock.theme);
+        let radius = dock.style.corner_radius(&dock.theme.visual()) * dock.dpi;
+        let bounds = if dock.style == DockStyle::Shelf {
+            (
+                frame.pill.0,
+                frame.pill.1,
+                frame.pill.2,
+                frame.pill.3 + radius,
+            )
+        } else {
+            frame.pill
+        };
         let backdrop_enabled = if let Some(backdrop) = &self.backdrop {
             backdrop
-                .update(
-                    frame.pill,
-                    dock.theme.visual().pill_radius * dock.dpi,
-                    if dock.theme == ThemePreset::Glass {
-                        1.0
-                    } else {
-                        0.0
-                    },
-                )
+                .update(bounds, radius, if wants_backdrop { 1.0 } else { 0.0 })
                 .is_ok()
+                && wants_backdrop
         } else {
             false
         };

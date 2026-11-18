@@ -142,9 +142,23 @@ Copy-Item -LiteralPath $built.FullName -Destination $FinalExe -Force
 # blocks normal user-cache writes and communication with Explorer's tray. Give
 # only the shipped executable the normal desktop-app level; no elevation needed.
 $artifactAclTool = Join-Path $env:SystemRoot 'System32\icacls.exe'
-$artifactAclOutput = & $artifactAclTool $FinalExe /setintegritylevel M /q 2>&1
-if ($LASTEXITCODE -ne 0) {
-    throw "Could not set Medium integrity on FeatherDock.exe: $artifactAclOutput"
+$prevErrorAction = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    $artifactAclOutput = (& $artifactAclTool $FinalExe /setintegritylevel M /q 2>&1) -join "`n"
+    $artifactAclExit = $LASTEXITCODE
+} finally {
+    $ErrorActionPreference = $prevErrorAction
+}
+if ($artifactAclExit -ne 0) {
+    $labelInfo = (& $artifactAclTool $FinalExe 2>&1) -join "`n"
+    $groupInfo = (& (Join-Path $env:SystemRoot 'System32\whoami.exe') /groups 2>&1) -join "`n"
+    $hasLowOrUntrustedFileLabel = $labelInfo -match 'Mandatory Label\\(Low|Untrusted) Mandatory Level'
+    $isMediumOrHigherProcess = $groupInfo -match 'S-1-16-(8192|12288|16384)\b'
+    if ($hasLowOrUntrustedFileLabel -or -not $isMediumOrHigherProcess) {
+        throw "Could not set Medium integrity on FeatherDock.exe: $artifactAclOutput"
+    }
+    Write-Host '==> icacls /setintegritylevel M skipped (no WRITE_OWNER); verified Medium+ process & non-Low file label' -ForegroundColor DarkYellow
 }
 if (-not $Stage) { Remove-StrayExes }
 

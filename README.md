@@ -57,7 +57,7 @@ FeatherDock 是一个 Windows 上的 Dock，用 Rust 直接写在系统原生图
 - 命令面板：`Ctrl+Alt+Space` 搜索固定项、运行窗口和桌面程序
 - 控制中心：主音量滑块、输出/输入音频设备选择、Wi-Fi 刷新与连接、蓝牙设备状态、输入法切换，以及电量与时钟入口
 - 固定项自修复：WindowsApps 版本目录更新或唯一 exe 文件名变化后，启动时会在安全范围内修复失效路径
-- 主题预设：暖瓷玻璃、紧凑、纯色、macOS、高对比五种预设，不引入重型皮肤系统
+- 主题预设与形态样式：`dock_style`（悬浮胶囊、极简顶线、分段浮岛、底部托台、独立键帽、Win11 流体）与 `theme`（暖瓷玻璃、紧凑、纯色、macOS、高对比）解耦，可自由组合，不引入重型皮肤系统
 - 自适应布局：主条宽度受屏幕约束，超出的应用可从“更多应用”打开；抽屉列数和缩略图布局随工作区调整
 - 常用操作：固定项拖拽排序、前台状态、多窗口数量、Shift+单击新实例，以及拖文件到固定应用后选择打开或固定
 - 中文搜索：全拼、首字母、启动入口去重与最近使用排序；抽屉也可直接输入搜索并通过键盘选择
@@ -159,6 +159,7 @@ Dock 行为设置：
 - `drawer_enabled = true | false`
 - `hide_desktop_icons = true | false`
 - `theme = "glass" | "compact" | "solid" | "macos" | "contrast"`
+- `dock_style = "pill" | "hairline" | "islands" | "shelf" | "tiles" | "fluent"`
 - `icon_size = 24..80`、`magnification = 100..220`（百分比）、`bottom_gap = 0..32`
 - `opacity = 10..100`（玻璃底色不透明度）、`preview_delay_ms = 0..1500`
 - `monitor = 0`（跟随主屏）或 Windows 显示器编号；断开时自动回退主屏

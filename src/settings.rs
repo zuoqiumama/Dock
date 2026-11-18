@@ -8,7 +8,7 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use crate::theme::ThemePreset;
+use crate::theme::{DockStyle, ThemePreset};
 
 /// How the dock occupies the bottom of the screen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -111,6 +111,8 @@ pub struct Settings {
     /// Visual preset for the dock pill and subtle cues. Kept intentionally small:
     /// presets change paint constants without starting a skin/plugin system.
     pub theme: ThemePreset,
+    /// Structural dock morphology decoupled from `theme` palette/material.
+    pub dock_style: DockStyle,
     /// Dedicated right-side Agent zone + status lights / hover session card.
     pub agent_zone_enabled: bool,
     /// Very subtle slow shimmer along Running Agent icons (honours `reduce_motion`).
@@ -162,6 +164,7 @@ impl Default for Settings {
             drawer_enabled: true,
             hide_desktop_icons: false,
             theme: ThemePreset::Glass,
+            dock_style: DockStyle::Pill,
             agent_zone_enabled: true,
             agent_shimmer: true,
             agent_bounce_waiting: true,
@@ -179,6 +182,7 @@ const HEADER: &str = "\
 # drawer_enabled = true | false  (show the app-drawer button on the dock)
 # hide_desktop_icons = true | false  (hide the Windows desktop icons while running)
 # theme = \"glass\" | \"compact\" | \"solid\" | \"macos\" | \"contrast\"
+# dock_style = \"pill\" | \"hairline\" | \"islands\" | \"shelf\" | \"tiles\" | \"fluent\"
 # agent_zone_enabled = true | false  (group AI agents in the right-side Agent zone)
 # agent_shimmer = true | false       (faint slow shimmer on active Running agent icons)
 # agent_bounce_waiting = true | false (single gentle hop when an agent enters Waiting)
@@ -280,6 +284,11 @@ fn parse_line_into(settings: &mut Settings, line: &str) {
                 settings.theme = theme;
             }
         }
+        "dock_style" => {
+            if let Some(style) = DockStyle::parse(value) {
+                settings.dock_style = style;
+            }
+        }
         "agent_zone_enabled" => {
             settings.agent_zone_enabled = value.eq_ignore_ascii_case("true");
         }
@@ -297,14 +306,15 @@ fn parse_line_into(settings: &mut Settings, line: &str) {
 pub fn save(settings: &Settings) -> io::Result<()> {
     let path = settings_path();
     let mut body = format!(
-        "{HEADER}\ndock_mode = \"{}\"\nhide_on_fullscreen = {}\nhide_on_maximized = {}\ntaskbar_mode = \"{}\"\ndrawer_enabled = {}\nhide_desktop_icons = {}\ntheme = \"{}\"\n",
+        "{HEADER}\ndock_mode = \"{}\"\nhide_on_fullscreen = {}\nhide_on_maximized = {}\ntaskbar_mode = \"{}\"\ndrawer_enabled = {}\nhide_desktop_icons = {}\ntheme = \"{}\"\ndock_style = \"{}\"\n",
         settings.dock_mode.as_str(),
         settings.hide_on_fullscreen,
         settings.hide_on_maximized,
         settings.taskbar_mode.as_str(),
         settings.drawer_enabled,
         settings.hide_desktop_icons,
-        settings.theme.as_str()
+        settings.theme.as_str(),
+        settings.dock_style.as_str()
     );
     body.push_str(&format!(
         "agent_zone_enabled = {}\nagent_shimmer = {}\nagent_bounce_waiting = {}\n",
@@ -334,12 +344,25 @@ mod tests {
     #[test]
     fn parses_theme_preset_without_disturbing_other_settings() {
         let mut settings = Settings::default();
-        for line in "theme = \"compact\"\nhide_on_fullscreen = false".lines() {
+        for line in
+            "theme = \"compact\"\ndock_style = \"hairline\"\nhide_on_fullscreen = false".lines()
+        {
             parse_line_into(&mut settings, line);
         }
 
         assert_eq!(settings.theme, crate::theme::ThemePreset::Compact);
+        assert_eq!(settings.dock_style, DockStyle::Hairline);
         assert!(!settings.hide_on_fullscreen);
+    }
+
+    #[test]
+    fn old_settings_without_dock_style_default_to_pill() {
+        let mut settings = Settings::default();
+        for line in "theme = \"macos\"\nopacity = 60".lines() {
+            parse_line_into(&mut settings, line);
+        }
+        assert_eq!(settings.theme, ThemePreset::Macos);
+        assert_eq!(settings.dock_style, DockStyle::Pill);
     }
 }
 

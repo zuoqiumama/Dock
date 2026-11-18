@@ -24,7 +24,7 @@ use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::settings::{self, DockMode, Settings, TaskbarMode};
-use crate::theme::ThemePreset;
+use crate::theme::{DockStyle, ThemePreset};
 use crate::{apps, autostart, config, error_log, taskbar};
 
 /// Posted to the dock when mode/fullscreen settings change (cheap re-rest).
@@ -47,6 +47,7 @@ const ID_DRAWER_ENABLED: usize = 142;
 const ID_HIDE_DESKTOP_ICONS: usize = 143;
 const ID_THEME: usize = 144;
 const ID_PREFERENCES: usize = 145;
+const ID_DOCK_STYLE: usize = 146;
 static HOTKEY_CONFLICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 pub(crate) const WM_HOTKEY_STATUS: u32 = WM_APP + 0x43;
 pub fn set_hotkey_conflict(conflict: bool) {
@@ -79,6 +80,7 @@ struct SettingsState {
     dock_radios: [HWND; 2],
     fullscreen: HWND,
     maximized: HWND,
+    style_combo: HWND,
     theme_combo: HWND,
     autostart: HWND,
     drawer_enabled: HWND,
@@ -370,14 +372,14 @@ pub unsafe fn open(dock_hwnd: HWND) {
 
     let (_, _, available_w, available_h) = monitor_work_area(dock_hwnd);
     let scale = ((GetDpiForWindow(dock_hwnd).max(96) as f32) / 96.0)
-        .min((available_h - 48).max(1) as f32 / 740.0)
+        .min((available_h - 48).max(1) as f32 / 772.0)
         .min((available_w - 24).max(1) as f32 / 420.0);
     let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
     let mut rect = RECT {
         left: 0,
         top: 0,
         right: (420.0 * scale) as i32,
-        bottom: (708.0 * scale) as i32,
+        bottom: (740.0 * scale) as i32,
     };
     let _ = AdjustWindowRectEx(&mut rect, style, false, WINDOW_EX_STYLE(0));
     let win_w = rect.right - rect.left;
@@ -479,7 +481,50 @@ pub unsafe fn open(dock_hwnd: HWND) {
         (26, 238, 366, 24),
     );
 
-    mk("外观", group, 0, (12, 282, 396, 56));
+    mk("外观", group, 0, (12, 282, 396, 88));
+    control(
+        hwnd,
+        instance,
+        w!("STATIC"),
+        "样式",
+        0,
+        0,
+        (26, 309, 36, 20),
+        scale,
+        font,
+    );
+    let style_combo = control(
+        hwnd,
+        instance,
+        w!("COMBOBOX"),
+        "",
+        FD_CBS_DROPDOWNLIST | WS_TABSTOP.0 | WS_VSCROLL.0,
+        ID_DOCK_STYLE,
+        (64, 305, 144, 200),
+        scale,
+        font,
+    );
+    for dock_style in DockStyle::ALL {
+        let label = wide(dock_style.label());
+        SendMessageW(
+            style_combo,
+            FD_CB_ADDSTRING,
+            WPARAM(0),
+            LPARAM(label.as_ptr() as isize),
+        );
+    }
+
+    control(
+        hwnd,
+        instance,
+        w!("STATIC"),
+        "配色",
+        0,
+        0,
+        (218, 309, 36, 20),
+        scale,
+        font,
+    );
     let theme_combo = control(
         hwnd,
         instance,
@@ -487,7 +532,7 @@ pub unsafe fn open(dock_hwnd: HWND) {
         "",
         FD_CBS_DROPDOWNLIST | WS_TABSTOP.0 | WS_VSCROLL.0,
         ID_THEME,
-        (26, 306, 180, 160),
+        (256, 305, 140, 200),
         scale,
         font,
     );
@@ -509,9 +554,20 @@ pub unsafe fn open(dock_hwnd: HWND) {
         },
         push,
         ID_PREFERENCES,
-        (218, 306, 178, 26),
+        (26, 338, 182, 26),
     );
-    mk("常驻应用（Dock 左侧固定项）", group, 0, (12, 350, 396, 150));
+    control(
+        hwnd,
+        instance,
+        w!("STATIC"),
+        "样式决定形态，配色决定色调与弹层",
+        0,
+        0,
+        (218, 342, 182, 20),
+        scale,
+        font,
+    );
+    mk("常驻应用（Dock 左侧固定项）", group, 0, (12, 382, 396, 150));
     let pin_list = control(
         hwnd,
         instance,
@@ -519,31 +575,31 @@ pub unsafe fn open(dock_hwnd: HWND) {
         "",
         LBS_NOTIFY as u32 | WS_VSCROLL.0 | WS_BORDER.0,
         ID_PIN_LIST,
-        (26, 374, 288, 116),
+        (26, 406, 288, 116),
         scale,
         font,
     );
-    mk("添加…", push, ID_PIN_ADD, (322, 374, 74, 26));
-    mk("移除", push, ID_PIN_REMOVE, (322, 406, 74, 26));
+    mk("添加…", push, ID_PIN_ADD, (322, 406, 74, 26));
+    mk("移除", push, ID_PIN_REMOVE, (322, 438, 74, 26));
 
-    mk("程序抽屉 / 桌面", group, 0, (12, 506, 396, 88));
+    mk("程序抽屉 / 桌面", group, 0, (12, 538, 396, 88));
     let drawer_cb = mk(
         "启用程序抽屉（Dock 上的应用网格按钮）",
         check,
         ID_DRAWER_ENABLED,
-        (26, 530, 366, 24),
+        (26, 562, 366, 24),
     );
     let hide_desktop_cb = mk(
         "隐藏桌面图标（退出时自动恢复）",
         check,
         ID_HIDE_DESKTOP_ICONS,
-        (26, 558, 366, 24),
+        (26, 590, 366, 24),
     );
 
-    mk("启动", group, 0, (12, 602, 396, 50));
-    let autostart_cb = mk("开机自启", check, ID_AUTOSTART, (26, 624, 366, 24));
+    mk("启动", group, 0, (12, 634, 396, 50));
+    let autostart_cb = mk("开机自启", check, ID_AUTOSTART, (26, 656, 366, 24));
 
-    mk("关闭", push, ID_CLOSE, (332, 660, 76, 28));
+    mk("关闭", push, ID_CLOSE, (332, 692, 76, 28));
 
     select_one(
         &tb_radios,
@@ -562,6 +618,11 @@ pub unsafe fn open(dock_hwnd: HWND) {
     );
     set_checked(fullscreen, current.hide_on_fullscreen);
     set_checked(maximized, current.hide_on_maximized);
+    let style_index = DockStyle::ALL
+        .iter()
+        .position(|s| *s == current.dock_style)
+        .unwrap_or(0);
+    SendMessageW(style_combo, FD_CB_SETCURSEL, WPARAM(style_index), LPARAM(0));
     let theme_index = ThemePreset::ALL
         .iter()
         .position(|preset| *preset == current.theme)
@@ -578,6 +639,7 @@ pub unsafe fn open(dock_hwnd: HWND) {
         dock_radios,
         fullscreen,
         maximized,
+        style_combo,
         theme_combo,
         autostart: autostart_cb,
         drawer_enabled: drawer_cb,
@@ -616,6 +678,16 @@ unsafe fn restore_controls(state: &SettingsState) {
     set_checked(state.maximized, state.settings.hide_on_maximized);
     set_checked(state.drawer_enabled, state.settings.drawer_enabled);
     set_checked(state.hide_desktop, state.settings.hide_desktop_icons);
+    let style_index = DockStyle::ALL
+        .iter()
+        .position(|s| *s == state.settings.dock_style)
+        .unwrap_or(0);
+    SendMessageW(
+        state.style_combo,
+        FD_CB_SETCURSEL,
+        WPARAM(style_index),
+        LPARAM(0),
+    );
     let theme = ThemePreset::ALL
         .iter()
         .position(|preset| *preset == state.settings.theme)
@@ -743,6 +815,17 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         state.settings.hide_on_maximized = checked(state.maximized);
                         persist_and_notify(hwnd, state, previous, WM_SETTINGS_CHANGED);
                     }
+                    ID_DOCK_STYLE if code == FD_CBN_SELCHANGE => {
+                        let sel =
+                            SendMessageW(state.style_combo, FD_CB_GETCURSEL, WPARAM(0), LPARAM(0))
+                                .0;
+                        if sel >= 0 {
+                            if let Some(dock_style) = DockStyle::ALL.get(sel as usize) {
+                                state.settings.dock_style = *dock_style;
+                                persist_and_notify(hwnd, state, previous, WM_SETTINGS_CHANGED);
+                            }
+                        }
+                    }
                     ID_THEME if code == FD_CBN_SELCHANGE => {
                         let sel =
                             SendMessageW(state.theme_combo, FD_CB_GETCURSEL, WPARAM(0), LPARAM(0))
@@ -835,6 +918,7 @@ mod tests {
         let mut current = Settings {
             taskbar_mode: TaskbarMode::Hidden,
             theme: ThemePreset::Compact,
+            dock_style: DockStyle::Hairline,
             ..previous
         };
         let result = save_or_restore(&mut current, previous, |_| {

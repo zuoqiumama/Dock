@@ -2,7 +2,13 @@
 
 本文件只保留**最新有效结论**和必要的历史摘要。下一次审查直接更新对应小节，不再新建日期版审查文档。待办统一进入 `PLAN.md`。
 
-## 当前结论 · 2026-11-17
+## 当前结论 · 2026-11-18
+
+- 完成 Dock **形态样式与配色解耦**（`DockStyle` × `ThemePreset`），在完整保留原五种主题（`glass`、`compact`、`solid`、`macos`、`contrast`）与默认 `pill` 形态不变的前提下，新增五种非换颜色的 Dock 形态样式：`hairline`（极简顶线）、`islands`（分段浮岛）、`shelf`（底部托台）、`tiles`（独立键帽）与 `fluent`（Win11 流体底座），并在设置窗口「外观」分组同时提供「样式」与「配色」下拉自由组合；同步补齐新样式下的悬停背板、点击按下微缩与分组分隔连续过渡。
+- 校验门通过：`cargo fmt --all -- --check`、严格 `cargo clippy --all-targets --locked -- -D warnings`、**256/256 项单元测试**和 `cargo build --release --locked` 均通过（含 `theme` / `settings` / `dock` / `render` 新增与更新测试）。
+- 暂存发布与构建修复说明：已修复 `rustup 1.29` 下 `rust-toolchain.toml` 报 `target tuple in channel name` 的问题（拆分 `channel = "stable"` 与 `targets = ["x86_64-pc-windows-gnu"]`，并在 `scripts/dev-env.ps1` 自动探测已安装的 `stable-x86_64-pc-windows-gnu\bin`、`build.ps1` 在无 `WRITE_OWNER` 时校验进程 `>= Medium` 且文件无 `Low/Untrusted` 标签，`.cargo/gnu-linker.cmd` 增加跨工具链自包含链接器回退）。直接执行 `.\build.cmd -Verify -Stage` 已完整通过并退出码为 `0`，最新产物位于 `outputs\pending\FeatherDock.exe`（**1,343,488 bytes**，SHA-256 `D749A1D2FCF0A0452E090D6A216407660BD5506F21A1282769597765DBA83F45`）；因本会话仍处于非交互桌面（`EnumWindows=0`），未替换根目录运行中的 `FeatherDock.exe`，真机交互发布与五种新样式的桌面视觉验收保留在 `PLAN.md`。
+
+## 历史结论 · 2026-11-17
 
 - 2026-11-16 独立复审的 5 项问题已全部修复；后续复核发现的稳态 rearm 丢更新窗口及 `Retired None` 跨通道复活路径也已闭合。原问题、修复和证据保留在下节。
 - 最终 `build.cmd -Verify` 通过：格式、严格 Clippy、**250/250 项测试**和 release 构建。包版本已提升为 **v0.1.1**，根目录 EXE 已发布并启动，主程序与 watchdog 均从该文件运行。

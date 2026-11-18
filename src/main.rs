@@ -832,7 +832,13 @@ unsafe fn monitor_geometry(
     if !GetMonitorInfoW(monitor, &mut info).as_bool() {
         return Err(Error::from_win32());
     }
-    let (width, height) = dock::window_size_with(items, dpi, prefs.layout, prefs.effective_theme());
+    let (width, height) = dock::window_size_with_style(
+        items,
+        dpi,
+        prefs.layout,
+        prefs.effective_theme(),
+        prefs.dock_style,
+    );
     let width =
         width.min((info.rcMonitor.right - info.rcMonitor.left - (16.0 * dpi) as i32).max(1) as u32);
     let x = info.rcMonitor.left + (info.rcMonitor.right - info.rcMonitor.left - width as i32) / 2;
@@ -961,6 +967,20 @@ fn resting_region(pill: (f32, f32, f32, f32), radius: f32, dpi: f32) -> (i32, i3
     )
 }
 
+fn style_resting_bounds(dock: &Dock) -> ((f32, f32, f32, f32), f32) {
+    let (l, t, r, b) = dock.frame().pill;
+    let radius = dock.style.corner_radius(&dock.theme.visual()) * dock.dpi;
+    let dpi = dock.dpi;
+    match dock.style {
+        theme::DockStyle::Pill | theme::DockStyle::Hairline => ((l, t, r, b), radius),
+        theme::DockStyle::Shelf => ((l, t - 3.0 * dpi, r, b + radius), radius),
+        theme::DockStyle::Islands | theme::DockStyle::Tiles | theme::DockStyle::Fluent => (
+            (l - 3.0 * dpi, t - 2.0 * dpi, r + 3.0 * dpi, b + 5.0 * dpi),
+            radius,
+        ),
+    }
+}
+
 /// At rest, clip to a slightly expanded pill so transparent head-room and side slack
 /// remain click-through. Hovering / animating removes the clip for magnified icons.
 /// `HTTRANSPARENT` alone does not pass these clicks through this composition window.
@@ -976,11 +996,8 @@ unsafe fn set_region_full(hwnd: HWND, app: &mut App, full: bool) {
         }
         return;
     }
-    let (l, t, r, b, ellipse) = resting_region(
-        app.dock.frame().pill,
-        app.dock.theme.visual().pill_radius * app.dock.dpi,
-        app.dock.dpi,
-    );
+    let (bounds, radius) = style_resting_bounds(&app.dock);
+    let (l, t, r, b, ellipse) = resting_region(bounds, radius, app.dock.dpi);
     let rgn = CreateRoundRectRgn(l, t, r, b, ellipse, ellipse);
     // On success the system owns the region; on failure we still own it -> free it.
     if SetWindowRgn(hwnd, rgn, BOOL(1)) == 0 {
@@ -1423,6 +1440,7 @@ fn run() -> Result<()> {
             dock_settings.effective_theme(),
         );
         dock.preferences = dock_settings.layout;
+        dock.style = dock_settings.dock_style;
         dock.foreground = Some(GetForegroundWindow().0 as isize);
         gpu.load_icons(&dock.items, dpi);
         let titles = window_titles(&running);
@@ -2752,7 +2770,9 @@ unsafe fn dock_overlapped(app: &App) -> bool {
     let (left, top, right, bottom) = app.dock.frame().pill;
     let shift = (1.0 - app.dock.reveal)
         * (app.dock.base_icon()
-            + (2.0 * dock::PILL_PAD_Y + app.settings.layout.bottom_gap as f32 - dock::HIDE_SLIVER)
+            + (2.0 * dock::PILL_PAD_Y
+                + dock::effective_bottom_gap(app.dock.style, app.settings.layout)
+                - dock::HIDE_SLIVER)
                 * app.dock.layout_dpi());
     let top = top - shift;
     let bottom = bottom - shift;
@@ -3001,9 +3021,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         (lparam.0 & 0xffff) as i16 as f32,
                         ((lparam.0 >> 16) & 0xffff) as i16 as f32,
                     );
-                    if let Some(item) = app
-                        .dock
-                        .hit_test(x, y)
+                    let hit = app.dock.hit_test(x, y);
+                    app.dock.pressed_idx = hit;
+                    if hit.is_some() {
+                        app.animating = true;
+                    }
+                    if let Some(item) = hit
                         .and_then(|i| app.dock.items.get(i))
                         .filter(|i| i.role == dock::ItemRole::Pinned)
                     {
@@ -3024,6 +3047,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_CANCELMODE | WM_CAPTURECHANGED => {
                 app.drag = None;
                 app.dock.insertion_x = None;
+                app.dock.pressed_idx = None;
                 app.animating = true;
                 LRESULT(0)
             }
@@ -3073,6 +3097,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     }
                 }
                 app.dock.cursor_x = Some(x);
+                app.dock.hovered_idx = if app.drag.as_ref().is_some_and(|d| d.active) {
+                    None
+                } else {
+                    app.dock.hit_test(x, y)
+                };
                 app.dock.reveal_target = 1.0; // mouse is over the dock zone -> reveal
                 app.animating = true;
                 if !app.drag.as_ref().is_some_and(|d| d.active) {
@@ -3124,6 +3153,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_MOUSELEAVE => {
                 app.preview_candidate = None;
                 app.dock.cursor_x = None;
+                app.dock.hovered_idx = None;
+                app.dock.pressed_idx = None;
                 let over_preview =
                     window_preview::contains_cursor() || agent_popup::contains_cursor();
                 if !over_preview {
@@ -3177,6 +3208,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 let drag = app.drag.take();
                 let _ = ReleaseCapture();
                 app.dock.insertion_x = None;
+                app.dock.pressed_idx = None;
+                app.animating = true;
                 if let Some(drag) = drag.filter(|d| d.active) {
                     let (_, y) = (
                         (lparam.0 & 0xffff) as i16 as f32,
@@ -3628,6 +3661,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 // state. If it switched us to hidden, defeat the auto-hide entry slide
                 // and grow maximized windows into the freed work area.
                 let previous_theme = app.dock.theme;
+                let previous_style = app.dock.style;
                 let settings = if msg == preferences::WM_PREVIEW_SETTINGS {
                     let preview = *Box::from_raw(lparam.0 as *mut settings::Settings);
                     preferences::merge_preview(app.saved_settings, preview)
@@ -3641,15 +3675,18 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 app.settings = settings;
                 app.dock.theme = app.settings.effective_theme();
+                app.dock.style = app.settings.dock_style;
                 app.dock.preferences = app.settings.layout;
-                if previous_theme != app.dock.theme {
+                if previous_theme != app.dock.theme || previous_style != app.dock.style {
                     // Popups snapshot their owner's palette. Reopen them on the new
                     // preset rather than leaving mixed materials on screen.
-                    drawer::hide();
-                    control_center::hide();
-                    hide_running_preview(app);
-                    command_palette::close();
-                    settings_window::sync_theme(app.dock.theme);
+                    if previous_theme != app.dock.theme {
+                        drawer::hide();
+                        control_center::hide();
+                        hide_running_preview(app);
+                        command_palette::close();
+                        settings_window::sync_theme(app.dock.theme);
+                    }
                     set_region_full(hwnd, app, true);
                 }
                 if app.settings.taskbar_mode == settings::TaskbarMode::Hidden
@@ -3707,6 +3744,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 app.saved_settings = settings::load();
                 app.settings = preferences::merge_preview(app.saved_settings, app.settings);
                 app.dock.theme = app.settings.effective_theme();
+                app.dock.style = app.settings.dock_style;
                 app.dock.preferences = app.settings.layout;
                 if let Err(error) = reload_app(hwnd, app) {
                     show_error(hwnd, "刷新常驻应用失败", error);
@@ -3724,6 +3762,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     return LRESULT(0);
                 }
                 app.dock.theme = app.settings.effective_theme();
+                app.dock.style = app.settings.dock_style;
                 app.gpu.refresh_backdrop(hwnd);
                 drawer::hide();
                 control_center::hide();

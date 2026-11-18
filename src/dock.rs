@@ -5,7 +5,7 @@ use std::time::Instant;
 
 use crate::agent_state::AgentState;
 use crate::content::ContentKind;
-use crate::theme::ThemePreset;
+use crate::theme::{DockStyle, ThemePreset};
 
 // All sizes are LOGICAL pixels @96dpi; multiply by `dpi` for device pixels.
 pub const BASE_ICON: f32 = 50.0;
@@ -30,6 +30,8 @@ pub const EXIT_TAU: f32 = 0.13; // disappear easing — a touch quicker than the
 pub const PRESENCE_GONE: f32 = 0.015; // below this, a fully-exited slot is dropped
 pub const ENTER_RISE: f32 = 0.16; // how far (fraction of icon) a new icon rises into place
 const RUNNING_TAU: f32 = 0.11;
+const HOVER_TAU: f32 = 0.055;
+const PRESS_TAU: f32 = 0.025;
 /// Seconds for the cursor low-pass AT REST: `cursor_smooth` eases toward the raw
 /// pointer with this time constant, filtering hand micro-jitter (±1px) while slow
 /// deliberate drift still tracks closely.
@@ -218,6 +220,8 @@ struct Slot {
     presence_target: f32, // 1 while alive, 0 once removed (then eased out + dropped)
     running_presence: f32,
     running_target: f32,
+    hover: f32,
+    press: f32,
 }
 
 impl Slot {
@@ -230,6 +234,8 @@ impl Slot {
             presence_target: 1.0,
             running_presence: running,
             running_target: running,
+            hover: 0.0,
+            press: 0.0,
         }
     }
     fn entering(running: bool) -> Slot {
@@ -240,6 +246,8 @@ impl Slot {
             presence_target: 1.0,
             running_presence: 0.0,
             running_target: if running { 1.0 } else { 0.0 },
+            hover: 0.0,
+            press: 0.0,
         }
     }
 }
@@ -251,6 +259,8 @@ pub struct IconFrame {
     pub bounce_y: f32,         // upward offset from the click hop
     pub presence: f32,         // 0..1 appear/disappear factor (icon scale + opacity)
     pub running_presence: f32, // independently eases the running-state indicator
+    pub hover: f32,            // 0..1 eased hover highlight factor
+    pub press: f32,            // 0..1 eased press compression factor
 }
 
 pub struct Frame {
@@ -264,6 +274,8 @@ pub struct Dock {
     pub foreground: Option<isize>,
     pub preferences: crate::settings::Layout,
     pub insertion_x: Option<f32>,
+    pub hovered_idx: Option<usize>,
+    pub pressed_idx: Option<usize>,
     slots: Vec<Slot>, // per-item animation state, kept in lockstep with `items`
     pub cursor_x: Option<f32>,
     /// Low-passed cursor position (px) that `frame` actually lays out against.
@@ -283,12 +295,17 @@ pub struct Dock {
     pub reveal: f32,        // 0 = fully hidden (slid down), 1 = fully shown
     pub reveal_target: f32, // where reveal is easing toward
     pub theme: ThemePreset,
+    pub style: DockStyle,
     pub dpi: f32,
     pub win_w: f32,
     pub win_h: f32,
     last: Instant,
     resume_pending: bool,
     pub shimmer_phase: Option<f32>,
+}
+
+pub fn effective_bottom_gap(style: DockStyle, preferences: crate::settings::Layout) -> f32 {
+    style.effective_bottom_gap(preferences.bottom_gap)
 }
 
 /// Window size (device px) needed to fit every slot at full magnification PLUS the
@@ -300,6 +317,16 @@ pub fn window_size_with(
     preferences: crate::settings::Layout,
     theme: ThemePreset,
 ) -> (u32, u32) {
+    window_size_with_style(items, dpi, preferences, theme, DockStyle::Pill)
+}
+
+pub fn window_size_with_style(
+    items: &[DockItem],
+    dpi: f32,
+    preferences: crate::settings::Layout,
+    theme: ThemePreset,
+    style: DockStyle,
+) -> (u32, u32) {
     let base = preferences.icon_size as f32 * dpi;
     let n = items.len();
     let row: f32 = items
@@ -310,7 +337,7 @@ pub fn window_size_with(
     let w = row + 2.0 * PILL_PAD_X * dpi + base * 4.0; // bulge headroom
     let h = base * preferences.magnification as f32 / 100.0
         + BOUNCE_AMP * base
-        + (PILL_PAD_Y + TOP_PAD + preferences.bottom_gap as f32) * dpi;
+        + (PILL_PAD_Y + TOP_PAD + effective_bottom_gap(style, preferences)) * dpi;
     (w.ceil() as u32, h.ceil() as u32)
 }
 
@@ -417,6 +444,8 @@ impl Dock {
             foreground: None,
             preferences: crate::settings::Layout::default(),
             insertion_x: None,
+            hovered_idx: None,
+            pressed_idx: None,
             // Whatever is present at construction starts fully shown (no intro animation).
             slots,
             cursor_x: None,
@@ -429,6 +458,7 @@ impl Dock {
             reveal: 1.0,
             reveal_target: 1.0,
             theme,
+            style: DockStyle::Pill,
             dpi,
             win_w,
             win_h,
@@ -436,6 +466,10 @@ impl Dock {
             resume_pending: false,
             shimmer_phase: None,
         }
+    }
+
+    pub fn effective_bottom_gap(&self) -> f32 {
+        effective_bottom_gap(self.style, self.preferences)
     }
 
     pub fn has_running_agent(&self) -> bool {
@@ -463,8 +497,7 @@ impl Dock {
     /// How far (device px) content slides down when hidden (leaves a small sliver).
     fn hide_slide(&self) -> f32 {
         self.preferences.icon_size as f32 * self.layout_dpi()
-            + (2.0 * PILL_PAD_Y + self.preferences.bottom_gap as f32 - HIDE_SLIVER)
-                * self.layout_dpi()
+            + (2.0 * PILL_PAD_Y + self.effective_bottom_gap() - HIDE_SLIVER) * self.layout_dpi()
     }
 
     /// Resting (un-magnified) width of slot `i` in device px.
@@ -614,11 +647,21 @@ impl Dock {
     pub fn tick(&mut self) -> bool {
         if self.preferences.reduce_motion {
             self.reveal = self.reveal_target;
-            for slot in &mut self.slots {
+            for (i, slot) in self.slots.iter_mut().enumerate() {
                 slot.scale = 1.0;
                 slot.bounce = 0.0;
                 slot.presence = slot.presence_target;
                 slot.running_presence = slot.running_target;
+                slot.hover = if self.hovered_idx == Some(i) && slot.presence_target > 0.0 {
+                    1.0
+                } else {
+                    0.0
+                };
+                slot.press = if self.pressed_idx == Some(i) && slot.presence_target > 0.0 {
+                    1.0
+                } else {
+                    0.0
+                };
             }
             return false;
         }
@@ -630,6 +673,8 @@ impl Dock {
         };
         self.last = now;
         let alpha = 1.0 - (-dt / EASE_TAU).exp(); // frame-rate independent
+        let hover_alpha = 1.0 - (-dt / HOVER_TAU).exp();
+        let press_alpha = 1.0 - (-dt / PRESS_TAU).exp();
         let rc = self.rest_centers();
         let mut moving = false;
         // Range loop: the body mutates `self.slots[i]` while also calling `self.target`
@@ -659,6 +704,36 @@ impl Dock {
                 moving = true;
             } else {
                 self.slots[i].running_presence = self.slots[i].running_target;
+            }
+            let hover_target = if self.hovered_idx == Some(i)
+                && self.slots[i].presence_target > 0.0
+                && !self.items[i].role.is_divider()
+            {
+                1.0
+            } else {
+                0.0
+            };
+            let dh = hover_target - self.slots[i].hover;
+            if dh.abs() > 0.002 {
+                self.slots[i].hover += dh * hover_alpha;
+                moving = true;
+            } else {
+                self.slots[i].hover = hover_target;
+            }
+            let press_target = if self.pressed_idx == Some(i)
+                && self.slots[i].presence_target > 0.0
+                && !self.items[i].role.is_divider()
+            {
+                1.0
+            } else {
+                0.0
+            };
+            let dpr = press_target - self.slots[i].press;
+            if dpr.abs() > 0.002 {
+                self.slots[i].press += dpr * press_alpha;
+                moving = true;
+            } else {
+                self.slots[i].press = press_target;
             }
             // appear/disappear: open a bit slower than we close, both frame-rate independent.
             let pt = self.slots[i].presence_target;
@@ -843,7 +918,7 @@ impl Dock {
 
         // auto-hide slide: shown floats SHOWN_GAP above the bottom; hidden slides down.
         let shown_baseline =
-            self.win_h - (PILL_PAD_Y + self.preferences.bottom_gap as f32) * self.layout_dpi();
+            self.win_h - (PILL_PAD_Y + self.effective_bottom_gap()) * self.layout_dpi();
         let baseline = shown_baseline + (1.0 - self.reveal) * self.hide_slide();
         let mut icons = Vec::with_capacity(n);
         for (i, &cx) in centers.iter().enumerate() {
@@ -856,6 +931,8 @@ impl Dock {
                 bounce_y,
                 presence: self.slots[i].presence,
                 running_presence: self.slots[i].running_presence,
+                hover: self.slots[i].hover,
+                press: self.slots[i].press,
             });
         }
         let pill_l = icons[0].cx - widths[0] / 2.0 - PILL_PAD_X * self.layout_dpi();
@@ -988,6 +1065,10 @@ impl Dock {
 
         self.items = items;
         self.slots = slots;
+        self.hovered_idx = self
+            .hovered_idx
+            .and_then(|old| remap.iter().position(|r| *r == Some(old)));
+        self.pressed_idx = None;
         remap
     }
 
@@ -1005,6 +1086,16 @@ impl Dock {
         if removed.is_empty() {
             return removed;
         }
+        let remap_index = |index: usize| -> Option<usize> {
+            if removed.contains(&index) {
+                None
+            } else {
+                let shift = removed.iter().filter(|&&r| r < index).count();
+                Some(index - shift)
+            }
+        };
+        self.hovered_idx = self.hovered_idx.and_then(remap_index);
+        self.pressed_idx = self.pressed_idx.and_then(remap_index);
         let mut keep = removed.iter().copied().peekable();
         let mut idx = 0;
         self.items.retain(|_| {
@@ -1853,5 +1944,49 @@ mod layout_regression_tests {
             dock.items[2].key(),
             ItemKey::Agent("antigravity".to_string())
         );
+    }
+
+    #[test]
+    fn shelf_style_anchors_pill_bottom_regardless_of_configured_bottom_gap() {
+        let items = vec![start(), item(ItemRole::Control, None, None)];
+        let prefs = crate::settings::Layout {
+            bottom_gap: 16,
+            ..Default::default()
+        };
+        let (w_pill, h_pill) =
+            window_size_with_style(&items, 1.0, prefs, ThemePreset::Glass, DockStyle::Pill);
+        let (w_shelf, h_shelf) =
+            window_size_with_style(&items, 1.0, prefs, ThemePreset::Glass, DockStyle::Shelf);
+        assert_eq!(w_pill, w_shelf);
+        assert_eq!(h_pill - h_shelf, 16);
+
+        let mut dock = Dock::new(
+            items,
+            1.0,
+            w_shelf as f32,
+            h_shelf as f32,
+            ThemePreset::Glass,
+        );
+        dock.preferences = prefs;
+        dock.style = DockStyle::Shelf;
+        let frame = dock.frame();
+        assert!((frame.pill.3 - h_shelf as f32).abs() < 0.01);
+    }
+
+    #[test]
+    fn hover_and_press_snap_in_reduce_motion_and_clear_on_reconcile() {
+        let mut dock = seeded(vec![start(), item(ItemRole::Control, None, None)]);
+        dock.preferences.reduce_motion = true;
+        dock.hovered_idx = Some(0);
+        dock.pressed_idx = Some(1);
+        assert!(!dock.tick());
+        let f = dock.frame();
+        assert_eq!(f.icons[0].hover, 1.0);
+        assert_eq!(f.icons[1].hover, 0.0);
+        assert_eq!(f.icons[1].press, 1.0);
+
+        dock.reconcile(vec![start(), item(ItemRole::Control, None, None)]);
+        assert_eq!(dock.hovered_idx, Some(0));
+        assert_eq!(dock.pressed_idx, None);
     }
 }

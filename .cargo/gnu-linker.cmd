@@ -4,6 +4,14 @@ for /f "usebackq delims=" %%I in (`rustc --print sysroot`) do set "RUST_SYSROOT=
 if not defined RUST_SYSROOT exit /b 1
 set "SELF_CONTAINED=%RUST_SYSROOT%\lib\rustlib\x86_64-pc-windows-gnu\bin\self-contained"
 set "SELF_CONTAINED_LIB=%RUST_SYSROOT%\lib\rustlib\x86_64-pc-windows-gnu\lib\self-contained"
+set "GCC_EXE=%SELF_CONTAINED%\x86_64-w64-mingw32-gcc.exe"
+if not exist "%GCC_EXE%" (
+  set "ALT_BIN=%RUST_SYSROOT%\..\stable-x86_64-pc-windows-gnu\lib\rustlib\x86_64-pc-windows-gnu\bin\self-contained"
+  if exist "!ALT_BIN!\x86_64-w64-mingw32-gcc.exe" (
+    set "SELF_CONTAINED=!ALT_BIN!"
+    set "GCC_EXE=!ALT_BIN!\x86_64-w64-mingw32-gcc.exe"
+  )
+)
 set "LINK_ARGS=%*"
 set "STARTUP_OBJECT=crt2.o"
 set "HAS_STARTUP=0"
@@ -22,8 +30,16 @@ if "!ARG:~0,1!"=="@" (
 shift
 goto scan_args
 :scanned_args
-if "%HAS_STARTUP%"=="1" (
-  "%SELF_CONTAINED%\x86_64-w64-mingw32-gcc.exe" -nostartfiles -B"%SELF_CONTAINED%\\" -L"%SELF_CONTAINED_LIB%" %LINK_ARGS%
+if exist "%GCC_EXE%" (
+  if "%HAS_STARTUP%"=="1" (
+    "%GCC_EXE%" -nostartfiles -B"%SELF_CONTAINED%\\" -L"%SELF_CONTAINED_LIB%" %LINK_ARGS%
+  ) else (
+    "%GCC_EXE%" -nostartfiles "%SELF_CONTAINED_LIB%\%STARTUP_OBJECT%" -B"%SELF_CONTAINED%\\" -L"%SELF_CONTAINED_LIB%" %LINK_ARGS%
+  )
 ) else (
-  "%SELF_CONTAINED%\x86_64-w64-mingw32-gcc.exe" -nostartfiles "%SELF_CONTAINED_LIB%\%STARTUP_OBJECT%" -B"%SELF_CONTAINED%\\" -L"%SELF_CONTAINED_LIB%" %LINK_ARGS%
+  if "%HAS_STARTUP%"=="1" (
+    x86_64-w64-mingw32-gcc.exe -nostartfiles -L"%SELF_CONTAINED_LIB%" %LINK_ARGS%
+  ) else (
+    x86_64-w64-mingw32-gcc.exe -nostartfiles "%SELF_CONTAINED_LIB%\%STARTUP_OBJECT%" -L"%SELF_CONTAINED_LIB%" %LINK_ARGS%
+  )
 )

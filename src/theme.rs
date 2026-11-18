@@ -1,4 +1,90 @@
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DockStyle {
+    #[default]
+    Pill,
+    Hairline,
+    Islands,
+    Shelf,
+    Tiles,
+    Fluent,
+}
+
+impl DockStyle {
+    pub const ALL: [DockStyle; 6] = [
+        DockStyle::Pill,
+        DockStyle::Hairline,
+        DockStyle::Islands,
+        DockStyle::Shelf,
+        DockStyle::Tiles,
+        DockStyle::Fluent,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DockStyle::Pill => "pill",
+            DockStyle::Hairline => "hairline",
+            DockStyle::Islands => "islands",
+            DockStyle::Shelf => "shelf",
+            DockStyle::Tiles => "tiles",
+            DockStyle::Fluent => "fluent",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DockStyle::Pill => "悬浮胶囊",
+            DockStyle::Hairline => "极简顶线",
+            DockStyle::Islands => "分段浮岛",
+            DockStyle::Shelf => "底部托台",
+            DockStyle::Tiles => "独立键帽",
+            DockStyle::Fluent => "Win11 流体",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<DockStyle> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "pill" | "default" | "capsule" => Some(DockStyle::Pill),
+            "hairline" | "line" | "transparent" | "minimal-line" => Some(DockStyle::Hairline),
+            "islands" | "island" | "segmented" => Some(DockStyle::Islands),
+            "shelf" | "stage" | "tray" => Some(DockStyle::Shelf),
+            "tiles" | "tile" | "keycap" | "keycaps" => Some(DockStyle::Tiles),
+            "fluent" | "win11" | "taskbar" => Some(DockStyle::Fluent),
+            _ => None,
+        }
+    }
+
+    /// Whether the main dock window should enable Windows 11 HostBackdrop blur.
+    /// Legacy `Pill` preserves the exact original `Glass`-only behavior.
+    pub fn uses_backdrop(self, theme: ThemePreset) -> bool {
+        match self {
+            DockStyle::Pill => theme == ThemePreset::Glass,
+            DockStyle::Hairline | DockStyle::Islands | DockStyle::Tiles => false,
+            DockStyle::Shelf | DockStyle::Fluent => {
+                !matches!(theme, ThemePreset::Solid | ThemePreset::Contrast)
+            }
+        }
+    }
+
+    pub fn corner_radius(self, visual: &VisualTheme) -> f32 {
+        match self {
+            DockStyle::Pill | DockStyle::Hairline => visual.pill_radius,
+            DockStyle::Islands => visual.pill_radius.min(26.0),
+            DockStyle::Shelf => 18.0,
+            DockStyle::Tiles => 14.0,
+            DockStyle::Fluent => 12.0,
+        }
+    }
+
+    pub fn effective_bottom_gap(self, configured_bottom_gap: u32) -> f32 {
+        if self == DockStyle::Shelf {
+            0.0
+        } else {
+            configured_bottom_gap as f32
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ThemePreset {
     #[default]
     Glass,
@@ -159,6 +245,10 @@ impl ThemePreset {
         }
     }
 
+    pub fn is_light(self) -> bool {
+        matches!(self, Self::Glass | Self::Macos)
+    }
+
     pub fn dock_alpha(self, backdrop_enabled: bool) -> f32 {
         if self == Self::Glass && !backdrop_enabled {
             0.92
@@ -169,7 +259,7 @@ impl ThemePreset {
 
     pub fn surface(self) -> SurfaceTheme {
         let visual = self.visual();
-        let light = matches!(self, Self::Glass | Self::Macos);
+        let light = self.is_light();
         SurfaceTheme {
             backdrop: self == Self::Glass,
             rgb: visual.pill_rgb,
@@ -325,6 +415,38 @@ mod tests {
                 rw >= 0.4 && we >= 0.25,
                 "{preset:?} agent palette lacks state contrast: rw={rw:.2}, we={we:.2}"
             );
+        }
+    }
+
+    #[test]
+    fn parses_known_dock_styles_case_insensitively() {
+        assert_eq!(DockStyle::parse("pill"), Some(DockStyle::Pill));
+        assert_eq!(DockStyle::parse("HAIRLINE"), Some(DockStyle::Hairline));
+        assert_eq!(DockStyle::parse("islands"), Some(DockStyle::Islands));
+        assert_eq!(DockStyle::parse("shelf"), Some(DockStyle::Shelf));
+        assert_eq!(DockStyle::parse("tiles"), Some(DockStyle::Tiles));
+        assert_eq!(DockStyle::parse("fluent"), Some(DockStyle::Fluent));
+        assert_eq!(DockStyle::parse("unknown"), None);
+    }
+
+    #[test]
+    fn dock_style_backdrop_and_bottom_gap_policies_preserve_legacy_pill() {
+        assert!(DockStyle::Pill.uses_backdrop(ThemePreset::Glass));
+        assert!(!DockStyle::Pill.uses_backdrop(ThemePreset::Macos));
+        assert!(!DockStyle::Pill.uses_backdrop(ThemePreset::Compact));
+        assert!(!DockStyle::Hairline.uses_backdrop(ThemePreset::Glass));
+        assert!(!DockStyle::Islands.uses_backdrop(ThemePreset::Glass));
+        assert!(!DockStyle::Tiles.uses_backdrop(ThemePreset::Glass));
+        assert!(DockStyle::Shelf.uses_backdrop(ThemePreset::Macos));
+        assert!(DockStyle::Fluent.uses_backdrop(ThemePreset::Compact));
+        assert!(!DockStyle::Fluent.uses_backdrop(ThemePreset::Contrast));
+
+        assert_eq!(DockStyle::Shelf.effective_bottom_gap(8), 0.0);
+        for style in DockStyle::ALL
+            .into_iter()
+            .filter(|s| *s != DockStyle::Shelf)
+        {
+            assert_eq!(style.effective_bottom_gap(8), 8.0);
         }
     }
 }
