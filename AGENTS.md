@@ -44,12 +44,13 @@ FeatherDock 是 Windows 10+ 的轻量原生 Dock：
 主条按以下顺序组织：
 
 ```text
-[Start] [Drawer] [常规固定应用] | [普通运行窗口] ‖ [Agent 区] [Overflow?] [Control]
+[Start] [Drawer] [常规固定应用] | [普通运行窗口] ‖ [Agent 区] [Overflow?] [系统托盘] [Control]
 ```
 
 - 首批 Agent 为 `antigravity`、`codex`、`dsh`；同一 Agent 的固定项和运行窗口聚合成一个槽位。
 - Agent 区为空时隐藏；普通项与 Agent 固定项各自内部排序，不跨区拖拽。
 - 溢出时优先保留 `Waiting`、`Error`、`Running` 等活跃 Agent，再保留普通运行项。
+- 系统托盘按钮按需唤出 Explorer 的原生「隐藏的图标」面板。任务栏完全隐藏时保持透明和自动隐藏，点击只打开托盘面板。遵守全屏免打扰。
 - 非标准可执行文件名必须在 `featherdock.toml` 显式声明，例如 DeepSeek Harness：
 
 ```toml
@@ -117,6 +118,7 @@ Phase 2/3 的会话管理、控制中心 Agent 总览和跨 Agent 工作流，�
 | `src/graphics.rs` / `src/backdrop.rs` | GPU、图标批次、背景材质；图标 source/代际必须匹配 |
 | `src/windows_list.rs` | WinEvent 窗口分组、激活、全屏/最大化判定 |
 | `src/taskbar.rs` / `src/watchdog.rs` | 任务栏策略与异常恢复；生命周期修改需同时检查 |
+| `src/native_tray.rs` | 按需在独立线程触发 Explorer 原生托盘面板；触发前复核前台与全屏状态 |
 
 额外红线：
 

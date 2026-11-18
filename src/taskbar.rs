@@ -247,18 +247,12 @@ pub fn should_rehide_after_start_invocation(
     mode == TaskbarMode::Hidden && grace_elapsed && !pointer_over_taskbar
 }
 
-/// In full-hide mode, temporarily show the real taskbar for an explicit Start-button
-/// click: make it opaque + interactive and pin it ALWAYS-ON-TOP so it slides fully
-/// on-screen and is usable.
-pub unsafe fn reveal_for_start_invocation(mode: TaskbarMode) -> bool {
-    if !should_reveal_for_start_invocation(mode) {
-        return false;
-    }
+/// Temporarily show the real taskbar for a Start-button click in full-hide mode.
+pub unsafe fn reveal_for_start_invocation() {
     make_taskbar_opaque();
     set_autohide(false);
     show_class("Shell_TrayWnd", true);
     show_class("Shell_SecondaryTrayWnd", true);
-    true
 }
 
 /// Return to the hidden resting state after a Start-button reveal.

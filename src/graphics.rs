@@ -371,12 +371,13 @@ impl Gpu {
                 .and_then(|(_, bmp)| drawer_icons::load_icon_bitmap(&self.dc, bmp))
         };
         match it.role {
-            // Start + Control + Drawer use custom vector glyphs; the divider draws a line.
+            // System buttons and dividers are drawn as vectors.
             ItemRole::Start
             | ItemRole::Divider
             | ItemRole::AgentDivider
             | ItemRole::Control
             | ItemRole::Drawer
+            | ItemRole::SystemTray
             | ItemRole::Overflow => None,
             // Running window: its app exe's helper-extracted icon, else the window's
             // window-class icon (owned by the app — don't free).

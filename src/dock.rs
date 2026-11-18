@@ -103,6 +103,7 @@ pub enum ItemRole {
     Divider,      // a vertical separator: no icon, no magnify, not clickable
     AgentDivider, // subtle zone separator before the dedicated Agent Zone
     Control,      // far-right button: opens the glass control center
+    SystemTray,   // opens Explorer's hidden notification icons
     Drawer,       // opens the glass app drawer (all desktop programs)
     Overflow,     // reachable applications that do not fit the current monitor
 }
@@ -122,6 +123,7 @@ pub enum ItemKey {
     Divider,
     AgentDivider,
     Control,
+    SystemTray,
     Drawer,
     Overflow,
     Pinned(String),  // by launch path (falls back to icon source, then label)
@@ -192,6 +194,7 @@ impl DockItem {
             ItemRole::Divider => ItemKey::Divider,
             ItemRole::AgentDivider => ItemKey::AgentDivider,
             ItemRole::Control => ItemKey::Control,
+            ItemRole::SystemTray => ItemKey::SystemTray,
             ItemRole::Drawer => ItemKey::Drawer,
             ItemRole::Overflow => ItemKey::Overflow,
             ItemRole::Running => ItemKey::Running(
@@ -408,7 +411,7 @@ pub fn limit_items(
     }
     let at = items
         .iter()
-        .position(|i| i.role == ItemRole::Control)
+        .position(|i| matches!(i.role, ItemRole::SystemTray | ItemRole::Control))
         .unwrap_or(items.len());
     items.insert(at, crate::apps::overflow_item());
     while window_size_with(&items, dpi, preferences, theme).0 > width {

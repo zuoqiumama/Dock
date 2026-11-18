@@ -73,6 +73,14 @@ pub fn overflow_item() -> DockItem {
     item
 }
 
+pub fn system_tray_item() -> DockItem {
+    let mut item = control_item();
+    item.role = ItemRole::SystemTray;
+    item.label = "系统托盘".into();
+    item.glyph = "⌃";
+    item
+}
+
 /// The vertical separator between pinned apps (left) and open windows (right).
 pub fn divider_item() -> DockItem {
     DockItem {

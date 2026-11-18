@@ -1181,7 +1181,11 @@ pub unsafe fn draw(
 
         if matches!(
             item.role,
-            ItemRole::Start | ItemRole::Control | ItemRole::Drawer | ItemRole::Overflow
+            ItemRole::Start
+                | ItemRole::Control
+                | ItemRole::Drawer
+                | ItemRole::Overflow
+                | ItemRole::SystemTray
         ) {
             draw_system_button(dc, brush, dock, item.role, tile, p);
             continue;
@@ -1866,8 +1870,46 @@ unsafe fn draw_system_button(
         ItemRole::Drawer => draw_drawer(dc, brush, dock.theme, tile, colors, alpha, shadow_dy),
         ItemRole::Control => draw_control(dc, brush, tile, colors, alpha, shadow_dy),
         ItemRole::Overflow => draw_overflow_dots(dc, brush, tile, colors, alpha, shadow_dy),
+        ItemRole::SystemTray => draw_tray_chevron(dc, brush, tile, colors, alpha, shadow_dy),
         _ => {}
     }
+}
+
+unsafe fn draw_tray_chevron(
+    dc: &ID2D1DeviceContext,
+    brush: &ID2D1SolidColorBrush,
+    tile: D2D_RECT_F,
+    colors: SystemButtonColors,
+    alpha: f32,
+    shadow_dy: Option<f32>,
+) {
+    let size = tile.right - tile.left;
+    let draw_chevron = |offset_y| {
+        let point = |x, y| D2D_POINT_2F {
+            x: tile.left + size * x,
+            y: tile.top + size * y + offset_y,
+        };
+        let peak = point(0.50, 0.30);
+        let stroke = (size * 0.10).max(1.0);
+        dc.DrawLine(point(0.24, 0.55), peak, brush, stroke, None);
+        dc.DrawLine(peak, point(0.76, 0.55), brush, stroke, None);
+    };
+    if let Some(offset) = shadow_dy {
+        brush.SetColor(&color(0.0, 0.0, 0.0, alpha * 0.30));
+        draw_chevron(offset);
+    }
+    let (r, g, b) = colors.primary;
+    brush.SetColor(&color(r, g, b, alpha));
+    draw_chevron(0.0);
+    fill_flat_rr(
+        dc,
+        brush,
+        tile_subrect(tile, 0.30, 0.64, 0.70, 0.73),
+        size * 0.045,
+        colors.secondary,
+        alpha,
+        shadow_dy,
+    );
 }
 
 /// Borderless flat 2x2 Windows panes in a soft cerulean-sky palette.
@@ -2403,6 +2445,7 @@ mod tests {
                 ItemRole::Drawer,
                 ItemRole::Control,
                 ItemRole::Overflow,
+                ItemRole::SystemTray,
             ] {
                 let c = system_button_colors(role, theme);
                 let min_ratio = if theme == ThemePreset::Contrast {

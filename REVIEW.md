@@ -4,6 +4,10 @@
 
 ## 当前结论 · 2026-11-18
 
+- Dock 主条的「系统托盘」按钮位于应用溢出与控制中心之间。显式点击由独立线程直接调用 Explorer 的原生隐藏图标按钮。任务栏完全隐藏时保持透明和自动隐藏，跨屏全屏前台阻止触发。
+- 通过 `build.cmd -Verify -Stage` 的格式、严格 Clippy、**261/261 项测试**和 release 构建。窄屏回归覆盖 Agent 区开启与关闭两种布局。已在交互桌面正常退出旧版，从根目录发布并启动，确认主窗口存在。根目录 `FeatherDock.exe` 为 **1,354,240 bytes**，SHA-256 `3DE57FAC284A6CD307E1EC151DD8A714AE692FA8D523A03FCE51DCF8D508B6A9`。
+- Windows 11 Build 26120 上从 Explorer 的 XAML 桥接窗口调用「显示隐藏的图标」的 `InvokePattern`，原生面板完整落在屏幕内。主任务栏调用前后透明度均为 0，自动隐藏均已启用。探针直接调用原生控件，Dock 点击路径与原生右键及跨版本验收仍按 `PLAN.md` 保留。
+
 - 移除非键帽样式悬浮时的半透明圆角矩形背板 `draw_hover_backplate`（[render.rs](src/render.rs)，`Tiles` 键帽高亮保持不变），使 `hairline`、`islands`、`shelf`、`fluent` 悬浮时仅保留纯放大动效。
 - 重新设计内置系统按钮 `Start`、`Drawer`、`Control` 与 `Overflow`（[render.rs](src/render.rs) `system_button_colors` / `draw_system_button`）：取消外层圆角矩形底框，改为纯扁平无底框的折纸风格矢量前景（采用与 `assets/featherdock-256.png` 同源的天蓝/暖杏/薄荷/紫罗兰高亮配色，配合 `hairline` 模式下的轻柔垂直投影与高对比主题专用黑白黄方案），并彻底区分按钮轮廓：`Start` 为 2×2 扁平天蓝四格窗徽，`Drawer` 为紫罗兰与薄荷卡片探出暖杏抽屉盒（带珊瑚折边与拉手条），`Control` 为薄荷/紫罗兰双胶囊开关，`Overflow` 为三色扁平圆点。
 - 延续同日早先完成的角标动画跟随修复（`badge_geometry` / `icon_motion` 使角标随悬浮放大、点击弹跳、进出场与按压同步移动和温和缩放）及 Dock **形态样式与配色解耦**（`DockStyle` × `ThemePreset`、`hairline`/`islands`/`shelf`/`tiles`/`fluent` 五种样式与设置联动）。

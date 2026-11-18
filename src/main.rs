@@ -33,6 +33,7 @@ mod glass;
 mod graphics;
 mod icons;
 mod menu_style;
+mod native_tray;
 mod preferences;
 mod render;
 mod search;
@@ -185,6 +186,7 @@ struct App {
     pending_relayout: bool,     // shrink the window to fit once exit animations settle
     pending_rebuild: bool, // a window-set/display change deferred while a fullscreen app owned the screen
     taskbar_invoked_at: Option<Instant>,
+    native_tray_request: Option<std::thread::JoinHandle<()>>,
     watchdog: Option<std::process::Child>, // sibling that restores system state if we crash
     watchdog_plan: Option<WatchdogPlan>,
 }
@@ -333,7 +335,7 @@ fn compose_items_with_pinned(
         for item in &mut pinned {
             item.agent = None;
         }
-        let mut items = Vec::with_capacity(pinned.len() + unpinned.len() + 4);
+        let mut items = Vec::with_capacity(pinned.len() + unpinned.len() + 5);
         items.push(apps::start_item());
         if settings.drawer_enabled {
             items.push(apps::drawer_item());
@@ -345,7 +347,7 @@ fn compose_items_with_pinned(
                 items.push(apps::running_item(group));
             }
         }
-        items.push(apps::control_item()); // always last → fixed far-right button
+        items.extend([apps::system_tray_item(), apps::control_item()]);
         return items;
     }
 
@@ -426,7 +428,7 @@ fn compose_items_with_pinned(
             + regular_running.len()
             + agent_pinned.len()
             + agent_unpinned.len()
-            + 5,
+            + 6,
     );
     items.push(apps::start_item());
     if settings.drawer_enabled {
@@ -449,7 +451,7 @@ fn compose_items_with_pinned(
         items.extend(agent_pinned);
         items.extend(agent_unpinned);
     }
-    items.push(apps::control_item()); // always last → fixed far-right button
+    items.extend([apps::system_tray_item(), apps::control_item()]);
     items
 }
 
@@ -900,6 +902,38 @@ unsafe fn place_dock_behind_taskbar(dock: HWND) {
         0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
     );
+}
+
+unsafe fn reveal_taskbar_for_start(hwnd: HWND, app: &mut App) {
+    if !taskbar::should_reveal_for_start_invocation(app.settings.taskbar_mode)
+        || SetTimer(hwnd, TIMER_TASKBAR_REHIDE, TIMER_TASKBAR_REHIDE_MS, None) == 0
+    {
+        return;
+    }
+    app.taskbar_invoked_at = Some(Instant::now());
+    taskbar::reveal_for_start_invocation();
+    place_dock_behind_taskbar(hwnd);
+}
+
+unsafe fn open_native_tray(hwnd: HWND, app: &mut App) {
+    if native_tray::fullscreen_foreground_present()
+        || app
+            .native_tray_request
+            .as_ref()
+            .is_some_and(|request| !request.is_finished())
+        || native_tray::overflow_visible()
+    {
+        return;
+    }
+    hide_running_preview(app);
+    drawer::hide();
+    control_center::hide();
+    // The notification chevron remains callable while the taskbar is transparent.
+    let foreground = GetForegroundWindow();
+    match native_tray::request_open(hwnd, foreground) {
+        Ok(request) => app.native_tray_request = Some(request),
+        Err(error) => error_log::write("启动系统托盘操作失败", &error),
+    }
 }
 
 /// Restore the dock to the top of the topmost band (its normal resting z-order).
@@ -1495,6 +1529,7 @@ fn run() -> Result<()> {
             pending_relayout: false,
             pending_rebuild: false,
             taskbar_invoked_at: None,
+            native_tray_request: None,
             watchdog: None,
             watchdog_plan: None,
         }));
@@ -3246,18 +3281,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     }
                     match role {
                         dock::ItemRole::Start => {
-                            if taskbar::reveal_for_start_invocation(app.settings.taskbar_mode) {
-                                app.taskbar_invoked_at = Some(Instant::now());
-                                // Drop the dock behind the revealed taskbar so the user
-                                // can operate the taskbar on top of it.
-                                place_dock_behind_taskbar(hwnd);
-                                let _ = SetTimer(
-                                    hwnd,
-                                    TIMER_TASKBAR_REHIDE,
-                                    TIMER_TASKBAR_REHIDE_MS,
-                                    None,
-                                );
-                            }
+                            reveal_taskbar_for_start(hwnd, app);
                             if taskbar::should_open_start_menu_for_start_invocation(
                                 app.settings.taskbar_mode,
                             ) {
@@ -3336,6 +3360,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                             app.dock.bump(i);
                             app.animating = true;
                         }
+                        dock::ItemRole::SystemTray => {
+                            open_native_tray(hwnd, app);
+                            app.dock.bump(i);
+                            app.animating = true;
+                        }
                         dock::ItemRole::Drawer => {
                             // Anchor the drawer above this button's center, then toggle.
                             let (acx, atop) = anchor_above(hwnd, app, i);
@@ -3371,7 +3400,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                         // Keep settings reachable directly from the dock even
                         // when Explorer has put its notification icon in overflow.
                         dock::ItemRole::Control => settings_window::open(hwnd),
-                        dock::ItemRole::Drawer => {}
+                        dock::ItemRole::Drawer | dock::ItemRole::SystemTray => {}
                         dock::ItemRole::Overflow => show_overflow(hwnd, app),
                         dock::ItemRole::Divider | dock::ItemRole::AgentDivider => {}
                     }
@@ -3635,20 +3664,23 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             WM_TIMER if wparam.0 == TIMER_TASKBAR_REHIDE => {
                 if let Some(invoked_at) = app.taskbar_invoked_at {
                     let grace_elapsed = invoked_at.elapsed() >= TASKBAR_INVOCATION_GRACE;
-                    let pointer_over_taskbar = taskbar::pointer_over_taskbar();
                     if taskbar::should_rehide_after_start_invocation(
                         app.settings.taskbar_mode,
                         grace_elapsed,
-                        pointer_over_taskbar,
+                        grace_elapsed && taskbar::pointer_over_taskbar(),
                     ) {
                         let _ = KillTimer(hwnd, TIMER_TASKBAR_REHIDE);
                         app.taskbar_invoked_at = None;
                         taskbar::rehide_after_start_invocation(app.settings.taskbar_mode);
-                        raise_dock_topmost(hwnd); // taskbar gone → dock back on top
+                        if !native_tray::fullscreen_foreground_present() {
+                            raise_dock_topmost(hwnd);
+                        }
                     } else if app.settings.taskbar_mode != settings::TaskbarMode::Hidden {
                         let _ = KillTimer(hwnd, TIMER_TASKBAR_REHIDE);
                         app.taskbar_invoked_at = None;
-                        raise_dock_topmost(hwnd);
+                        if !native_tray::fullscreen_foreground_present() {
+                            raise_dock_topmost(hwnd);
+                        }
                     }
                 } else {
                     let _ = KillTimer(hwnd, TIMER_TASKBAR_REHIDE);
@@ -3910,6 +3942,33 @@ mod tests {
             group_key: None,
             windows,
             agent: None,
+        }
+    }
+
+    #[test]
+    fn system_tray_stays_next_to_control_when_apps_overflow() {
+        for agent_zone_enabled in [false, true] {
+            let settings = settings::Settings {
+                agent_zone_enabled,
+                ..Default::default()
+            };
+            let pinned = (0..20)
+                .map(|index| pinned_item(&format!("App {index}"), &format!("C:/Apps/{index}.exe")))
+                .collect();
+            let items = compose_items_with_pinned(
+                pinned,
+                &[],
+                &settings,
+                &agent_state::AgentRegistry::default(),
+            );
+            let (visible, overflow) =
+                dock::limit_items(items, 500, 1.0, settings.layout, theme::ThemePreset::Glass);
+            assert!(!overflow.is_empty());
+            let suffix: Vec<_> = visible[visible.len() - 3..]
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect();
+            assert_eq!(suffix, ["更多应用", "系统托盘", "控制中心"]);
         }
     }
 
@@ -4367,7 +4426,10 @@ mod interaction_regression_tests {
             .unwrap();
         // Regular items live before AgentDivider; Agent items live after AgentDivider.
         assert!(row[..ag_div].iter().all(|i| !i.is_agent()));
-        let agent_slots: Vec<&dock::DockItem> = row[ag_div + 1..row.len() - 1].iter().collect();
+        let agent_slots: Vec<&dock::DockItem> = row[ag_div + 1..]
+            .iter()
+            .take_while(|item| item.role != dock::ItemRole::SystemTray)
+            .collect();
         assert_eq!(agent_slots.len(), 2);
         assert_eq!(
             agent_slots[0].agent.as_ref().unwrap().agent_id,
