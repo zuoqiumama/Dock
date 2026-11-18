@@ -60,6 +60,13 @@ static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
 static POPUP_HWND: AtomicIsize = AtomicIsize::new(0);
 static PENDING_ACTIVATION: Mutex<Option<PopupActivation>> = Mutex::new(None);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PopupIntent {
+    Activate,
+    Acknowledge,
+    Dismiss,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PopupActivation {
     pub agent_id: String,
@@ -68,6 +75,8 @@ pub struct PopupActivation {
     pub pid: Option<u32>,
     pub deep_link: Option<String>,
     pub launch_path: Option<String>,
+    pub intent: PopupIntent,
+    pub expected_version: Option<agent_state::SessionVersion>,
 }
 
 pub fn take_activation() -> Option<PopupActivation> {
@@ -342,6 +351,7 @@ struct PopupState {
     layout: PopupLayout,
     scroll_offset: usize,
     hovered_row: Option<usize>,
+    hovered_action: Option<(usize, PopupIntent)>,
     hovered_footer: bool,
     tracking_leave: bool,
     in_menu: bool,
@@ -448,6 +458,7 @@ pub unsafe fn show(
                     0
                 };
                 state.hovered_row = None;
+                state.hovered_action = None;
                 state.hovered_footer = false;
                 let _ = KillTimer(hwnd, TIMER_LEAVE_CHECK);
                 if size_changed {
@@ -532,6 +543,7 @@ pub unsafe fn show(
         layout,
         scroll_offset: 0,
         hovered_row: None,
+        hovered_action: None,
         hovered_footer: false,
         tracking_leave: false,
         in_menu: false,
@@ -628,6 +640,79 @@ fn resolve_row_session_index(
     (actual < total).then_some(actual)
 }
 
+fn row_action_rect(
+    row: (f32, f32, f32, f32),
+    dpi: f32,
+    intent: PopupIntent,
+) -> Option<(f32, f32, f32, f32)> {
+    let (_, rt, rr, rb) = row;
+    if rb - rt < 40.0 * dpi {
+        return None;
+    }
+    let top = rb - 25.0 * dpi;
+    let bottom = rb - 4.0 * dpi;
+    match intent {
+        PopupIntent::Dismiss => {
+            let right = rr - 8.0 * dpi;
+            Some((right - 38.0 * dpi, top, right, bottom))
+        }
+        PopupIntent::Acknowledge => {
+            let right = rr - 51.0 * dpi;
+            Some((right - 54.0 * dpi, top, right, bottom))
+        }
+        PopupIntent::Activate => None,
+    }
+}
+
+fn point_in_rect(rect: (f32, f32, f32, f32), x: f32, y: f32) -> bool {
+    x >= rect.0 && x <= rect.2 && y >= rect.1 && y <= rect.3
+}
+
+fn session_supports_action(session: &agent_state::AgentSession, intent: PopupIntent) -> bool {
+    match intent {
+        PopupIntent::Acknowledge => {
+            matches!(session.state, AgentState::Waiting | AgentState::Done)
+        }
+        PopupIntent::Dismiss => session.source != SessionSource::Window,
+        PopupIntent::Activate => true,
+    }
+}
+
+fn session_action_at(
+    layout: &PopupLayout,
+    sessions: &[agent_state::AgentSession],
+    scroll_offset: usize,
+    dpi: f32,
+    x: f32,
+    y: f32,
+) -> Option<(usize, PopupIntent)> {
+    let row_idx = layout.row_at(x, y)?;
+    let session_idx =
+        resolve_row_session_index(sessions.len(), layout.visible_rows, scroll_offset, row_idx)?;
+    let session = sessions.get(session_idx)?;
+    let row = layout.row_rect(row_idx)?;
+    for intent in [PopupIntent::Acknowledge, PopupIntent::Dismiss] {
+        if session_supports_action(session, intent)
+            && row_action_rect(row, dpi, intent).is_some_and(|rect| point_in_rect(rect, x, y))
+        {
+            return Some((row_idx, intent));
+        }
+    }
+    None
+}
+
+fn take_hover_flags(
+    row: &mut Option<usize>,
+    action: &mut Option<(usize, PopupIntent)>,
+    footer: &mut bool,
+) -> bool {
+    let had_row = row.take().is_some();
+    let had_action = action.take().is_some();
+    let had_footer = *footer;
+    *footer = false;
+    had_row || had_action || had_footer
+}
+
 fn activation_for_session(
     agent_id: &str,
     launch_path: Option<&str>,
@@ -641,6 +726,8 @@ fn activation_for_session(
             pid: session.pid,
             deep_link: session.deep_link.clone(),
             launch_path: launch_path.map(str::to_string),
+            intent: PopupIntent::Activate,
+            expected_version: None,
         }
     } else {
         PopupActivation {
@@ -650,12 +737,16 @@ fn activation_for_session(
             pid: None,
             deep_link: None,
             launch_path: launch_path.map(str::to_string),
+            intent: PopupIntent::Activate,
+            expected_version: None,
         }
     }
 }
 
 unsafe fn post_activation(owner: HWND, activation: PopupActivation) {
     *PENDING_ACTIVATION.lock().unwrap_or_else(|e| e.into_inner()) = Some(activation);
+    // Every command closes the card before returning to the owner's message loop.
+    // This preserves the single-inflight-slot invariant even for rapid clicks.
     hide();
     if !owner.is_invalid() {
         let _ = PostMessageW(owner, WM_AGENT_POPUP_ACTIVATED, WPARAM(0), LPARAM(0));
@@ -678,6 +769,7 @@ pub unsafe fn hide() {
     let owner = if !ptr.is_null() {
         let state = &mut *ptr;
         state.hovered_row = None;
+        state.hovered_action = None;
         state.hovered_footer = false;
         state.tracking_leave = false;
         state.owner
@@ -977,13 +1069,13 @@ unsafe fn paint(state: &PopupState) {
                 brush,
             );
 
-            // Right meta label ("待确认 · 12s" or "仅识别窗口" for Track A fallback)
+            // Right meta label ("question · 12s" or "仅识别窗口" for Track A fallback)
             let is_window_only = session.source == SessionSource::Window && session.updated_at == 0;
             let meta_str = if is_window_only {
                 "仅识别窗口".to_string()
             } else {
                 let age = agent_state::format_relative_age(session.updated_at, now);
-                format!("{} · {age}", session.state.label_zh())
+                format!("{} · {age}", session.state.label_en())
             };
             let meta_w = 88.0 * dpi;
             let meta_l = rr - 10.0 * dpi - meta_w;
@@ -1050,19 +1142,82 @@ unsafe fn paint(state: &PopupState) {
                 0.88,
             ));
             let detail_wide: Vec<u16> = detail_str.encode_utf16().collect();
+            let detail_r = if session_supports_action(session, PopupIntent::Acknowledge) {
+                row_action_rect((rl, rt, rr, rb), dpi, PopupIntent::Acknowledge)
+                    .map(|rect| rect.0 - 6.0 * dpi)
+            } else if session_supports_action(session, PopupIntent::Dismiss) {
+                row_action_rect((rl, rt, rr, rb), dpi, PopupIntent::Dismiss)
+                    .map(|rect| rect.0 - 6.0 * dpi)
+            } else {
+                None
+            }
+            .unwrap_or(rr - 10.0 * dpi);
             dc.DrawText(
                 &detail_wide,
                 &state.formats.detail,
                 &D2D_RECT_F {
                     left: text_l,
                     top: rt + 27.0 * dpi,
-                    right: rr - 10.0 * dpi,
+                    right: detail_r.max(text_l + 24.0 * dpi),
                     bottom: rb - 5.0 * dpi,
                 },
                 brush,
                 D2D1_DRAW_TEXT_OPTIONS_CLIP,
                 DWRITE_MEASURING_MODE_NATURAL,
             );
+
+            for (intent, label) in [
+                (PopupIntent::Acknowledge, "知道了"),
+                (PopupIntent::Dismiss, "清除"),
+            ] {
+                if !session_supports_action(session, intent) {
+                    continue;
+                }
+                let Some((al, at, ar, ab)) = row_action_rect((rl, rt, rr, rb), dpi, intent) else {
+                    continue;
+                };
+                let action_hovered = state.hovered_action == Some((idx, intent));
+                let accent = if intent == PopupIntent::Acknowledge {
+                    palette.waiting_rgb
+                } else {
+                    surface.muted_rgb
+                };
+                let fill_alpha = if action_hovered { 0.24 } else { 0.10 };
+                brush.SetColor(&rgba(accent.0, accent.1, accent.2, fill_alpha));
+                dc.FillRoundedRectangle(
+                    &D2D1_ROUNDED_RECT {
+                        rect: D2D_RECT_F {
+                            left: al,
+                            top: at,
+                            right: ar,
+                            bottom: ab,
+                        },
+                        radiusX: 6.0 * dpi,
+                        radiusY: 6.0 * dpi,
+                    },
+                    brush,
+                );
+                brush.SetColor(&rgba(
+                    accent.0,
+                    accent.1,
+                    accent.2,
+                    if action_hovered { 1.0 } else { 0.88 },
+                ));
+                let wide: Vec<u16> = label.encode_utf16().collect();
+                dc.DrawText(
+                    &wide,
+                    &state.formats.footer,
+                    &D2D_RECT_F {
+                        left: al,
+                        top: at,
+                        right: ar,
+                        bottom: ab,
+                    },
+                    brush,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+            }
         }
     }
 
@@ -1167,7 +1322,7 @@ unsafe fn open_all_sessions_menu(
         let state_label = if session.source == SessionSource::Window && session.updated_at == 0 {
             "仅识别窗口"
         } else {
-            session.state.label_zh()
+            session.state.label_en()
         };
         let escaped_title = session.title.replace('&', "&&");
         let label = format!("[{state_label}] {escaped_title}");
@@ -1243,9 +1398,21 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 let x = (lparam.0 & 0xFFFF) as i16 as f32;
                 let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as f32;
                 let hovered = state.layout.row_at(x, y);
+                let hovered_action = session_action_at(
+                    &state.layout,
+                    &state.summary.sessions,
+                    state.scroll_offset,
+                    state.dpi,
+                    x,
+                    y,
+                );
                 let hovered_footer = state.layout.footer_hit(x, y);
-                if hovered != state.hovered_row || hovered_footer != state.hovered_footer {
+                if hovered != state.hovered_row
+                    || hovered_action != state.hovered_action
+                    || hovered_footer != state.hovered_footer
+                {
                     state.hovered_row = hovered;
+                    state.hovered_action = hovered_action;
                     state.hovered_footer = hovered_footer;
                     paint(state);
                 }
@@ -1257,8 +1424,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             if !ptr.is_null() {
                 let state = &mut *ptr;
                 state.tracking_leave = false;
-                let changed = state.hovered_row.take().is_some() || state.hovered_footer;
-                state.hovered_footer = false;
+                let changed = take_hover_flags(
+                    &mut state.hovered_row,
+                    &mut state.hovered_action,
+                    &mut state.hovered_footer,
+                );
                 if changed {
                     paint(state);
                 }
@@ -1314,10 +1484,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                     launch_path,
                     theme,
                     sessions,
+                    versions,
                     visible_rows,
                     scroll_offset,
                     footer_hit,
                     row_hit,
+                    action_hit,
                 ) = {
                     let state = &*ptr;
                     (
@@ -1326,12 +1498,43 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                         state.launch_path.clone(),
                         state.theme,
                         state.summary.sessions.clone(),
+                        state.summary.versions.clone(),
                         state.layout.visible_rows,
                         state.scroll_offset,
                         state.layout.footer_hit(x, y),
                         state.layout.row_at(x, y),
+                        session_action_at(
+                            &state.layout,
+                            &state.summary.sessions,
+                            state.scroll_offset,
+                            state.dpi,
+                            x,
+                            y,
+                        ),
                     )
                 };
+                if let Some((row_idx, intent)) = action_hit {
+                    if let Some(session) = resolve_row_session_index(
+                        sessions.len(),
+                        visible_rows,
+                        scroll_offset,
+                        row_idx,
+                    )
+                    .and_then(|idx| sessions.get(idx))
+                    {
+                        let mut activation = activation_for_session(
+                            &agent_id,
+                            launch_path.as_deref(),
+                            Some(session),
+                        );
+                        activation.intent = intent;
+                        activation.expected_version = versions
+                            .get(&(session.agent.clone(), session.session_id.clone()))
+                            .cloned();
+                        post_activation(owner, activation);
+                        return LRESULT(0);
+                    }
+                }
                 if footer_hit && !sessions.is_empty() {
                     open_all_sessions_menu(
                         hwnd,
@@ -1460,5 +1663,91 @@ mod tests {
         );
         let footer = layout.footer_rect().unwrap();
         assert!(layout.footer_hit((footer.0 + footer.2) * 0.5, (footer.1 + footer.3) * 0.5));
+    }
+
+    fn action_test_session(
+        id: &str,
+        state: AgentState,
+        source: SessionSource,
+    ) -> agent_state::AgentSession {
+        agent_state::AgentSession {
+            agent: "codex".into(),
+            session_id: id.into(),
+            title: id.into(),
+            detail: String::new(),
+            cwd: None,
+            state,
+            hwnd: None,
+            pid: None,
+            deep_link: None,
+            updated_at: 100,
+            source,
+        }
+    }
+
+    #[test]
+    fn action_hit_testing_tracks_scrolled_identity_and_dpi() {
+        let work = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1040,
+        };
+        for dpi in [1.0, 1.5, 2.0] {
+            let sessions: Vec<_> = (0..10)
+                .map(|idx| {
+                    action_test_session(
+                        &format!("s{idx}"),
+                        AgentState::Waiting,
+                        SessionSource::Event,
+                    )
+                })
+                .collect();
+            let layout = compute_layout(sessions.len(), dpi, work, 900, 1000);
+            let scroll = max_scroll_offset(sessions.len(), layout.visible_rows);
+            let row_idx = layout.visible_rows - 1;
+            let row = layout.row_rect(row_idx).unwrap();
+            for intent in [PopupIntent::Acknowledge, PopupIntent::Dismiss] {
+                let rect = row_action_rect(row, dpi, intent).unwrap();
+                assert!(rect.0 >= row.0 && rect.2 <= row.2);
+                assert!(rect.1 >= row.1 && rect.3 <= row.3);
+                let hit = session_action_at(
+                    &layout,
+                    &sessions,
+                    scroll,
+                    dpi,
+                    (rect.0 + rect.2) * 0.5,
+                    (rect.1 + rect.3) * 0.5,
+                );
+                assert_eq!(hit, Some((row_idx, intent)));
+                let session_idx =
+                    resolve_row_session_index(sessions.len(), layout.visible_rows, scroll, row_idx)
+                        .unwrap();
+                assert_eq!(sessions[session_idx].session_id, "s9");
+            }
+        }
+    }
+
+    #[test]
+    fn window_only_and_tiny_rows_do_not_expose_track_b_actions() {
+        let session = action_test_session("hwnd:42", AgentState::Idle, SessionSource::Window);
+        assert!(!session_supports_action(&session, PopupIntent::Acknowledge));
+        assert!(!session_supports_action(&session, PopupIntent::Dismiss));
+        assert_eq!(
+            row_action_rect((10.0, 10.0, 200.0, 40.0), 1.0, PopupIntent::Dismiss),
+            None
+        );
+    }
+
+    #[test]
+    fn hover_leave_clears_row_action_and_footer_without_short_circuit() {
+        let mut row = Some(2);
+        let mut action = Some((2, PopupIntent::Acknowledge));
+        let mut footer = true;
+        assert!(take_hover_flags(&mut row, &mut action, &mut footer));
+        assert_eq!(row, None);
+        assert_eq!(action, None);
+        assert!(!footer);
+        assert!(!take_hover_flags(&mut row, &mut action, &mut footer));
     }
 }

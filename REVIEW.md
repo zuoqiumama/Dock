@@ -2,6 +2,23 @@
 
 本文件只保留**最新有效结论**和必要的历史摘要。下一次审查直接更新对应小节，不再新建日期版审查文档。待办统一进入 `PLAN.md`。
 
+## 当前工作区结论 · 2026-11-18（Agent 历史时间窗与主会话聚合）
+
+- 新增 `agent_history_minutes`，默认 **30 分钟**；「布局与快捷键… → Agent 空闲历史」提供 30 分钟、1 小时、6 小时、24 小时、全部五档，复用预览/取消/保存。仅过期 Track B Idle 被显示筛选，Track A、Running/Error/Waiting 与未读 Done 始终保留；过滤不删除文件、Registry、已读标记或 Tombstone，角标与弹层共用同一摘要。
+- 会话卡右侧改用稳定 `running` / `question` / `error` / `done` / `idle` 与相对时间。设置草稿、默认值、解析/序列化、过期边界、未来时间、全部历史、窗口回退和较新事件重新显示均有回归。
+- DSH 插件按 `origin=subagent` / `delegationDepth` 与 `parentSession` 聚合内部子 Agent 到主会话，保留主标题、session id 与点击目标；用户 fork 不合并，孤儿/循环谱系不发布。此前重复的子 Agent `861fcc16-2775-436c-ad9b-580ca020ace7` 文件已实际清理，主会话仍持续更新。
+- 标题只从首个有意义标题或 `data.source.kind = "user"` 的真实用户消息产生并锁定，子 Agent 报告、后台任务与系统通知不再抢占标题；当前恢复为真实用户标题「另一个agent对你的工作进行了审查，你去看看review并进行修复优化」。旧 Idle 启动恢复不再刷新时间，实测 `Antigravity 免开 TUN 访问研究` 保持原始 `updated_at=1794628457`。
+- 最终 `build.cmd -Verify -Stage` 通过格式、严格 Clippy、**272/272 项 Rust 测试**和 release 构建；DSH **11/11 项 Node 测试**通过。系统 Temp 写入受限时仅将 Node 测试临时目录改到项目 `.dsh/tmp/`，全部测试随后通过。
+- 根目录与暂存 EXE 一致：**1,357,312 bytes / 1326 KiB**，SHA-256 `13C0168ECA44907878F3314069EB635636B0BCB10A7587443DDEFD2A60E06232`。旧版备份位于 `.dsh/tmp/pre-agent-history-20261118-192112/FeatherDock.exe`；新版主进程 PID `37712`、watchdog PID `41900` 均正常响应，最终插件已通过 Desktop 官方 CLI 移除/重装并启用。
+- 时间窗设置与状态文案的实际视觉、五档预览/保存/取消及重启持久化人工验收仍按 `PLAN.md` 保留；本批未新建 Git tag 或 Release。
+
+## 当前工作区结论 · 2026-11-18（远端更新合并后应用运行）
+
+- 已将 `origin/main` 的 `1bbc051..3c68abc` 五个提交快进到本地，保留 Phase 2、DSH 插件与文档改动。`src/render.rs` 采用远端已包含角标动画跟随的新实现，`REVIEW.md` 合并双方验证记录；未创建 Git commit。
+- `build.cmd -Verify -Stage` 的格式、严格 Clippy、**270/270 项测试**与 release 构建全部通过；随后以 `build.cmd -Run` 发布并启动根目录程序。
+- 根目录与暂存 EXE 一致：**1,355,264 bytes / 1324 KiB**，SHA-256 `18862E9DCB9699BBCEDAF7D142C1C5F6F152B78AFA8606590D54C4635389D19A`。旧版已备份到 `.dsh/tmp/pre-apply-20261118-190008/FeatherDock.exe`。
+- 旧主进程 PID `28888` 与 watchdog PID `6712` 已通过 `--quit` 正常退出（命令退出码 `0`）；新版主进程 PID `19112`、watchdog PID `32300` 均从根目录 `FeatherDock.exe` 运行。
+
 ## 当前结论 · 2026-11-18
 
 - Dock 主条的「系统托盘」按钮位于应用溢出与控制中心之间。显式点击由独立线程直接调用 Explorer 的原生隐藏图标按钮。任务栏完全隐藏时保持透明和自动隐藏，跨屏全屏前台阻止触发。
@@ -14,8 +31,36 @@
 - 校验门通过：`cargo fmt --all -- --check`、严格 `cargo clippy --all-targets --locked -- -D warnings`、**260/260 项单元测试**（含新增 `system_buttons_stay_distinct_and_visible_against_dark_and_contrast_backgrounds` 及角标/样式回归）和 `cargo build --release --locked` 均通过。
 - 暂存发布与构建修复说明：已修复 `rustup 1.29` 下 `rust-toolchain.toml` 报 `target tuple in channel name` 的问题（拆分 `channel = "stable"` 与 `targets = ["x86_64-pc-windows-gnu"]`，并在 `scripts/dev-env.ps1` 自动探测已安装的 `stable-x86_64-pc-windows-gnu\bin`、`build.ps1` 在无 `WRITE_OWNER` 时校验进程 `>= Medium` 且文件无 `Low/Untrusted` 标签，`.cargo/gnu-linker.cmd` 增加跨工具链自包含链接器回退）。直接执行 `.\build.cmd -Verify -Stage` 已完整通过并退出码为 `0`，最新产物位于 `outputs\pending\FeatherDock.exe`（**1,345,536 bytes**，SHA-256 `004FEFD3112ADA72072AF56A0FAF22FD592ED0AAEFE6E53D907169952F2C748E`）；因本会话仍处于非交互桌面（`EnumWindows=0`），未替换根目录运行中的 `FeatherDock.exe`，真机交互发布及新样式/角标/系统按钮的桌面视觉验收保留在 `PLAN.md`。
 
-## 历史结论 · 2026-11-17
+## 当前工作区结论 · 2026-11-17（DSH 真实生命周期接入）
 
+- 新增 `examples/agent-adapters/dsh-featherdock/` 原生 Host 插件，直接订阅 DSH `agent/created`、`agent/disposed` 与 `session/event`。`turn/start`、审批、提问、`turn/end` 映射为 Running/Waiting/Done/Error/Idle，不再以窗口识别冒充对话状态。
+- 适配器使用 Dock 原子 JSON 文件通道，无轮询、无子进程、无额外 npm 依赖；包含真实 Host PID、稳定 session id、进程级 instance、单调 seq、每会话串行原子替换和实例隔离清理。7 项 Node 测试覆盖状态映射、公开文本过滤、历史恢复、原子写入、序号递增、热重载实例隔离与卸载清理，全部通过。
+- 插件已通过 Desktop 官方 CLI 安装到当前 `desktop` profile 并启用；profile 原 `package.json`、lockfile 与 `cordis.patch.yml` 已备份到 `.dsh/tmp/dsh-adapter-profile-backup/`。移除/重装也验证了卸载清理和重新接入。
+- 本机当前真实会话 `session-7434043b-339e-4f58-baf9-c46e5ded1a42` 连续产生文件事件：标题为「我发现现在agent似乎只能识别窗口，不能识别在跑对话」，`state=running`，Host PID `30444`；观察到 `seq=4 → 18`，详情由「对话进行中」更新为「执行工具 · read / pwsh」。这证明真实 DSH Running 与持续更新已生效，而非手工测试事件。
+- 标题过滤覆盖时间采样、runtime context、checkpoint、system-reminder 与通用 `dsh` 标题；启动最多读取最近 4096 条事件，长会话已恢复真实用户标题。公开投影不转发推理、请求头、工具参数或原始模型响应。
+- 真实 Waiting、自然 Done/Error、宿主退出清理仍按 `PLAN.md` 验收；当前只宣称 DSH Running 已实测。Antigravity、Codex 的真实生命周期 Hook 尚未接入，没有 Track B 时仍显示「仅识别窗口」。
+- 本批新增插件与文档尚未创建 Git commit 或 Release；根目录 FeatherDock EXE 未因本批重新构建，仍是下方 Phase 2 已验证版本。
+
+## 当前工作区结论 · 2026-11-17（Phase 2 第一批：会话提醒管理）
+
+- 会话卡新增明确操作：Track B 的 Waiting/Done 可点「知道了」，保留 Idle 历史与跳转信息；Track B 会话可点「清除」，Track A 窗口行不提供清除。所有命令关闭卡片后逐项处理，普通点击激活语义不变。
+- Event/File 分别按 `instance + seq + updated_at` 保存已读标记。相同版本重载保持已读，较新 Waiting 或新实例重新提醒；操作命令携带预期版本并由主窗口重校验，避免旧点击误伤同键新状态。Event 已读标记在 Closed、清除、窗口/PID prune 时对称释放。
+- 清除采用 `%LOCALAPPDATA%\FeatherDock\agent-dismissals\*.json` 独立原子标记，不删除生产者 session JSON。主流程先持久化再建立 Closed Tombstone；启动时先于首次文件合流恢复。回归覆盖首载/重启后旧 IPC 与旧文件均不复活、较新事件可重开、延迟旧文件不覆盖新 IPC。写标记失败保留原会话并显示错误。
+- UI 命中覆盖 1x/1.5x/2x DPI、滚动后正确会话、Track A/小行排除；PID 仅在无其他会话使用时 unwatch，旧 queued generation 不影响新监视。此前角标与图标共享动画变换的修复及两项几何回归全部保留。
+- 独立最终复审发现的 hover 清理短路、持久标记读取失败静默失效两项问题已修复。标记目录/条目/单文件读取及格式错误均显式上报，启动在首次合流前可见报错并中止；仅目录 NotFound 视为空。新增真实共享冲突读取失败、损坏标记、同秒 seq 旧点击版本和 hover 清理回归。
+- `build.cmd -Verify -Stage` 通过：格式、严格 Clippy、**261/261 项测试**和 release 构建。根目录与暂存 EXE 均为 **1,323,008 bytes / 1292 KiB**，SHA-256 `350B46CAB1DB6DAFFA0C4F6F23160C184533D89D3367FEDBF224380BB233DAA2`，完整性为 Medium。
+- 本机主程序 PID `28888`、watchdog PID `6712`；真实 `WM_COPYDATA` 的 `phase2-actions-demo` Waiting 注入返回 `0`，供人工点击「知道了」/「清除」与真实重启验收。人工按钮视觉和本机重启持久化结果尚待确认，当前重启证据为确定性 Registry/持久标记回归。
+- 本批与角标补丁均未创建新 Git commit、tag 或 Release；GitHub `v0.1.1` 公开资产仍使用下节原发布哈希。
+
+## 当前工作区结论 · 2026-11-17（角标动画后续补丁）
+
+- 用户实测发现 Agent 事件角标停留在静止坐标，未跟随图标的悬停放大与弹跳。根因是图标使用了 scale/bounce/presence 变换，而角标 pass 重置到 identity 后按 resting baseline 绘制。
+- `src/render.rs` 已抽出共享 `icon_transform`，图标与角标背景统一使用同一放大、弹跳和出现/消失几何；角标文字通过 `badge_text_transform` 将 DPI/文字缩放与图标矩阵组合。普通多窗口数量角标共用该修复。
+- 新增 2 项几何回归，完整 `build.cmd -Verify -Stage` 通过：格式、严格 Clippy、**252/252 项测试**和 release 构建。根目录与暂存 EXE 均为 **1274 KiB**，SHA-256 `2018597EE49B2AE5FECA5D224EF44DC55D605F4BF061BAB0B7FAE76EF72F3100`。
+- 修复版已从根目录启动，主程序 PID `42888`、watchdog PID `15604`；真实 `WM_COPYDATA` Waiting 注入与验收后的 Closed 清理均返回 `0`，测试会话已关闭。角标动画的人工视觉确认尚待用户反馈，不以矩阵测试代替桌面观察。
+- 此后续补丁尚未创建新 Git commit、tag 或 Release；GitHub `v0.1.1` 公开资产仍是下节哈希，不与本机后续补丁混称。
+
+## v0.1.1 发布结论 · 2026-11-17
 - 2026-11-16 独立复审的 5 项问题已全部修复；后续复核发现的稳态 rearm 丢更新窗口及 `Retired None` 跨通道复活路径也已闭合。原问题、修复和证据保留在下节。
 - 最终 `build.cmd -Verify` 通过：格式、严格 Clippy、**250/250 项测试**和 release 构建。包版本已提升为 **v0.1.1**，根目录 EXE 已发布并启动，主程序与 watchdog 均从该文件运行。
 - 最终发布 EXE 为 **1274 KiB / 1,305,088 bytes**，SHA-256 `6DC97F4F4CA491C5A21852C59134DCD3E7CC33A2A3168C1D1B1E7654906C1790`，完整性为 **Medium**。本发布资产以根目录文件为准，早期暂存哈希不是最终发布哈希。

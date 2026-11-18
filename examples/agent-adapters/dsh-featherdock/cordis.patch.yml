@@ -1,0 +1,5 @@
+- insert:
+    - id: featherdock-agent-bridge
+      name: '@local/dsh-featherdock-agent-bridge'
+      config:
+        coalesceMs: 40

@@ -7,6 +7,12 @@ FeatherDock separates Agent recognition into two explicit tiers:
   1. `FeatherDock.exe --agent-event --json <json>`（或 `--agent ... --session ... --state ...`，`WM_COPYDATA` fast path）, or
   2. Atomic JSON session files under `%LOCALAPPDATA%\FeatherDock\agent-sessions\*.json` (`ReadDirectoryChangesW` watcher).
 
+## Real DSH lifecycle plugin
+
+[`dsh-featherdock/`](dsh-featherdock/) is a native DSH Host plugin, not a window-title scraper. It subscribes to `session/event` and publishes `turn/start`, approvals, questions and `turn/end` through the atomic JSON channel. It is event-driven, has no polling or child processes, and uses stable session IDs, monotonic sequences and the real Host PID.
+
+Install `dsh-featherdock/` through DSH Plugins → Add plugin → Install third-party plugin, or with the Desktop CLI documented in its README. After installation, a real DSH conversation should show Running automatically; approvals/questions show Waiting and completion shows Done. Internal subagents roll up into their top-level conversation instead of creating duplicate rows; user-created forks remain independent. Codex and Antigravity still use their separate adapter paths below until their real hooks are installed.
+
 ## Quick Usage
 
 ### 1. Push a live event via CLI (`WM_COPYDATA`)

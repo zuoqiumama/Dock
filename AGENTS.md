@@ -34,6 +34,8 @@ FeatherDock 是 Windows 10+ 的轻量原生 Dock：
 - 文件夹 Stack、DWM 窗口预览、分页控制中心、五种主题、布局预览/保存/取消恢复。
 - WindowsApps/快捷方式/AppUserModelID 等应用身份匹配，以及全屏边缘 1 物理像素容差。
 - Agentic Dock Phase 1 的主体实现：Agent 分区、状态聚合、会话卡、事件协议和生命周期保护。
+- Phase 2 第一批会话提醒管理：Waiting/Done「知道了」、Track B 会话「清除」、版本级已读和持久清除标记。
+- DSH 原生生命周期适配器：独立 Host 插件直接订阅 `session/event`，真实 Running 已在本机当前对话验证；Antigravity/Codex 仍保留在待接入清单。
 
 历史调研中的「全部应用」「视觉文件夹面板」「完整 UIA provider」「每屏独立 Dock」「媒体控制」仍属于后续增量，不要误写为现有能力。
 
@@ -94,6 +96,28 @@ Waiting > Error > Running > Done > Idle
 - 接收和激活外部 HWND 时都校验窗口、PID/进程实例与 Agent 身份；失败时回退到可信窗口。
 - 会话卡按工作区和 DPI 计算可见行数；超出可见范围的项目必须能通过滚动或「查看全部」到达。
 - 指针离开 Dock 与卡片后，经短暂宽限关闭卡片；不为离开检测增加常驻轮询。
+
+### 3.5 Phase 2 第一批：会话提醒管理
+
+- Track B 的 `Waiting`、`Done` 会话提供「知道了」：按通道记录当前 `instance + seq + updated_at` 的已读标记，会话转为 Idle 历史行但保留标题、详情和跳转信息。同版本 IPC/文件重载不复活提醒；较新版本或新实例重新提醒。普通点击激活仍沿用原精确消警语义。
+- Track B 会话提供「清除」；Track A「仅识别窗口」不提供该操作。清除命令携带卡片中的预期版本，主窗口处理前重新校验，旧点击不得清除同键新版本。
+- 清除先在 `%LOCALAPPDATA%\FeatherDock\agent-dismissals\*.json` 原子保存用户清除标记，再建立 Closed Tombstone 并清理双通道；不得删除或改写生产者的 session JSON。标记写入失败时保留会话并显示错误。重启时先于首次文件合流恢复标记，真正较新的协议事件仍可重新建立会话；标记目录/文件读取或格式错误必须显式报错并中止该次启动，只有目录 NotFound 才视为空。
+- 所有卡片命令处理后关闭卡片，保持单条在途命令不变量。PID 监视仅在没有其他会话使用该 PID 时释放；旧代际已排队退出不得影响同数值 PID 的新监视。
+
+### 3.6 DSH 原生生命周期适配器
+
+- `examples/agent-adapters/dsh-featherdock/` 是独立 DSH Host 插件，通过 `agent/created`、`agent/disposed`、`session/event` 获取权威状态，不读取窗口标题或猜测进度。
+- `turn/start` 映射 Running；`approval/asked` 和 `ask_user_question` 映射 Waiting；审批/问题结果恢复 Running；`turn/end` 按 completed/error/blocked/取消映射 Done/Error/Waiting/Idle，销毁清理会话。
+- 使用 `%LOCALAPPDATA%\FeatherDock\agent-sessions\` 原子 JSON 通道，事件驱动且没有轮询或子进程。每个会话保留稳定 session id、单调 seq、插件实例 instance 和真实 Host pid；卸载只清理仍属于本实例的文件。
+- 标题仅使用首个真实用户文本（有来源元数据时必须 `data.source.kind = "user"`）或有意义的 Session 标题，过滤时间采样、runtime context、checkpoint、system-reminder、子 Agent/后台任务通知和通用 `dsh` 标题。首个有效标题锁定后，后续自动标题不得覆盖；启动历史投影最多 4096 条，不转发推理块、请求头、工具参数或原始模型响应。
+- DSH 已接入不代表其它 Agent 已接入；Antigravity、Codex 未发送 Track B 时仍必须显示「仅识别窗口」。
+- DSH 内部子 Agent 依据 `origin = "subagent"` / `delegationDepth` 和 `parentSession` 归属到存活的顶层主会话，只发布一行；聚合状态不得覆盖主会话的标题、session id 或跳转目标。多级子任务可向上聚合，孤儿/循环谱系不得冒充主会话；用户主动 fork 的独立会话不按 `parentSession` 单独合并。启动恢复不得把旧 Idle 的 `updated_at` 刷新为当前时间。
+
+### 3.7 会话历史时间窗与状态文案
+
+- `agent_history_minutes` 默认 `30`，设置页的「布局与快捷键…→ Agent 空闲历史」提供 30 分钟、1 小时、6 小时、24 小时、全部五档，沿用预览、取消和保存草稿路由；`0` 表示全部历史，手写配置允许最多 7 天。
+- 时间窗只是摘要与弹层的显示筛选，不删除生产者文件、Registry 会话、已读标记或 Tombstone，也不新增轮询。仅过期 Track B `Idle` 被收起；Track A 窗口、`Running`、`Error`、`Waiting` 和未读 `Done` 始终保留，较新事件必须能重新显示原会话。
+- 角标、会话卡、总数与操作版本来自同一份过滤后摘要，隐藏行不得继续计数或接收旧点击。会话卡右侧使用稳定状态文案 `running`、`question`、`error`、`done`、`idle` 和相对时间；`Waiting` 的展示文案为 `question`。
 
 ## 4. 后续产品方向（只保留确认过的优先级）
 

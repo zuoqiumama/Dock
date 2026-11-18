@@ -1379,6 +1379,22 @@ fn run() -> Result<()> {
         let running = windows_list::enumerate_sorted();
         let dock_settings = settings::load();
         let mut agent_registry = agent_state::AgentRegistry::default();
+        agent_registry.set_history_window(dock_settings.agent_history_window_secs());
+        let restored_dismissals = match agent_state::load_session_dismissals() {
+            Ok(records) => records,
+            Err(error) => {
+                show_error(
+                    HWND::default(),
+                    "读取会话清除标记失败，本次启动已中止以避免旧会话复活",
+                    &error,
+                );
+                return Err(Error::new(
+                    HRESULT_CANCELLED,
+                    "session dismissal restore failed",
+                ));
+            }
+        };
+        agent_registry.restore_dismissals(restored_dismissals);
         let session_dir = agent_state::sessions_dir();
         let _ = std::fs::create_dir_all(&session_dir);
         let initial_snapshot =
@@ -2428,6 +2444,58 @@ unsafe fn refresh_agent_views(
 }
 
 unsafe fn activate_popup_session(hwnd: HWND, app: &mut App, act: agent_popup::PopupActivation) {
+    if act.intent != agent_popup::PopupIntent::Activate {
+        let Some(session_id) = act.session_id.as_deref() else {
+            return;
+        };
+        let Some(expected) = act.expected_version.as_ref() else {
+            return;
+        };
+        if app
+            .agent_registry
+            .session_version(&act.agent_id, session_id)
+            .as_ref()
+            != Some(expected)
+        {
+            // The card referred to an older version. Do not let a delayed click
+            // acknowledge or dismiss a newer producer state with the same key.
+            return;
+        }
+        match act.intent {
+            agent_popup::PopupIntent::Acknowledge => {
+                if app
+                    .agent_registry
+                    .acknowledge_session(&act.agent_id, session_id)
+                {
+                    refresh_agent_views(hwnd, app, &[], Vec::new(), None);
+                }
+            }
+            agent_popup::PopupIntent::Dismiss => {
+                let Some(record) = app
+                    .agent_registry
+                    .dismissal_record(&act.agent_id, session_id)
+                else {
+                    return;
+                };
+                if let Err(error) = agent_state::persist_session_dismissal(&record) {
+                    show_error(hwnd, "保存会话清除标记失败", error);
+                    return;
+                }
+                let (changed, released_pids) = app
+                    .agent_registry
+                    .dismiss_session(&act.agent_id, session_id);
+                for pid in released_pids {
+                    app.agent_pids.unwatch(pid);
+                }
+                if changed {
+                    refresh_agent_views(hwnd, app, &[], Vec::new(), None);
+                }
+            }
+            agent_popup::PopupIntent::Activate => unreachable!(),
+        }
+        return;
+    }
+
     let changed = if let Some(sid) = act.session_id.as_deref() {
         app.agent_registry.mark_session_read(&act.agent_id, sid)
     } else {
@@ -2552,6 +2620,8 @@ unsafe fn execute_agent_click_for_item(
                         pid: session.pid,
                         deep_link: session.deep_link.clone(),
                         launch_path: item.path.clone(),
+                        intent: agent_popup::PopupIntent::Activate,
+                        expected_version: None,
                     },
                 );
             }
@@ -3706,6 +3776,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                     return LRESULT(0);
                 }
                 app.settings = settings;
+                app.agent_registry
+                    .set_history_window(app.settings.agent_history_window_secs());
                 app.dock.theme = app.settings.effective_theme();
                 app.dock.style = app.settings.dock_style;
                 app.dock.preferences = app.settings.layout;
@@ -3775,6 +3847,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 // rebuild the dock.
                 app.saved_settings = settings::load();
                 app.settings = preferences::merge_preview(app.saved_settings, app.settings);
+                app.agent_registry
+                    .set_history_window(app.settings.agent_history_window_secs());
                 app.dock.theme = app.settings.effective_theme();
                 app.dock.style = app.settings.dock_style;
                 app.dock.preferences = app.settings.layout;

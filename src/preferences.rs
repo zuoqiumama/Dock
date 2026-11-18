@@ -42,7 +42,7 @@ fn choices(values: &[u32], suffix: &str) -> Vec<(u32, String)> {
         .map(|v| (*v, format!("{v}{suffix}")))
         .collect()
 }
-fn current(settings: Settings) -> [u32; 10] {
+fn current(settings: Settings) -> [u32; 11] {
     [
         settings.layout.icon_size,
         settings.layout.magnification,
@@ -54,9 +54,10 @@ fn current(settings: Settings) -> [u32; 10] {
         u32::from(settings.follow_system),
         u32::from(settings.layout.reduce_motion),
         u32::from(settings.intellihide),
+        settings.agent_history_minutes,
     ]
 }
-fn apply(mut settings: Settings, values: [u32; 10]) -> Settings {
+fn apply(mut settings: Settings, values: [u32; 11]) -> Settings {
     settings.layout.icon_size = values[0];
     settings.layout.magnification = values[1];
     settings.layout.bottom_gap = values[2];
@@ -67,6 +68,7 @@ fn apply(mut settings: Settings, values: [u32; 10]) -> Settings {
     settings.follow_system = values[7] != 0;
     settings.layout.reduce_motion = values[8] != 0;
     settings.intellihide = values[9] != 0;
+    settings.agent_history_minutes = values[10];
     settings
 }
 
@@ -76,6 +78,7 @@ pub fn merge_preview(mut committed: Settings, preview: Settings) -> Settings {
     committed.search_hotkey = preview.search_hotkey;
     committed.follow_system = preview.follow_system;
     committed.intellihide = preview.intellihide;
+    committed.agent_history_minutes = preview.agent_history_minutes;
     committed
 }
 
@@ -154,10 +157,10 @@ pub unsafe fn show(owner: HWND, dock: HWND, settings: Settings) {
     let area = crate::geometry::work_area(bounds.left, bounds.top);
     let dpi = GetDpiForWindow(owner).max(96) as f32 / 96.0;
     let scale = dpi
-        .min((area.bottom - area.top - 48).max(1) as f32 / 550.0)
+        .min((area.bottom - area.top - 48).max(1) as f32 / 586.0)
         .min((area.right - area.left - 24).max(1) as f32 / 450.0);
     let width = (450.0 * scale) as i32;
-    let height = (550.0 * scale) as i32;
+    let height = (586.0 * scale) as i32;
     let x = crate::geometry::fit_axis(bounds.left, width, area.left, area.right, 8);
     let y = crate::geometry::fit_axis(bounds.top, height, area.top, area.bottom, 8);
     let Ok(hwnd) = CreateWindowExW(
@@ -245,6 +248,16 @@ pub unsafe fn show(owner: HWND, dock: HWND, settings: Settings) {
             label: "仅在窗口重叠时避让",
             choices: bools(),
         },
+        Field {
+            label: "Agent 空闲历史",
+            choices: vec![
+                (30, "最近 30 分钟".into()),
+                (60, "最近 1 小时".into()),
+                (360, "最近 6 小时".into()),
+                (1440, "最近 24 小时".into()),
+                (0, "全部历史".into()),
+            ],
+        },
     ];
     let values = current(settings);
     let mut controls = Vec::new();
@@ -302,7 +315,7 @@ pub unsafe fn show(owner: HWND, dock: HWND, settings: Settings) {
         },
         0,
         0,
-        (16, 382, 408, 48),
+        (16, 418, 408, 48),
         scale,
         font,
     );
@@ -312,7 +325,7 @@ pub unsafe fn show(owner: HWND, dock: HWND, settings: Settings) {
         "预览",
         BS_PUSHBUTTON as u32,
         201,
-        (16, 450, 90, 28),
+        (16, 486, 90, 28),
         scale,
         font,
     );
@@ -322,7 +335,7 @@ pub unsafe fn show(owner: HWND, dock: HWND, settings: Settings) {
         "恢复默认",
         BS_PUSHBUTTON as u32,
         204,
-        (114, 450, 90, 28),
+        (114, 486, 90, 28),
         scale,
         font,
     );
@@ -332,7 +345,7 @@ pub unsafe fn show(owner: HWND, dock: HWND, settings: Settings) {
         "保存",
         BS_DEFPUSHBUTTON as u32,
         202,
-        (236, 450, 90, 28),
+        (236, 486, 90, 28),
         scale,
         font,
     );
@@ -342,7 +355,7 @@ pub unsafe fn show(owner: HWND, dock: HWND, settings: Settings) {
         "取消",
         BS_PUSHBUTTON as u32,
         203,
-        (334, 450, 90, 28),
+        (334, 486, 90, 28),
         scale,
         font,
     );
@@ -500,11 +513,14 @@ mod tests {
         let mut values = current(original);
         values[0] = 64;
         values[6] = 0;
+        values[10] = 1440;
         let draft = apply(original, values);
         assert_eq!(draft.layout.icon_size, 64);
         assert_eq!(draft.search_hotkey, 0);
+        assert_eq!(draft.agent_history_minutes, 1440);
         assert!(draft.hide_desktop_icons);
         assert_eq!(original.layout.icon_size, 50);
+        assert_eq!(original.agent_history_minutes, 30);
     }
 
     #[test]
@@ -516,6 +532,7 @@ mod tests {
         };
         let mut values = current(preview);
         values[0] = 72;
+        values[10] = 60;
         let preview = apply(preview, values);
         let committed = Settings {
             dock_mode: crate::settings::DockMode::AutoHide,
@@ -524,10 +541,12 @@ mod tests {
 
         let effective = merge_preview(committed, preview);
         assert_eq!(effective.layout.icon_size, 72);
+        assert_eq!(effective.agent_history_minutes, 60);
         assert_eq!(effective.dock_mode, crate::settings::DockMode::AutoHide);
 
         let canceled = merge_preview(committed, original);
         assert_eq!(canceled.layout.icon_size, 50);
+        assert_eq!(canceled.agent_history_minutes, 30);
         assert_eq!(canceled.dock_mode, crate::settings::DockMode::AutoHide);
     }
 }

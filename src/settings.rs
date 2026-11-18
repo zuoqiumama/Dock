@@ -119,9 +119,16 @@ pub struct Settings {
     pub agent_shimmer: bool,
     /// Single light bounce when an Agent session newly enters Waiting (suppressed when fullscreen).
     pub agent_bounce_waiting: bool,
+    /// How long idle Track B history remains visible. Zero keeps all history;
+    /// active sessions, unread Done reminders and Track A windows are never hidden.
+    pub agent_history_minutes: u32,
 }
 
 impl Settings {
+    pub fn agent_history_window_secs(&self) -> Option<u64> {
+        (self.agent_history_minutes > 0).then(|| u64::from(self.agent_history_minutes) * 60)
+    }
+
     pub fn effective_theme(&self) -> ThemePreset {
         if !self.follow_system {
             return self.theme;
@@ -168,6 +175,7 @@ impl Default for Settings {
             agent_zone_enabled: true,
             agent_shimmer: true,
             agent_bounce_waiting: true,
+            agent_history_minutes: 30,
         }
     }
 }
@@ -186,6 +194,7 @@ const HEADER: &str = "\
 # agent_zone_enabled = true | false  (group AI agents in the right-side Agent zone)
 # agent_shimmer = true | false       (faint slow shimmer on active Running agent icons)
 # agent_bounce_waiting = true | false (single gentle hop when an agent enters Waiting)
+# agent_history_minutes = 30         (idle history window; 0 = unlimited; active/Done always shown)
 ";
 
 fn settings_path() -> PathBuf {
@@ -298,6 +307,11 @@ fn parse_line_into(settings: &mut Settings, line: &str) {
         "agent_bounce_waiting" => {
             settings.agent_bounce_waiting = value.eq_ignore_ascii_case("true");
         }
+        "agent_history_minutes" => {
+            if let Some(v) = number(0, 10_080) {
+                settings.agent_history_minutes = v;
+            }
+        }
         _ => {}
     }
 }
@@ -317,8 +331,11 @@ pub fn save(settings: &Settings) -> io::Result<()> {
         settings.dock_style.as_str()
     );
     body.push_str(&format!(
-        "agent_zone_enabled = {}\nagent_shimmer = {}\nagent_bounce_waiting = {}\n",
-        settings.agent_zone_enabled, settings.agent_shimmer, settings.agent_bounce_waiting
+        "agent_zone_enabled = {}\nagent_shimmer = {}\nagent_bounce_waiting = {}\nagent_history_minutes = {}\n",
+        settings.agent_zone_enabled,
+        settings.agent_shimmer,
+        settings.agent_bounce_waiting,
+        settings.agent_history_minutes
     ));
     body.push_str(&format!("icon_size = {}\nmagnification = {}\nbottom_gap = {}\nopacity = {}\npreview_delay_ms = {}\nreduce_motion = {}\nmonitor = {}\nsearch_hotkey = {}\nfollow_system = {}\nintellihide = {}\n",settings.layout.icon_size,settings.layout.magnification,settings.layout.bottom_gap,settings.layout.opacity,settings.layout.preview_delay_ms,settings.layout.reduce_motion,settings.monitor,settings.search_hotkey,settings.follow_system,settings.intellihide));
     crate::atomic::write(&path, body.as_bytes())
@@ -408,6 +425,8 @@ mod layout_settings_regression_tests {
         assert!(s.agent_zone_enabled);
         assert!(s.agent_shimmer);
         assert!(s.agent_bounce_waiting);
+        assert_eq!(s.agent_history_minutes, 30);
+        assert_eq!(s.agent_history_window_secs(), Some(1_800));
     }
 
     #[test]
@@ -422,5 +441,15 @@ mod layout_settings_regression_tests {
         assert!(!s.agent_zone_enabled);
         assert!(!s.agent_shimmer);
         assert!(!s.agent_bounce_waiting);
+
+        parse_line_into(&mut s, "agent_history_minutes = 1440");
+        assert_eq!(s.agent_history_minutes, 1440);
+        assert_eq!(s.agent_history_window_secs(), Some(86_400));
+        parse_line_into(&mut s, "agent_history_minutes = 0");
+        assert_eq!(s.agent_history_window_secs(), None);
+        parse_line_into(&mut s, "agent_history_minutes = 999999");
+        assert_eq!(s.agent_history_minutes, 10_080);
+        parse_line_into(&mut s, "agent_history_minutes = invalid");
+        assert_eq!(s.agent_history_minutes, 10_080);
     }
 }

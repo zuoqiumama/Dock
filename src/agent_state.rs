@@ -84,6 +84,18 @@ impl AgentState {
             AgentState::Idle => "空闲",
         }
     }
+
+    /// Stable lifecycle wording for the session card; Waiting is phrased as a
+    /// question because it needs a user answer or approval rather than CPU work.
+    pub fn label_en(self) -> &'static str {
+        match self {
+            AgentState::Waiting => "question",
+            AgentState::Error => "error",
+            AgentState::Running => "running",
+            AgentState::Done => "done",
+            AgentState::Idle => "idle",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,6 +165,20 @@ pub struct AgentEventPayload {
     pub updated_at: Option<u64>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionVersion {
+    pub instance: Option<String>,
+    pub seq: u64,
+    pub updated_at: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionDismissal {
+    pub agent: String,
+    pub session_id: String,
+    pub version: SessionVersion,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentDockSummary {
     pub agent_id: String,
@@ -165,6 +191,7 @@ pub struct AgentDockSummary {
     pub done_count: usize,
     pub badge_text: Option<String>,
     pub sessions: Vec<AgentSession>,
+    pub versions: HashMap<(String, String), SessionVersion>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -267,8 +294,12 @@ struct DeadHwndRecord {
 
 #[derive(Default)]
 pub struct AgentRegistry {
+    /// Presentation-only cutoff for idle history. `None` means unlimited; the
+    /// stored sessions and lifecycle tombstones are never pruned by this setting.
+    history_window_secs: Option<u64>,
     event_sessions: Vec<AgentSession>,
     file_sessions: Vec<AgentSession>,
+    read_event_versions: HashMap<(String, String), VersionStamp>,
     read_file_versions: HashMap<(String, String), VersionStamp>,
     waiting_bounce_acked: HashSet<(String, String)>,
     event_versions: HashMap<(String, String), VersionStamp>,
@@ -318,6 +349,14 @@ fn file_read_marker_covers(read: &VersionStamp, incoming: &VersionStamp) -> bool
     // A read marker belongs to one producer instance. Within that instance use the
     // same seq-first ordering as live events; a different instance is always unread.
     read.instance == incoming.instance && !is_older_stamp(incoming, read)
+}
+
+fn public_version(stamp: &VersionStamp) -> SessionVersion {
+    SessionVersion {
+        instance: stamp.instance.clone(),
+        seq: stamp.seq,
+        updated_at: stamp.updated_at,
+    }
 }
 
 fn newest_channel_stamp<'a>(file: &'a VersionStamp, event: &'a VersionStamp) -> &'a VersionStamp {
@@ -444,6 +483,53 @@ impl AgentRegistry {
             (Some(file), Some(event)) => Some(newest_channel_stamp(&file, &event).clone()),
             (Some(stamp), None) | (None, Some(stamp)) => Some(stamp),
             (None, None) => None,
+        }
+    }
+
+    pub fn session_version(&self, agent_id: &str, session_id: &str) -> Option<SessionVersion> {
+        self.latest_stamp(&(agent_id.to_string(), session_id.to_string()))
+            .as_ref()
+            .map(public_version)
+    }
+
+    pub fn dismissal_record(&self, agent_id: &str, session_id: &str) -> Option<SessionDismissal> {
+        Some(SessionDismissal {
+            agent: agent_id.to_string(),
+            session_id: session_id.to_string(),
+            version: self.session_version(agent_id, session_id)?,
+        })
+    }
+
+    /// Restore only user-initiated dismissals. Lifecycle tombstones remain
+    /// runtime observations; these small persisted records cover Dock restarts.
+    pub fn restore_dismissals(&mut self, records: Vec<SessionDismissal>) {
+        for record in records {
+            let Some(agent) = normalize_agent_id(&record.agent) else {
+                continue;
+            };
+            let Some(session_id) = sanitize_id(&record.session_id, MAX_ID_CHARS) else {
+                continue;
+            };
+            let instance = record
+                .version
+                .instance
+                .as_deref()
+                .and_then(sanitize_instance);
+            self.insert_tombstone(
+                (agent, session_id),
+                SessionTombstone {
+                    stamp: VersionStamp {
+                        updated_at: record.version.updated_at,
+                        seq: record.version.seq,
+                        instance,
+                        pid: None,
+                        proc_start: None,
+                        watch_generation: None,
+                        proc_bind_version: None,
+                    },
+                    kind: TombstoneKind::Closed,
+                },
+            );
         }
     }
 
@@ -642,6 +728,7 @@ impl AgentRegistry {
                 .retain(|s| s.agent != agent || s.session_id != session_id);
             self.event_versions.remove(&key);
             self.file_versions.remove(&key);
+            self.read_event_versions.remove(&key);
             self.read_file_versions.remove(&key);
             self.waiting_bounce_acked.remove(&key);
             self.dead_hwnds.remove(&key);
@@ -661,8 +748,18 @@ impl AgentRegistry {
         }
         let session_hwnd = payload_hwnd.or_else(|| prev.as_ref().and_then(|p| p.hwnd));
         let session_fg = is_session_foreground(&agent, session_hwnd, foreground_hwnd, fg_agents);
-        if state == AgentState::Done && session_fg {
-            state = AgentState::Idle;
+        if matches!(state, AgentState::Done | AgentState::Waiting) {
+            let already_read = self
+                .read_event_versions
+                .get(&key)
+                .is_some_and(|read| file_read_marker_covers(read, &incoming_stamp));
+            if already_read || (state == AgentState::Done && session_fg) {
+                state = AgentState::Idle;
+                self.read_event_versions
+                    .insert(key.clone(), incoming_stamp.clone());
+            }
+        } else {
+            self.read_event_versions.remove(&key);
         }
         if state != AgentState::Waiting {
             self.waiting_bounce_acked.remove(&key);
@@ -903,12 +1000,15 @@ impl AgentRegistry {
 
             let session_fg =
                 is_session_foreground(&session.agent, session.hwnd, foreground_hwnd, fg_agents);
-            if session.state == AgentState::Done {
+            if matches!(session.state, AgentState::Done | AgentState::Waiting) {
                 let already_read = self
                     .read_file_versions
                     .get(&key)
                     .is_some_and(|read| file_read_marker_covers(read, &stamp));
-                if already_read || (session_fg && prev.is_none_or(|p| p.state != AgentState::Done))
+                if already_read
+                    || (session.state == AgentState::Done
+                        && session_fg
+                        && prev.is_none_or(|p| p.state != AgentState::Done))
                 {
                     session.state = AgentState::Idle;
                     self.read_file_versions.insert(key.clone(), stamp.clone());
@@ -1067,6 +1167,101 @@ impl AgentRegistry {
         changed
     }
 
+    /// Explicitly acknowledge the current Waiting/Done notification while
+    /// retaining its session as an Idle history row. Read markers are scoped to
+    /// each producer version, so a newer Waiting event or a new instance alerts
+    /// again, while an unchanged IPC packet or file reload stays acknowledged.
+    pub fn acknowledge_session(&mut self, agent_id: &str, session_id: &str) -> bool {
+        let mut changed = false;
+        let key = (agent_id.to_string(), session_id.to_string());
+        for session in &mut self.event_sessions {
+            if session.agent == agent_id
+                && session.session_id == session_id
+                && matches!(session.state, AgentState::Waiting | AgentState::Done)
+            {
+                let stamp = self
+                    .event_versions
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| Self::session_stamp(session, None));
+                session.state = AgentState::Idle;
+                self.read_event_versions.insert(key.clone(), stamp);
+                self.waiting_bounce_acked.remove(&key);
+                changed = true;
+            }
+        }
+        for session in &mut self.file_sessions {
+            if session.agent == agent_id
+                && session.session_id == session_id
+                && matches!(session.state, AgentState::Waiting | AgentState::Done)
+            {
+                let stamp = self
+                    .file_versions
+                    .get(&key)
+                    .cloned()
+                    .unwrap_or_else(|| Self::session_stamp(session, None));
+                session.state = AgentState::Idle;
+                self.read_file_versions.insert(key.clone(), stamp);
+                self.waiting_bounce_acked.remove(&key);
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Remove a Track B session locally and protect the dismissal with the
+    /// latest observed version. Returns PIDs that no remaining session uses,
+    /// allowing the caller to release their OS wait registrations as well.
+    pub fn dismiss_session(&mut self, agent_id: &str, session_id: &str) -> (bool, Vec<u32>) {
+        let key = (agent_id.to_string(), session_id.to_string());
+        let Some(stamp) = self.latest_stamp(&key) else {
+            return (false, Vec::new());
+        };
+        let watched_pids: HashSet<u32> = self
+            .event_sessions
+            .iter()
+            .chain(self.file_sessions.iter())
+            .filter(|session| session.agent == agent_id && session.session_id == session_id)
+            .filter_map(|session| session.pid)
+            .filter(|&pid| pid != 0)
+            .collect();
+        self.insert_tombstone(
+            key.clone(),
+            SessionTombstone {
+                stamp,
+                kind: TombstoneKind::Closed,
+            },
+        );
+        let before_event = self.event_sessions.len();
+        let before_file = self.file_sessions.len();
+        self.event_sessions
+            .retain(|session| session.agent != agent_id || session.session_id != session_id);
+        self.file_sessions
+            .retain(|session| session.agent != agent_id || session.session_id != session_id);
+        self.event_versions.remove(&key);
+        self.file_versions.remove(&key);
+        self.read_event_versions.remove(&key);
+        self.read_file_versions.remove(&key);
+        self.waiting_bounce_acked.remove(&key);
+        self.dead_hwnds.remove(&key);
+
+        let mut released_pids: Vec<u32> = watched_pids
+            .into_iter()
+            .filter(|pid| {
+                !self
+                    .event_sessions
+                    .iter()
+                    .chain(self.file_sessions.iter())
+                    .any(|session| session.pid == Some(*pid))
+            })
+            .collect();
+        released_pids.sort_unstable();
+        (
+            self.event_sessions.len() != before_event || self.file_sessions.len() != before_file,
+            released_pids,
+        )
+    }
+
     pub fn prune_dead_windows<F>(&mut self, mut is_alive: F) -> bool
     where
         F: FnMut(isize) -> bool,
@@ -1129,6 +1324,7 @@ impl AgentRegistry {
                 self.file_versions.remove(&key);
             }
             if !event_alive {
+                self.read_event_versions.remove(&key);
                 self.event_versions.remove(&key);
             }
             self.insert_tombstone(
@@ -1218,6 +1414,7 @@ impl AgentRegistry {
                 self.file_versions.remove(&key);
             }
             if !event_alive {
+                self.read_event_versions.remove(&key);
                 self.event_versions.remove(&key);
             }
             self.insert_tombstone(
@@ -1229,6 +1426,12 @@ impl AgentRegistry {
             );
         }
         changed
+    }
+
+    /// Set the presentation-only cutoff for idle history. Active sessions,
+    /// unread completion reminders and Track A windows are always visible.
+    pub fn set_history_window(&mut self, history_window_secs: Option<u64>) {
+        self.history_window_secs = history_window_secs;
     }
 
     /// Agent IDs that currently have active Track B sessions (`state != Idle` or non-empty)
@@ -1277,6 +1480,29 @@ impl AgentRegistry {
                 merged.push((session.clone(), stamp));
             }
         }
+
+        // Keep lifecycle storage intact while hiding only stale idle history from
+        // summaries, badges and popup actions. A later event can make the same
+        // session visible again without resurrecting a dismissed/closed identity.
+        if let Some(window_secs) = self.history_window_secs {
+            let now = now_unix_secs();
+            merged.retain(|(session, _)| {
+                session.source == SessionSource::Window
+                    || session.state != AgentState::Idle
+                    || session.updated_at == 0
+                    || now.saturating_sub(session.updated_at) <= window_secs
+            });
+        }
+
+        let versions = merged
+            .iter()
+            .map(|(session, stamp)| {
+                (
+                    (session.agent.clone(), session.session_id.clone()),
+                    public_version(stamp),
+                )
+            })
+            .collect();
         let mut merged: Vec<AgentSession> =
             merged.into_iter().map(|(session, _)| session).collect();
 
@@ -1380,6 +1606,7 @@ impl AgentRegistry {
             done_count,
             badge_text,
             sessions: merged,
+            versions,
         }
     }
 }
@@ -1784,6 +2011,121 @@ fn escape_json_into(out: &mut String, s: &str) {
             c => out.push(c),
         }
     }
+}
+
+fn dismissals_dir() -> PathBuf {
+    sessions_dir()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("agent-dismissals")
+}
+
+fn dismissal_path_from_dir(dir: &Path, agent_id: &str, session_id: &str) -> PathBuf {
+    let key = format!("{agent_id}\0{session_id}");
+    dir.join(format!("{}.json", crate::atomic::hash_hex(&key)))
+}
+
+fn dismissal_json(record: &SessionDismissal) -> String {
+    serialize_event_json_with_meta(
+        &AgentEventPayload {
+            agent: record.agent.clone(),
+            session_id: record.session_id.clone(),
+            title: None,
+            detail: None,
+            cwd: None,
+            state: ParsedEventState::Closed,
+            hwnd: None,
+            pid: None,
+            deep_link: None,
+            updated_at: Some(record.version.updated_at),
+        },
+        &EventMeta {
+            instance: record.version.instance.clone(),
+            seq: Some(record.version.seq),
+        },
+    )
+}
+
+/// Persist a user dismissal outside the producer-watched session directory.
+/// Atomic replacement prevents half-written markers and the producer can keep
+/// updating its own JSON without a delete/rename race.
+pub fn persist_session_dismissal(record: &SessionDismissal) -> std::io::Result<()> {
+    let dir = dismissals_dir();
+    let path = dismissal_path_from_dir(&dir, &record.agent, &record.session_id);
+    crate::atomic::write(&path, dismissal_json(record).as_bytes())
+}
+
+fn load_session_dismissals_from_dir(dir: &Path) -> std::io::Result<Vec<SessionDismissal>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut records = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_none_or(|extension| !extension.eq_ignore_ascii_case("json"))
+        {
+            continue;
+        }
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() || metadata.len() > MAX_PAYLOAD_BYTES as u64 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid dismissal marker: {}", path.display()),
+            ));
+        }
+        let text = fs::read_to_string(&path)?;
+        let invalid = || {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid dismissal marker: {}", path.display()),
+            )
+        };
+        let Some((payload, meta)) = parse_agent_event_json_with_meta(&text) else {
+            return Err(invalid());
+        };
+        if payload.state != ParsedEventState::Closed {
+            return Err(invalid());
+        }
+        let Some(agent) = normalize_agent_id(&payload.agent) else {
+            return Err(invalid());
+        };
+        let Some(session_id) = sanitize_id(&payload.session_id, MAX_ID_CHARS) else {
+            return Err(invalid());
+        };
+        let Some(updated_at) = payload.updated_at else {
+            return Err(invalid());
+        };
+        let Some(seq) = meta.seq else {
+            return Err(invalid());
+        };
+        let instance = match meta.instance {
+            Some(value) => Some(sanitize_instance(&value).ok_or_else(invalid)?),
+            None => None,
+        };
+        if dismissal_path_from_dir(dir, &agent, &session_id) != path {
+            return Err(invalid());
+        }
+        records.push(SessionDismissal {
+            agent,
+            session_id,
+            version: SessionVersion {
+                instance,
+                seq,
+                updated_at,
+            },
+        });
+    }
+    Ok(records)
+}
+
+pub fn load_session_dismissals() -> std::io::Result<Vec<SessionDismissal>> {
+    load_session_dismissals_from_dir(&dismissals_dir())
 }
 
 #[cfg(test)]
@@ -2730,6 +3072,17 @@ impl PidMonitor {
         }
     }
 
+    /// Release a watch only after the registry proves that no remaining session
+    /// uses this PID. `UnregisterWaitEx` drains any in-flight callback before the
+    /// context is freed, matching the existing monitor cleanup path.
+    pub unsafe fn unwatch(&mut self, pid: u32) -> bool {
+        let Some(entry) = self.entries.remove(&pid) else {
+            return false;
+        };
+        cleanup_pid_entry(entry);
+        true
+    }
+
     pub unsafe fn clear(&mut self) {
         for (_, entry) in self.entries.drain() {
             cleanup_pid_entry(entry);
@@ -3033,6 +3386,84 @@ mod tests {
         );
         assert!(infer_agent_from_exe_or_aumid(Some(r"C:\Games\bloodshed.exe"), None).is_none());
         assert!(infer_agent_from_exe_or_aumid(Some(r"C:\Tools\windshell.exe"), None).is_none());
+    }
+
+    #[test]
+    fn history_window_hides_only_expired_idle_track_b_sessions() {
+        let now = now_unix_secs();
+        let old = now.saturating_sub(3600);
+        let mut reg = AgentRegistry::default();
+        reg.set_history_window(Some(1800));
+        reg.file_sessions = vec![
+            p0_file_session("stale-idle", AgentState::Idle, old),
+            p0_file_session("recent-idle", AgentState::Idle, now - 60),
+            p0_file_session("boundary-idle", AgentState::Idle, now - 1800),
+            p0_file_session("future-idle", AgentState::Idle, now + 600),
+            p0_file_session("running", AgentState::Running, old),
+            p0_file_session("waiting", AgentState::Waiting, old),
+            p0_file_session("error", AgentState::Error, old),
+            p0_file_session("done", AgentState::Done, old),
+        ];
+
+        let summary = reg.summarize_agent("codex", "Codex", &[]);
+        let visible: HashSet<&str> = summary
+            .sessions
+            .iter()
+            .map(|session| session.session_id.as_str())
+            .collect();
+        assert!(!visible.contains("stale-idle"));
+        for expected in [
+            "recent-idle",
+            "boundary-idle",
+            "future-idle",
+            "running",
+            "waiting",
+            "error",
+            "done",
+        ] {
+            assert!(visible.contains(expected), "missing {expected}");
+        }
+        assert!(!summary
+            .versions
+            .contains_key(&("codex".into(), "stale-idle".into())));
+        assert_eq!(summary.total_sessions, visible.len());
+        assert_eq!(summary.aggregate_state, AgentState::Waiting);
+
+        reg.set_history_window(None);
+        assert_eq!(reg.summarize_agent("codex", "Codex", &[]).total_sessions, 8);
+        assert_eq!(AgentState::Waiting.label_en(), "question");
+        assert_eq!(AgentState::Running.label_en(), "running");
+        assert_eq!(AgentState::Idle.label_en(), "idle");
+    }
+
+    #[test]
+    fn history_window_preserves_window_fallback_and_allows_reactivation() {
+        let now = now_unix_secs();
+        let mut reg = AgentRegistry::default();
+        reg.set_history_window(Some(1800));
+        reg.file_sessions = vec![p0_file_session("stale", AgentState::Idle, now - 7200)];
+        let windows = [RunningWindowRef {
+            hwnd: 42,
+            title: "Codex window".into(),
+        }];
+        let summary = reg.summarize_agent("codex", "Codex", &windows);
+        assert_eq!(summary.total_sessions, 1);
+        assert_eq!(summary.sessions[0].source, SessionSource::Window);
+        assert_eq!(summary.sessions[0].hwnd, Some(42));
+
+        reg.apply_event(
+            p0_event(
+                "stale",
+                ParsedEventState::State(AgentState::Running),
+                now + 1,
+            ),
+            None,
+            &[],
+        );
+        let reactivated = reg.summarize_agent("codex", "Codex", &[]);
+        assert_eq!(reactivated.total_sessions, 1);
+        assert_eq!(reactivated.sessions[0].session_id, "stale");
+        assert_eq!(reactivated.aggregate_state, AgentState::Running);
     }
 
     #[test]
@@ -4919,6 +5350,281 @@ mod tests {
     }
 
     #[test]
+    fn acknowledgement_survives_duplicate_channels_and_new_waiting_realerts() {
+        let mut registry = AgentRegistry::default();
+        let waiting = p0_event("ack", ParsedEventState::State(AgentState::Waiting), 100);
+        registry.apply_event_with_meta(waiting.clone(), p0_meta("inst-a", 1), None, &[]);
+        registry.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("ack", AgentState::Waiting, 100),
+                p0_meta("inst-a", 1),
+            )],
+            None,
+            &[],
+        );
+        assert!(registry.acknowledge_session("codex", "ack"));
+        let acknowledged = registry.summarize_agent("codex", "Codex", &[]);
+        assert_eq!(acknowledged.aggregate_state, AgentState::Idle);
+        assert_eq!(acknowledged.waiting_count, 0);
+        assert_eq!(acknowledged.total_sessions, 1);
+        assert_eq!(acknowledged.badge_text, None);
+        assert_eq!(acknowledged.sessions[0].title, "ack");
+
+        let duplicate = registry.apply_event_with_meta(waiting, p0_meta("inst-a", 1), None, &[]);
+        assert!(!duplicate.changed);
+        assert_eq!(duplicate.bounce_agent, None);
+        assert!(duplicate.watch.is_none());
+        let (changed, bounces, _) = registry.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("ack", AgentState::Waiting, 100),
+                p0_meta("inst-a", 1),
+            )],
+            None,
+            &[],
+        );
+        assert!(!changed);
+        assert!(bounces.is_empty());
+        assert_eq!(
+            registry
+                .summarize_agent("codex", "Codex", &[])
+                .aggregate_state,
+            AgentState::Idle
+        );
+
+        let newer = registry.apply_event_with_meta(
+            p0_event("ack", ParsedEventState::State(AgentState::Waiting), 101),
+            p0_meta("inst-a", 2),
+            None,
+            &[],
+        );
+        assert!(newer.changed);
+        assert_eq!(newer.bounce_agent.as_deref(), Some("codex"));
+        assert!(registry.acknowledge_session("codex", "ack"));
+
+        let (_, file_bounces, _) = registry.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("ack", AgentState::Waiting, 102),
+                p0_meta("inst-a", 3),
+            )],
+            None,
+            &[],
+        );
+        assert_eq!(file_bounces, vec!["codex".to_string()]);
+        assert_eq!(
+            registry
+                .summarize_agent("codex", "Codex", &[])
+                .aggregate_state,
+            AgentState::Waiting
+        );
+    }
+
+    #[test]
+    fn persisted_dismissal_blocks_old_channels_after_restart_and_allows_newer_event() {
+        let mut registry = AgentRegistry::default();
+        registry.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("clear", AgentState::Waiting, 100),
+                p0_meta("inst-a", 1),
+            )],
+            None,
+            &[],
+        );
+        registry.apply_event_with_meta(
+            p0_event("clear", ParsedEventState::State(AgentState::Waiting), 200),
+            p0_meta("inst-a", 2),
+            None,
+            &[],
+        );
+        let record = registry.dismissal_record("codex", "clear").unwrap();
+        assert_eq!(record.version.seq, 2);
+        assert_eq!(record.version.updated_at, 200);
+
+        let dir = temp_dir("dismissal-restart");
+        let path = dismissal_path_from_dir(&dir, "codex", "clear");
+        crate::atomic::write(&path, dismissal_json(&record).as_bytes()).unwrap();
+        let records = load_session_dismissals_from_dir(&dir).unwrap();
+        assert_eq!(records, vec![record]);
+        fs::write(dir.join("damaged.json"), "{").unwrap();
+        assert!(load_session_dismissals_from_dir(&dir).is_err());
+        fs::remove_file(dir.join("damaged.json")).unwrap();
+
+        let (changed, released) = registry.dismiss_session("codex", "clear");
+        assert!(changed);
+        assert_eq!(released, vec![4242]);
+        let stale_event = registry.apply_event_with_meta(
+            p0_event("clear", ParsedEventState::State(AgentState::Waiting), 200),
+            p0_meta("inst-a", 2),
+            None,
+            &[],
+        );
+        assert!(!stale_event.changed);
+        assert!(stale_event.watch.is_none());
+        assert_eq!(stale_event.bounce_agent, None);
+
+        let mut restarted = AgentRegistry::default();
+        restarted.restore_dismissals(records);
+        let replay = restarted.apply_event_with_meta(
+            p0_event("clear", ParsedEventState::State(AgentState::Waiting), 200),
+            p0_meta("inst-a", 2),
+            None,
+            &[],
+        );
+        assert!(!replay.changed);
+        let (changed, bounces, _) = restarted.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("clear", AgentState::Waiting, 100),
+                p0_meta("inst-a", 1),
+            )],
+            None,
+            &[],
+        );
+        assert!(!changed);
+        assert!(bounces.is_empty());
+        assert_eq!(
+            restarted
+                .summarize_agent("codex", "Codex", &[])
+                .total_sessions,
+            0
+        );
+
+        let newer = restarted.apply_event_with_meta(
+            p0_event("clear", ParsedEventState::State(AgentState::Waiting), 201),
+            p0_meta("inst-a", 3),
+            None,
+            &[],
+        );
+        assert!(newer.changed);
+        assert_eq!(newer.bounce_agent.as_deref(), Some("codex"));
+        let (changed, _, _) = restarted.replace_file_sessions_with_meta(
+            vec![(
+                p0_file_session("clear", AgentState::Waiting, 100),
+                p0_meta("inst-a", 1),
+            )],
+            None,
+            &[],
+        );
+        assert!(!changed);
+        assert_eq!(
+            restarted
+                .summarize_agent("codex", "Codex", &[])
+                .aggregate_state,
+            AgentState::Waiting
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dismissal_loader_distinguishes_empty_from_directory_and_read_failures() {
+        let dir = temp_dir("dismissal-io");
+        assert!(load_session_dismissals_from_dir(&dir).unwrap().is_empty());
+        let record = SessionDismissal {
+            agent: "codex".into(),
+            session_id: "locked".into(),
+            version: SessionVersion {
+                instance: Some("inst-a".into()),
+                seq: 4,
+                updated_at: 100,
+            },
+        };
+        let path = dismissal_path_from_dir(&dir, "codex", "locked");
+        crate::atomic::write(&path, dismissal_json(&record).as_bytes()).unwrap();
+
+        use std::os::windows::fs::OpenOptionsExt;
+        let locked = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        assert!(load_session_dismissals_from_dir(&dir).is_err());
+        drop(locked);
+        assert_eq!(
+            load_session_dismissals_from_dir(&dir).unwrap(),
+            vec![record]
+        );
+
+        let not_a_directory = temp_dir("dismissal-not-directory");
+        fs::write(&not_a_directory, "file").unwrap();
+        assert!(load_session_dismissals_from_dir(&not_a_directory).is_err());
+        let _ = fs::remove_dir_all(dir);
+        let _ = fs::remove_file(not_a_directory);
+    }
+
+    #[test]
+    fn stale_expected_version_is_rejected_after_same_second_sequence_advance() {
+        let mut registry = AgentRegistry::default();
+        registry.apply_event_with_meta(
+            p0_event(
+                "expected",
+                ParsedEventState::State(AgentState::Waiting),
+                100,
+            ),
+            p0_meta("inst-a", 1),
+            None,
+            &[],
+        );
+        let stale = registry.session_version("codex", "expected").unwrap();
+        registry.apply_event_with_meta(
+            p0_event(
+                "expected",
+                ParsedEventState::State(AgentState::Waiting),
+                100,
+            ),
+            p0_meta("inst-a", 2),
+            None,
+            &[],
+        );
+        let current = registry.session_version("codex", "expected").unwrap();
+        assert_ne!(stale, current);
+        let summary = registry.summarize_agent("codex", "Codex", &[]);
+        assert_eq!(
+            summary.versions.get(&("codex".into(), "expected".into())),
+            Some(&current)
+        );
+    }
+
+    #[test]
+    fn event_read_marker_is_released_with_its_channel() {
+        let mut registry = AgentRegistry::default();
+        let mut event = p0_event(
+            "prune-read",
+            ParsedEventState::State(AgentState::Waiting),
+            100,
+        );
+        event.hwnd = Some(77);
+        registry.apply_event_with_meta(event, p0_meta("inst-a", 1), None, &[]);
+        assert!(registry.acknowledge_session("codex", "prune-read"));
+        let key = ("codex".to_string(), "prune-read".to_string());
+        assert!(registry.read_event_versions.contains_key(&key));
+        assert!(registry.prune_dead_windows(|_| false));
+        assert!(!registry.read_event_versions.contains_key(&key));
+    }
+
+    #[test]
+    fn unwatch_then_rewatch_ignores_the_old_queued_generation() {
+        let pid = std::process::id();
+        let hwnd = HWND(std::ptr::dangling_mut::<c_void>());
+        let mut monitor = PidMonitor::default();
+        let mut registry = AgentRegistry::default();
+        let old_generation = match unsafe { monitor.ensure_watching(hwnd, pid) } {
+            PidWatchResult::Watching { generation, .. } => generation,
+            other => panic!("expected current-process watch, got {other:?}"),
+        };
+        assert!(unsafe { monitor.unwatch(pid) });
+        assert!(!unsafe { monitor.unwatch(pid) });
+        let new_generation = match unsafe { monitor.ensure_watching(hwnd, pid) } {
+            PidWatchResult::Watching { generation, .. } => generation,
+            other => panic!("expected replacement watch, got {other:?}"),
+        };
+        assert_ne!(old_generation, new_generation);
+        assert!(!unsafe { monitor.complete_and_prune(&mut registry, pid, old_generation) });
+        assert_eq!(
+            monitor.entries.get(&pid).map(|entry| entry.generation),
+            Some(new_generation)
+        );
+        assert!(unsafe { monitor.unwatch(pid) });
+    }
+
+    #[test]
     fn select_agent_click_action_prioritizes_single_waiting_session() {
         let summary = AgentDockSummary {
             agent_id: "codex".into(),
@@ -4958,6 +5664,7 @@ mod tests {
                     source: SessionSource::Event,
                 },
             ],
+            versions: HashMap::new(),
         };
         assert_eq!(
             select_agent_click_action(&summary),

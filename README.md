@@ -108,6 +108,8 @@ Dock 常用交互：
 - 点击文件夹固定项会展开 Stack 菜单；菜单打开时才读取该目录。
 - 按 `Ctrl+Alt+Space` 打开命令面板，搜索固定项、运行窗口和桌面程序。
 - 设置中的“布局与快捷键…”可修改或禁用搜索热键；全屏应用期间热键不会打开搜索。
+- Agent 会话卡右侧显示 `running`、`question`、`error`、`done`、`idle` 和相对时间。默认只保留最近 30 分钟的空闲历史；活动会话、未读完成提醒和窗口行不受时间窗限制。可在“布局与快捷键… → Agent 空闲历史”选择 30 分钟、1 小时、6 小时、24 小时或全部。
+- Agent 会话卡的 `待确认` / `已完成` 行可点“知道了”，保留历史但清除提醒；“清除”会移除对应任务会话并保存版本化清除标记，较新的 Agent 事件仍可重新建立该会话。
 - 固定项可直接拖拽排序；Shift+单击启动新实例。拖文件到固定应用上可选择用它打开、固定新项目，或使用支持的图片替换图标。
 - 左侧 Start 按钮打开 Windows 开始菜单，右侧 Control 按钮打开 FeatherDock 控制中心。
 - 右键最右侧 Control（滑杆）按钮可直接打开设置；也可运行 `FeatherDock.exe --settings`。
@@ -117,7 +119,7 @@ Dock 常用交互：
 
 Agent 工作区：
 
-- 悬停 Agent 图标可打开会话详情卡，查看所有会话状态、进展摘要、工作目录与运行窗口；超过首屏行数时支持滚轮滚动或通过底部入口查看全部。
+- 悬停 Agent 图标可打开会话详情卡，查看时间窗内会话的状态、进展摘要、工作目录与运行窗口；超过首屏行数时支持滚轮滚动或通过底部入口查看全部。DSH 内部子 Agent 会聚合到主会话，不再重复占行。
 - 点击 Agent 图标时，若当前只有一个 `Waiting` 会话会直接跳转；多会话或状态展开时打开/聚焦会话卡；空闲或单窗口状态直接启动或激活对应窗口；`Shift+单击` 可打开新实例。
 - 可通过事件协议或原子会话文件接入实时任务状态（如 `codex-notify-adapter.ps1`、`send-agent-event.ps1`、`write-session-file.ps1`），参见 [examples/agent-adapters/README.md](examples/agent-adapters/README.md)。
 
@@ -190,6 +192,7 @@ Dock 行为设置：
 - `agent_zone_enabled = true | false`（是否启用右侧 Agent 分区与会话卡）
 - `agent_shimmer = true | false`（Running Agent 图标微流光，受 `reduce_motion` 约束）
 - `agent_bounce_waiting = true | false`（Agent 新进入 Waiting 且不在前台时轻跳提醒一次）
+- `agent_history_minutes = 30`（空闲历史显示时间窗；推荐 `30` / `60` / `360` / `1440`，`0` 表示全部；活动与未读完成始终显示）
 - `icon_size = 24..80`、`magnification = 100..220`（百分比）、`bottom_gap = 0..32`
 - `opacity = 10..100`（玻璃底色不透明度）、`preview_delay_ms = 0..1500`
 - `monitor = 0`（跟随主屏）或 Windows 显示器编号；断开时自动回退主屏
