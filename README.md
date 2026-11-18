@@ -4,10 +4,10 @@
   <img src="assets/featherdock-256.png" width="96" height="96" alt="FeatherDock icon">
 </p>
 
-<h3 align="center">A tiny, GPU-composited dock and app drawer for Windows.</h3>
+<h3 align="center">A tiny, GPU-composited, Agent-aware dock and app drawer for Windows.</h3>
 
 <p align="center">
-  <strong>Rust</strong> · <strong>DirectComposition</strong> · <strong>Direct2D</strong> · <strong>D3D11</strong> · <strong>Win32</strong>
+  <strong>Rust</strong> · <strong>DirectComposition</strong> · <strong>Direct2D</strong> · <strong>D3D11</strong> · <strong>Win32</strong> · <strong>Agentic Dock</strong>
 </p>
 
 <p align="center">
@@ -20,9 +20,45 @@
   <img src="docs/images/dock.png" width="760" alt="FeatherDock 主条">
 </p>
 
-FeatherDock 是一个 Windows 上的 Dock，用 Rust 直接写在系统原生图形栈上（DirectComposition + Direct2D + D3D11），不用 Electron 或 WebView，也没有常驻的后台扫描进程。界面静止时不持续重绘。
+FeatherDock 是一个为 Windows 打造的轻量原生 Dock，也是面向多 AI Agent 工作流的 **Agentic Dock**。它用 Rust 直接写在系统原生图形栈上（DirectComposition + Direct2D + D3D11），不依赖 Electron 或 WebView，没有常驻轮询与后台扫描服务，静止时 CPU 零消耗。
 
-常用的功能都在：图标悬停放大，正在运行的窗口按程序归组、图标下标一个小圆点，悬停能看实时缩略图。文件夹固定项可按需展开成 Stack 菜单，`Ctrl+Alt+Space` 可打开轻量命令面板。另外有一个把桌面程序分类整理的程序抽屉，和一个支持音频设备、网络、蓝牙、输入法、电量与时间的分页控制中心。
+除了经典 Dock 体验（图标悬停放大、运行窗口按应用归组与 DWM 实时缩略图预览、文件夹 Stack、全局命令面板 `Ctrl+Alt+Space`、程序抽屉与分页控制中心）和 6 种可与配色自由解耦的 Dock 形态样式外，FeatherDock 在右侧内建了 **AI Agent 专属工作区**：把 `Antigravity`、`Codex`、`dsh`（如 DeepSeek Harness）等 Agent 的多窗口与多任务会话聚合成一处，用克制的状态灯、等待提醒和悬停会话卡让你一眼看清哪个 Agent 正在运行、哪个在等你确认、点一下直接跳回对应会话。
+
+## Agent 工作区（Agentic Dock）
+
+FeatherDock 主条按三段式分区组织，把普通应用、运行窗口与 AI Agent 自然隔开：
+
+```text
+[Start] [Drawer] [常规固定应用] | [普通运行窗口] ‖ [Agent 区] [Overflow?] [Control]
+```
+
+- **同 Agent 聚合与独立分区**：首批内置支持 `antigravity`、`codex`、`dsh`（非标准可执行名可在 `featherdock.toml` 显式声明 `kind = "agent"`）。同一 Agent 的固定入口、多开窗口与后台会话聚合成单个槽位；Agent 区为空时自动隐藏，窄屏溢出时优先保留 `Waiting` / `Error` / `Running` 等活跃 Agent。
+- **状态优先级与克制视觉反馈**：状态聚合优先级固定为 `Waiting > Error > Running > Done > Idle`：
+  - `Waiting`：琥珀状态点与计数角标，首次进入且目标不在前台时轻弹提醒一次；若只有一个 `Waiting` 会话，点击图标直接跳转。
+  - `Error`：柔红状态点，异常状态不漏报。
+  - `Running`：薄荷状态点与轻流光（仅主条可见且未开启减少动画时运行，无轮询）。
+  - `Done`：未读完成提示点，精确聚焦到对应会话窗口后自动消警。
+- **悬停会话卡与精确可达**：悬停 Agent 图标展开会话详情卡，按优先级列出各会话标题、状态摘要与 `cwd` 工作目录（支持滚轮滚动与「查看全部」）。点击会话卡或图标时，校验 HWND / PID / 进程实例身份并聚焦目标窗口（失败时自动回退到可信窗口），或通过白名单 `deep_link`（`antigravity://`、`codex://`、`dsh://`、`vscode://`、`cursor://`）唤醒。
+- **双轨接入（Track A + Track B）**：
+  - **Track A（零配置窗口识别）**：自动识别支持的 Agent 窗口，并在详情卡明确标注「仅识别窗口」，绝不猜测或伪造任务进度。
+  - **Track B（任务事件 / 原子会话文件）**：支持 `FeatherDock.exe --agent-event`（`WM_COPYDATA`）与 `%LOCALAPPDATA%\FeatherDock\agent-sessions\*.json`（内核目录事件监听 + 原子重命名），提供 `instance` + 单调 `seq` 顺序仲裁、PID 退出监听与 Tombstone 防复活，确保旧事件或已退出进程不会覆盖新状态。
+  - 完整协议与现成 PowerShell 适配器示例见 [examples/agent-adapters/README.md](examples/agent-adapters/README.md)。
+
+## Highlights
+
+- **Agentic Dock 工作区**：右侧独立 Agent 分区、多会话状态聚合、Waiting 计数角标/轻提醒、悬停会话详情卡与 Track A / Track B 双轨接入
+- **样式与配色解耦**：`dock_style`（悬浮胶囊、极简顶线、分段浮岛、底部托台、独立键帽、Win11 流体）与 `theme`（暖瓷玻璃、紧凑、纯色、macOS、高对比）正交组合，配合 Windows 11 `HostBackdrop` 真背景模糊
+- **原生 GPU 合成**：DirectComposition + Direct2D + D3D11 + DirectWrite，静止时零重绘
+- **Dock 动效**：悬停放大、微光背板与按下反馈、点击弹跳、自动隐藏滑入滑出、全屏/最大化时收起（全屏游戏免打扰）
+- **程序抽屉**：玻璃弹层从 Dock 按钮位置展开，按刷新率逐行波浪式淡入，支持右键固定、移除与自定义分类
+- **低资源策略**：抽屉扫描结果按 TTL 和桌面签名缓存，目录事件与 WinEvent 驱动，没有常驻后台扫描器
+- **窗口体验**：运行窗口按应用归组，悬停按需生成 DWM 实时缩略图预览
+- **文件夹 Stack**：点击固定文件夹时按需读取目录，展示轻量打开菜单
+- **命令面板**：`Ctrl+Alt+Space` 全拼/首字母搜索固定项、运行窗口和桌面程序
+- **控制中心**：主音量滑块、音频输入输出切换、Wi-Fi 刷新与连接、蓝牙设备状态、输入法切换与电量时间
+- **固定项自修复**：WindowsApps 版本目录更新或唯一 exe 变化时安全自修复路径
+- **自适应布局与安全**：主条溢出“更多应用”保护、独立进程 Shell 图标提取、异常退出 watchdog 恢复任务栏与桌面图标
+- **单文件发布**：`build.ps1` 产出仓库根目录唯一入口 `FeatherDock.exe`
 
 ## 截图
 
@@ -43,28 +79,6 @@ FeatherDock 是一个 Windows 上的 Dock，用 Rust 直接写在系统原生图
 <p align="center">
   <img src="docs/images/control-center.png" width="340" alt="控制中心">
 </p>
-
-## Highlights
-
-- 原生 GPU 合成：DirectComposition + Direct2D + D3D11 + DirectWrite
-- Dock 动效：悬停放大、点击弹跳、自动隐藏滑入滑出、全屏/最大化时收起
-- 程序抽屉：玻璃弹层从 Dock 按钮位置展开，开合动画跟随屏幕刷新率（每个 vsync 渲染），分类标题与图标逐行波浪式淡入
-- 抽屉自定义：右键程序可 `固定到 Dock`、`移除该程序`、`放入分类`，也可新建/重命名/删除分类
-- 系统入口：程序抽屉保留 `此电脑`、`回收站`、`控制面板`
-- 低资源策略：抽屉扫描结果写入缓存，按 TTL 和桌面签名失效；没有后台文件扫描器
-- 窗口体验：运行窗口按应用分组，悬停时按需创建 DWM 缩略图预览
-- 文件夹 Stack：点击固定到 Dock 的文件夹时按需读取目录，并显示轻量打开菜单
-- 命令面板：`Ctrl+Alt+Space` 搜索固定项、运行窗口和桌面程序
-- 控制中心：主音量滑块、输出/输入音频设备选择、Wi-Fi 刷新与连接、蓝牙设备状态、输入法切换，以及电量与时钟入口
-- 固定项自修复：WindowsApps 版本目录更新或唯一 exe 文件名变化后，启动时会在安全范围内修复失效路径
-- 主题预设与形态样式：`dock_style`（悬浮胶囊、极简顶线、分段浮岛、底部托台、独立键帽、Win11 流体）与 `theme`（暖瓷玻璃、紧凑、纯色、macOS、高对比）解耦，可自由组合，不引入重型皮肤系统
-- 自适应布局：主条宽度受屏幕约束，超出的应用可从“更多应用”打开；抽屉列数和缩略图布局随工作区调整
-- 常用操作：固定项拖拽排序、前台状态、多窗口数量、Shift+单击新实例，以及拖文件到固定应用后选择打开或固定
-- 中文搜索：全拼、首字母、启动入口去重与最近使用排序；抽屉也可直接输入搜索并通过键盘选择
-- 布局设置：图标大小、悬停放大、透明度、预览延迟、屏幕选择、搜索热键、减少动画及重叠避让，支持预览和取消恢复
-- 设置窗口：系统任务栏模式、Dock 显示模式、主题预设、全屏 / 最大化时收起、开机自启、常驻应用管理
-- 桌面模式：可隐藏 Windows 桌面图标，把桌面程序交给抽屉管理
-- 单文件发布：`build.ps1` 产出仓库根目录的 `FeatherDock.exe`
 
 ## Build And Run
 
@@ -99,7 +113,13 @@ Dock 常用交互：
 - 右键最右侧 Control（滑杆）按钮可直接打开设置；也可运行 `FeatherDock.exe --settings`。
 - 控制中心支持主页面与音频、网络、蓝牙、输入法、电量子页面；页面切换保留玻璃背景和短动画，网络状态刷新使用独立的短时刷新计时器。
 - 音频页可切换活动设备；网络页可刷新并连接 Wi-Fi；蓝牙页和输入法页提供设备/输入法状态与系统设置入口。
-- Windows 右下角通知区域里的 FeatherDock 小图标右键菜单，以及设置窗口，都可切换常驻 / 自动隐藏、任务栏显示策略、主题预设、桌面图标隐藏和抽屉按钮。
+- Windows 右下角通知区域里的 FeatherDock 小图标右键菜单，以及设置窗口，都可切换常驻 / 自动隐藏、任务栏显示策略、Dock 样式与配色、桌面图标隐藏和抽屉按钮。
+
+Agent 工作区：
+
+- 悬停 Agent 图标可打开会话详情卡，查看所有会话状态、进展摘要、工作目录与运行窗口；超过首屏行数时支持滚轮滚动或通过底部入口查看全部。
+- 点击 Agent 图标时，若当前只有一个 `Waiting` 会话会直接跳转；多会话或状态展开时打开/聚焦会话卡；空闲或单窗口状态直接启动或激活对应窗口；`Shift+单击` 可打开新实例。
+- 可通过事件协议或原子会话文件接入实时任务状态（如 `codex-notify-adapter.ps1`、`send-agent-event.ps1`、`write-session-file.ps1`），参见 [examples/agent-adapters/README.md](examples/agent-adapters/README.md)。
 
 程序抽屉：
 
@@ -142,6 +162,13 @@ path = "C:\\Images\\photo.png"
 label = "Tool"
 path = "C:\\Tools\\tool.exe"
 icon = "C:\\Tools\\tool.ico"
+
+# 非标准可执行名的 Agent 可显式归入右侧 Agent 区：
+[[item]]
+label = "DeepSeek Harness"
+path = "C:\\Path\\To\\DeepSeek Harness.exe"
+kind = "agent"
+agent = "dsh"
 ```
 
 Dock 行为设置：
@@ -160,6 +187,9 @@ Dock 行为设置：
 - `hide_desktop_icons = true | false`
 - `theme = "glass" | "compact" | "solid" | "macos" | "contrast"`
 - `dock_style = "pill" | "hairline" | "islands" | "shelf" | "tiles" | "fluent"`
+- `agent_zone_enabled = true | false`（是否启用右侧 Agent 分区与会话卡）
+- `agent_shimmer = true | false`（Running Agent 图标微流光，受 `reduce_motion` 约束）
+- `agent_bounce_waiting = true | false`（Agent 新进入 Waiting 且不在前台时轻跳提醒一次）
 - `icon_size = 24..80`、`magnification = 100..220`（百分比）、`bottom_gap = 0..32`
 - `opacity = 10..100`（玻璃底色不透明度）、`preview_delay_ms = 0..1500`
 - `monitor = 0`（跟随主屏）或 Windows 显示器编号；断开时自动回退主屏
@@ -200,14 +230,9 @@ Dock 行为设置：
 - Rust stable toolchain
 - `rust-toolchain.toml` 中固定的 Windows GNU target
 
-`build.ps1` 会自动准备当前进程的开发环境。本工作区已安装独立的 GNU Rust 工具链
-（含 Cargo、rustfmt、Clippy），位于仓库同级的 `Dock-build-tools\`；构建脚本会自动使用它。
-其他机器上没有该目录时，会使用已安装的 Rust。环境配置不会修改系统 PATH、注册表或
-PowerShell 配置文件。GNU linker 的临时文件保存在忽略的 `outputs\tool-temp\` 中，
-手动运行 `cargo clean` 也不会删掉该目录。
+`build.ps1` 会通过 `scripts\dev-env.ps1` 自动准备当前进程的开发环境：若存在同级 `Dock-build-tools\` 会优先使用，否则自动查找已安装的 `stable-x86_64-pc-windows-gnu` 工具链并加入进程 `PATH`（无需修改系统环境变量、注册表或 PowerShell 配置文件）。GNU linker 的临时文件保存在忽略的 `outputs\tool-temp\` 中，手动运行 `cargo clean` 也不会删掉该目录。
 `build.cmd` 调用同一个构建脚本，并仅为子进程启用脚本运行，不更改电脑的执行策略。
-发布时会将最终 `FeatherDock.exe` 的文件完整性标记设为普通桌面应用使用的 Medium，
-避免沙箱工作目录继承的 Low 标记导致托盘注册、用户缓存写入失败；不需要管理员运行。
+发布时会将最终 `FeatherDock.exe` 的文件完整性设为 Medium（若当前目录缺少 `WRITE_OWNER` 权限导致 `icacls /setintegritylevel M` 拒绝访问，会自动校验当前进程为 Medium+ 且文件不含 `Low`/`Untrusted` 标签），避免沙箱工作目录继承的 Low 标记导致托盘注册、用户缓存写入失败。
 
 手动使用 Cargo 时，可运行 `scripts\dev-shell.cmd` 打开已准备好的开发终端。
 如果当前 PowerShell 允许本地脚本，也可直接运行：
@@ -265,12 +290,12 @@ EXE 旁的 `outputs\`。每个实例使用独立目录，正常退出时清理�
 | `src/agent_state.rs` | Agent 识别、任务事件、状态聚合、顺序与生命周期 |
 | `src/agent_popup.rs` | Agent 会话详情卡、滚动和点击跳转 |
 | `src/dock.rs` | Dock 布局、放大曲线、自动隐藏和动画 easing |
-| `src/render.rs` | Direct2D 绘制圆角底座、图标、Start / Control / Drawer glyph |
+| `src/render.rs` | Direct2D 绘制多种 Dock 形态外壳、悬停背板、状态指示、图标与矢量按钮 |
 | `src/graphics.rs` | D3D11、DXGI、Direct2D、DirectComposition、图标 bitmap |
 | `src/apps.rs` | 内置按钮、默认应用、运行窗口和固定项合并 |
 | `src/command_palette.rs` | `Ctrl+Alt+Space` 命令面板和按需入口搜索 |
 | `src/folder_stack.rs` | 文件夹固定项的按需 Stack 菜单 |
-| `src/theme.rs` | 轻量主题预设和渲染颜色参数 |
+| `src/theme.rs` | Dock 形态（`DockStyle`）、配色与弹层材质（`ThemePreset`）及 Agent 状态色板 |
 | `src/drawer.rs` | 程序抽屉窗口、开合动画、右键菜单、拖拽分类 |
 | `src/drawer_layout.rs` | 抽屉分类布局、命中测试和 drop target 计算 |
 | `src/drawer_input.rs` | 分类名称输入弹窗 |
@@ -287,6 +312,7 @@ EXE 旁的 `outputs\`。每个实例使用独立目录，正常退出时清理�
 | `src/watchdog.rs` | 进程异常退出后的任务栏和桌面图标恢复守护 |
 | `src/icons.rs` | WIC 图片缩略图、Shell 图标和 PIDL 图标提取 |
 | `assets/` | 应用图标和 Windows resource 资源 |
+| `examples/agent-adapters/` | Track B Agent 事件接入示例脚本与协议说明 |
 | `AGENTS.md` / `PLAN.md` / `REVIEW.md` | 需求与协作规则、下一步计划、最新审查结果三个固定入口 |
 | `docs/images/` | README 截图 |
 | `build.ps1` | 唯一的发布构建脚本，产出根目录单个 `FeatherDock.exe` |
