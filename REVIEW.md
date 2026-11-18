@@ -4,10 +4,11 @@
 
 ## 当前结论 · 2026-11-18
 
-- 修复主条应用窗口数与 Agent 状态角标（[render.rs](src/render.rs) `badge_geometry` / `icon_motion`）在悬浮放大时停留在静态坐标的问题：抽取共享 `icon_motion` 与 `badge_geometry`，使角标右上角随图标 `ic.scale`、`ic.bounce_y`、`ic.presence`（`ENTER_RISE`）及非 `Pill` 样式的按压反馈（`ic.press`）同步移动并按 `sqrt(scale)` 温和缩放，同时增加微弱投影以提升浅色图标上的对比度，并与图标/背板/键帽共享变换计算。
-- 延续同日早先完成的 Dock **形态样式与配色解耦**（`DockStyle` × `ThemePreset`），在完整保留原五种主题（`glass`、`compact`、`solid`、`macos`、`contrast`）与默认 `pill` 形态不变的前提下，新增五种非换颜色的 Dock 形态样式：`hairline`（极简顶线）、`islands`（分段浮岛）、`shelf`（底部托台）、`tiles`（独立键帽）与 `fluent`（Win11 流体底座），并在设置窗口「外观」分组同时提供「样式」与「配色」下拉自由组合；同步补齐新样式下的悬停背板、点击按下微缩与分组分隔连续过渡。
-- 校验门通过：`cargo fmt --all -- --check`、严格 `cargo clippy --all-targets --locked -- -D warnings`、**259/259 项单元测试**（含 `theme` / `settings` / `dock` / `render` 新增与角标动画 3 项回归）和 `cargo build --release --locked` 均通过。
-- 暂存发布与构建修复说明：已修复 `rustup 1.29` 下 `rust-toolchain.toml` 报 `target tuple in channel name` 的问题（拆分 `channel = "stable"` 与 `targets = ["x86_64-pc-windows-gnu"]`，并在 `scripts/dev-env.ps1` 自动探测已安装的 `stable-x86_64-pc-windows-gnu\bin`、`build.ps1` 在无 `WRITE_OWNER` 时校验进程 `>= Medium` 且文件无 `Low/Untrusted` 标签，`.cargo/gnu-linker.cmd` 增加跨工具链自包含链接器回退）。直接执行 `.\build.cmd -Verify -Stage` 已完整通过并退出码为 `0`，最新产物位于 `outputs\pending\FeatherDock.exe`（**1,344,000 bytes**，SHA-256 `83244EA4C3627E0CE75B3524661D8CEA1D1166A19E0CA77476B571C73DFBD3B6`）；因本会话仍处于非交互桌面（`EnumWindows=0`），未替换根目录运行中的 `FeatherDock.exe`，真机交互发布、五种新样式与角标动画的桌面视觉验收保留在 `PLAN.md`。
+- 移除非键帽样式悬浮时的半透明圆角矩形背板 `draw_hover_backplate`（[render.rs](src/render.rs)，`Tiles` 键帽高亮保持不变），使 `hairline`、`islands`、`shelf`、`fluent` 悬浮时仅保留纯放大动效。
+- 重新设计内置系统按钮 `Start`、`Drawer`、`Control` 与 `Overflow`（[render.rs](src/render.rs) `system_button_colors` / `draw_system_button`）：取消外层圆角矩形底框，改为纯扁平无底框的折纸风格矢量前景（采用与 `assets/featherdock-256.png` 同源的天蓝/暖杏/薄荷/紫罗兰高亮配色，配合 `hairline` 模式下的轻柔垂直投影与高对比主题专用黑白黄方案），并彻底区分按钮轮廓：`Start` 为 2×2 扁平天蓝四格窗徽，`Drawer` 为紫罗兰与薄荷卡片探出暖杏抽屉盒（带珊瑚折边与拉手条），`Control` 为薄荷/紫罗兰双胶囊开关，`Overflow` 为三色扁平圆点。
+- 延续同日早先完成的角标动画跟随修复（`badge_geometry` / `icon_motion` 使角标随悬浮放大、点击弹跳、进出场与按压同步移动和温和缩放）及 Dock **形态样式与配色解耦**（`DockStyle` × `ThemePreset`、`hairline`/`islands`/`shelf`/`tiles`/`fluent` 五种样式与设置联动）。
+- 校验门通过：`cargo fmt --all -- --check`、严格 `cargo clippy --all-targets --locked -- -D warnings`、**260/260 项单元测试**（含新增 `system_buttons_stay_distinct_and_visible_against_dark_and_contrast_backgrounds` 及角标/样式回归）和 `cargo build --release --locked` 均通过。
+- 暂存发布与构建修复说明：已修复 `rustup 1.29` 下 `rust-toolchain.toml` 报 `target tuple in channel name` 的问题（拆分 `channel = "stable"` 与 `targets = ["x86_64-pc-windows-gnu"]`，并在 `scripts/dev-env.ps1` 自动探测已安装的 `stable-x86_64-pc-windows-gnu\bin`、`build.ps1` 在无 `WRITE_OWNER` 时校验进程 `>= Medium` 且文件无 `Low/Untrusted` 标签，`.cargo/gnu-linker.cmd` 增加跨工具链自包含链接器回退）。直接执行 `.\build.cmd -Verify -Stage` 已完整通过并退出码为 `0`，最新产物位于 `outputs\pending\FeatherDock.exe`（**1,345,536 bytes**，SHA-256 `004FEFD3112ADA72072AF56A0FAF22FD592ED0AAEFE6E53D907169952F2C748E`）；因本会话仍处于非交互桌面（`EnumWindows=0`），未替换根目录运行中的 `FeatherDock.exe`，真机交互发布及新样式/角标/系统按钮的桌面视觉验收保留在 `PLAN.md`。
 
 ## 历史结论 · 2026-11-17
 

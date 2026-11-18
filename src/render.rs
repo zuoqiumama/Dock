@@ -9,7 +9,7 @@ use windows::Win32::Graphics::DirectWrite::*;
 
 use crate::agent_state::AgentState;
 use crate::dock::{gap_for, Dock, ItemRole, CORNER, ENTER_RISE, PILL_PAD_X};
-use crate::theme::{AgentTheme, DockStyle, ThemePreset};
+use crate::theme::{rgb8, AgentTheme, DockStyle, ThemePreset};
 
 /// Reused GPU material brushes: no gradient resources are allocated per frame.
 pub struct MaterialBrushes {
@@ -252,15 +252,6 @@ fn fit_rect(container: D2D_RECT_F, source_w: f32, source_h: f32) -> D2D_RECT_F {
         top,
         right: left + fitted_w,
         bottom: top + fitted_h,
-    }
-}
-
-fn offset_rect(rect: D2D_RECT_F, dx: f32, dy: f32) -> D2D_RECT_F {
-    D2D_RECT_F {
-        left: rect.left + dx,
-        top: rect.top + dy,
-        right: rect.right + dx,
-        bottom: rect.bottom + dy,
     }
 }
 
@@ -1080,48 +1071,6 @@ unsafe fn draw_keycap_tile(
     draw_specular_rounded_border(dc, brush, materials, keycap, radius, dock.dpi, dock.theme);
 }
 
-#[allow(clippy::too_many_arguments)]
-unsafe fn draw_hover_backplate(
-    dc: &ID2D1DeviceContext,
-    brush: &ID2D1SolidColorBrush,
-    dock: &Dock,
-    ic: &crate::dock::IconFrame,
-    base: f32,
-    baseline: f32,
-) {
-    if ic.hover <= 0.01 || matches!(dock.style, DockStyle::Pill | DockStyle::Tiles) {
-        return;
-    }
-    let motion = icon_motion(dock, ic, base);
-    let s = motion.scale;
-    let pad = 4.5 * dock.layout_dpi() * s;
-    let y_base = baseline + motion.dy;
-    let half_w = base * 0.5 * s + pad;
-    let backplate = D2D1_ROUNDED_RECT {
-        rect: D2D_RECT_F {
-            left: ic.cx - half_w,
-            top: y_base - base * s - pad * 0.85,
-            right: ic.cx + half_w,
-            bottom: y_base + pad * 0.65,
-        },
-        radiusX: 9.0 * dock.layout_dpi() * s.sqrt(),
-        radiusY: 9.0 * dock.layout_dpi() * s.sqrt(),
-    };
-    let (rgb, alpha) = if dock.style == DockStyle::Hairline {
-        if dock.theme.is_light() {
-            ((1.0, 1.0, 1.0), 0.24 * ic.hover)
-        } else {
-            ((1.0, 1.0, 1.0), 0.16 * ic.hover)
-        }
-    } else if dock.theme.is_light() {
-        ((1.0, 1.0, 1.0), 0.28 * ic.hover)
-    } else {
-        ((1.0, 1.0, 1.0), 0.14 * ic.hover)
-    };
-    brush.SetColor(&color(rgb.0, rgb.1, rgb.2, alpha * ic.presence));
-    dc.FillRoundedRectangle(&backplate, brush);
-}
-
 pub unsafe fn draw(
     dc: &ID2D1DeviceContext,
     brush: &ID2D1SolidColorBrush,
@@ -1194,8 +1143,8 @@ pub unsafe fn draw(
             .foreground
             .is_some_and(|fg| item.windows.iter().any(|w| w.hwnd == fg));
 
-        dc.SetTransform(&IDENTITY);
         if dock.style == DockStyle::Tiles {
+            dc.SetTransform(&IDENTITY);
             draw_keycap_tile(
                 dc,
                 brush,
@@ -1207,8 +1156,6 @@ pub unsafe fn draw(
                 is_foreground,
                 &palette,
             );
-        } else {
-            draw_hover_backplate(dc, brush, dock, ic, base, frame.baseline);
         }
 
         let motion = icon_motion(dock, ic, base);
@@ -1232,61 +1179,11 @@ pub unsafe fn draw(
             raw_tile
         };
 
-        let hairline_shadow = if dock.style == DockStyle::Hairline {
-            let shadow_rgb = if dock.theme.is_light() {
-                (1.0, 1.0, 1.0)
-            } else {
-                (0.0, 0.0, 0.0)
-            };
-            Some((shadow_rgb, 0.34 * p))
-        } else {
-            None
-        };
-
-        if item.role == ItemRole::Start {
-            draw_start(dc, brush, tile, p);
-            continue;
-        }
-        if item.role == ItemRole::Control {
-            if let Some((srgb, salpha)) = hairline_shadow {
-                draw_control(
-                    dc,
-                    brush,
-                    offset_rect(tile, 0.9 * dock.dpi, 0.9 * dock.dpi),
-                    srgb,
-                    salpha,
-                );
-            }
-            draw_control(dc, brush, tile, theme.control_rgb, p);
-            continue;
-        }
-        if item.role == ItemRole::Drawer {
-            if let Some((srgb, salpha)) = hairline_shadow {
-                draw_drawer(
-                    dc,
-                    brush,
-                    offset_rect(tile, 0.9 * dock.dpi, 0.9 * dock.dpi),
-                    srgb,
-                    salpha,
-                );
-            }
-            draw_drawer(dc, brush, tile, theme.control_rgb, p);
-            continue;
-        }
-        if item.role == ItemRole::Overflow {
-            if let Some((srgb, salpha)) = hairline_shadow {
-                let offset = 0.9 * dock.dpi;
-                draw_overflow_dots(
-                    dc,
-                    brush,
-                    ic.cx + offset,
-                    frame.baseline + offset,
-                    base,
-                    srgb,
-                    salpha,
-                );
-            }
-            draw_overflow_dots(dc, brush, ic.cx, frame.baseline, base, theme.control_rgb, p);
+        if matches!(
+            item.role,
+            ItemRole::Start | ItemRole::Control | ItemRole::Drawer | ItemRole::Overflow
+        ) {
+            draw_system_button(dc, brush, dock, item.role, tile, p);
             continue;
         }
 
@@ -1842,70 +1739,275 @@ unsafe fn draw_agent_shimmer(
     dc.DrawRoundedRectangle(&rr, brush, (base * 0.026).max(1.0), None);
 }
 
-/// The Start button: a 2x2 grid of rounded panes (Windows-logo feel), drawn as
-/// vectors so it stays crisp under magnification.
-unsafe fn draw_start(
+#[derive(Clone, Copy, Debug)]
+struct SystemButtonColors {
+    primary: (f32, f32, f32),
+    secondary: (f32, f32, f32),
+    accent: (f32, f32, f32),
+    detail: (f32, f32, f32),
+}
+
+fn system_button_colors(role: ItemRole, theme: ThemePreset) -> SystemButtonColors {
+    if theme == ThemePreset::Contrast {
+        return match role {
+            ItemRole::Start => SystemButtonColors {
+                primary: (1.0, 1.0, 1.0),
+                secondary: (1.0, 1.0, 1.0),
+                accent: (1.0, 1.0, 1.0),
+                detail: (1.0, 1.0, 1.0),
+            },
+            ItemRole::Drawer => SystemButtonColors {
+                primary: rgb8(255, 214, 10),
+                secondary: (1.0, 1.0, 1.0),
+                accent: (0.82, 0.82, 0.82),
+                detail: (0.0, 0.0, 0.0),
+            },
+            ItemRole::Control => SystemButtonColors {
+                primary: rgb8(255, 214, 10),
+                secondary: (1.0, 1.0, 1.0),
+                accent: (1.0, 1.0, 1.0),
+                detail: (0.0, 0.0, 0.0),
+            },
+            _ => SystemButtonColors {
+                primary: (1.0, 1.0, 1.0),
+                secondary: rgb8(255, 214, 10),
+                accent: (1.0, 1.0, 1.0),
+                detail: (0.0, 0.0, 0.0),
+            },
+        };
+    }
+
+    match role {
+        ItemRole::Start => SystemButtonColors {
+            primary: rgb8(70, 162, 245),
+            secondary: rgb8(98, 184, 255),
+            accent: rgb8(50, 138, 228),
+            detail: rgb8(124, 198, 255),
+        },
+        ItemRole::Drawer => SystemButtonColors {
+            primary: rgb8(252, 176, 74),
+            secondary: rgb8(64, 218, 190),
+            accent: rgb8(138, 124, 234),
+            detail: rgb8(254, 248, 236),
+        },
+        ItemRole::Control => SystemButtonColors {
+            primary: rgb8(64, 218, 190),
+            secondary: rgb8(138, 124, 234),
+            accent: rgb8(242, 118, 86),
+            detail: rgb8(254, 248, 236),
+        },
+        _ => SystemButtonColors {
+            primary: rgb8(252, 176, 74),
+            secondary: rgb8(64, 218, 190),
+            accent: rgb8(138, 124, 234),
+            detail: rgb8(254, 248, 236),
+        },
+    }
+}
+
+fn tile_subrect(tile: D2D_RECT_F, l: f32, t: f32, r: f32, b: f32) -> D2D_RECT_F {
+    let size = tile.right - tile.left;
+    D2D_RECT_F {
+        left: tile.left + size * l,
+        top: tile.top + size * t,
+        right: tile.left + size * r,
+        bottom: tile.top + size * b,
+    }
+}
+
+unsafe fn fill_flat_rr(
     dc: &ID2D1DeviceContext,
     brush: &ID2D1SolidColorBrush,
-    tile: D2D_RECT_F,
+    rect: D2D_RECT_F,
+    radius: f32,
+    rgb: (f32, f32, f32),
     alpha: f32,
+    hairline_shadow_dy: Option<f32>,
 ) {
-    let size = tile.right - tile.left;
-    let pad = size * 0.20;
-    let gap = size * 0.12;
-    let inner_l = tile.left + pad;
-    let inner_t = tile.top + pad;
-    let cell = (size - 2.0 * pad - gap) / 2.0;
-    let radius = cell * 0.20;
-    brush.SetColor(&color(0.26, 0.60, 0.98, alpha));
-    for (col, row) in [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
-        let left = inner_l + col * (cell + gap);
-        let top = inner_t + row * (cell + gap);
-        let pane = D2D1_ROUNDED_RECT {
+    if let Some(dy) = hairline_shadow_dy {
+        let shadow = D2D1_ROUNDED_RECT {
             rect: D2D_RECT_F {
-                left,
-                top,
-                right: left + cell,
-                bottom: top + cell,
+                left: rect.left,
+                top: rect.top + dy,
+                right: rect.right,
+                bottom: rect.bottom + dy,
             },
             radiusX: radius,
             radiusY: radius,
         };
-        dc.FillRoundedRectangle(&pane, brush);
+        brush.SetColor(&color(0.0, 0.0, 0.0, 0.14 * alpha));
+        dc.FillRoundedRectangle(&shadow, brush);
+    }
+    brush.SetColor(&color(rgb.0, rgb.1, rgb.2, alpha));
+    dc.FillRoundedRectangle(
+        &D2D1_ROUNDED_RECT {
+            rect,
+            radiusX: radius,
+            radiusY: radius,
+        },
+        brush,
+    );
+}
+
+unsafe fn draw_system_button(
+    dc: &ID2D1DeviceContext,
+    brush: &ID2D1SolidColorBrush,
+    dock: &Dock,
+    role: ItemRole,
+    tile: D2D_RECT_F,
+    alpha: f32,
+) {
+    let size = tile.right - tile.left;
+    let shadow_dy = (dock.style == DockStyle::Hairline && dock.theme != ThemePreset::Contrast)
+        .then_some(size * 0.020);
+    let colors = system_button_colors(role, dock.theme);
+    match role {
+        ItemRole::Start => draw_start(dc, brush, tile, colors, alpha, shadow_dy),
+        ItemRole::Drawer => draw_drawer(dc, brush, dock.theme, tile, colors, alpha, shadow_dy),
+        ItemRole::Control => draw_control(dc, brush, tile, colors, alpha, shadow_dy),
+        ItemRole::Overflow => draw_overflow_dots(dc, brush, tile, colors, alpha, shadow_dy),
+        _ => {}
     }
 }
 
-/// The Control button: two horizontal slider tracks with offset knobs (a "control
-/// center / sliders" feel), drawn as vectors so it stays crisp under magnification.
+/// Borderless flat 2x2 Windows panes in a soft cerulean-sky palette.
+unsafe fn draw_start(
+    dc: &ID2D1DeviceContext,
+    brush: &ID2D1SolidColorBrush,
+    tile: D2D_RECT_F,
+    colors: SystemButtonColors,
+    alpha: f32,
+    shadow_dy: Option<f32>,
+) {
+    let size = tile.right - tile.left;
+    let pad = size * 0.16;
+    let gap = size * 0.065;
+    let cell = (size - 2.0 * pad - gap) / 2.0;
+    let radius = cell * 0.18;
+    let panes = [
+        (0.0, 0.0, colors.primary),
+        (1.0, 0.0, colors.secondary),
+        (0.0, 1.0, colors.accent),
+        (1.0, 1.0, colors.detail),
+    ];
+    for (col, row, rgb) in panes {
+        let left = tile.left + pad + col * (cell + gap);
+        let top = tile.top + pad + row * (cell + gap);
+        let rect = D2D_RECT_F {
+            left,
+            top,
+            right: left + cell,
+            bottom: top + cell,
+        };
+        fill_flat_rr(dc, brush, rect, radius, rgb, alpha, shadow_dy);
+    }
+}
+
+/// Borderless flat origami pocket/drawer matching FeatherDock's brand icon:
+/// two pastel cards peeking from a warm peach drawer body with a pull handle.
+unsafe fn draw_drawer(
+    dc: &ID2D1DeviceContext,
+    brush: &ID2D1SolidColorBrush,
+    theme: ThemePreset,
+    tile: D2D_RECT_F,
+    colors: SystemButtonColors,
+    alpha: f32,
+    shadow_dy: Option<f32>,
+) {
+    let size = tile.right - tile.left;
+    let lip_rgb = if theme == ThemePreset::Contrast {
+        rgb8(200, 160, 0)
+    } else {
+        rgb8(242, 118, 86)
+    };
+    fill_flat_rr(
+        dc,
+        brush,
+        tile_subrect(tile, 0.25, 0.14, 0.81, 0.56),
+        size * 0.09,
+        colors.accent,
+        alpha,
+        shadow_dy,
+    );
+    fill_flat_rr(
+        dc,
+        brush,
+        tile_subrect(tile, 0.18, 0.25, 0.75, 0.66),
+        size * 0.09,
+        colors.secondary,
+        alpha,
+        None,
+    );
+    fill_flat_rr(
+        dc,
+        brush,
+        tile_subrect(tile, 0.14, 0.39, 0.86, 0.84),
+        size * 0.12,
+        lip_rgb,
+        alpha,
+        shadow_dy,
+    );
+    fill_flat_rr(
+        dc,
+        brush,
+        tile_subrect(tile, 0.14, 0.43, 0.86, 0.86),
+        size * 0.12,
+        colors.primary,
+        alpha,
+        None,
+    );
+    fill_flat_rr(
+        dc,
+        brush,
+        tile_subrect(tile, 0.37, 0.60, 0.63, 0.68),
+        size * 0.04,
+        colors.detail,
+        alpha,
+        None,
+    );
+}
+
+/// Borderless flat control switches: two pastel capsule toggles with cream knobs.
 unsafe fn draw_control(
     dc: &ID2D1DeviceContext,
     brush: &ID2D1SolidColorBrush,
     tile: D2D_RECT_F,
-    rgb: (f32, f32, f32),
+    colors: SystemButtonColors,
     alpha: f32,
+    shadow_dy: Option<f32>,
 ) {
     let size = tile.right - tile.left;
-    let pad = size * 0.26;
-    let left = tile.left + pad;
-    let right = tile.right - pad;
-    let track_h = size * 0.05;
-    let knob_r = size * 0.10;
-    for (fy, kx) in [(0.40, 0.66_f32), (0.62, 0.34_f32)] {
-        let y = tile.top + size * fy;
-        let track = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F {
-                left,
-                top: y - track_h,
-                right,
-                bottom: y + track_h,
-            },
-            radiusX: track_h,
-            radiusY: track_h,
+    let pad_x = size * 0.14;
+    let left = tile.left + pad_x;
+    let right = tile.right - pad_x;
+    let pill_h = size * 0.27;
+    let half_h = pill_h * 0.5;
+    let gap = size * 0.12;
+    let y0 = tile.top + (size - (2.0 * pill_h + gap)) * 0.5 + half_h;
+    let knob_r = pill_h * 0.36;
+
+    for (i, (y, track_rgb)) in [(y0, colors.primary), (y0 + pill_h + gap, colors.secondary)]
+        .into_iter()
+        .enumerate()
+    {
+        let track = D2D_RECT_F {
+            left,
+            top: y - half_h,
+            right,
+            bottom: y + half_h,
         };
-        brush.SetColor(&color(rgb.0, rgb.1, rgb.2, 0.72 * alpha));
-        dc.FillRoundedRectangle(&track, brush);
-        let knob_x = left + (right - left) * kx;
-        brush.SetColor(&color(rgb.0, rgb.1, rgb.2, alpha));
+        fill_flat_rr(dc, brush, track, half_h, track_rgb, alpha, shadow_dy);
+        let knob_x = if i == 0 {
+            right - half_h
+        } else {
+            left + half_h
+        };
+        brush.SetColor(&color(
+            colors.detail.0,
+            colors.detail.1,
+            colors.detail.2,
+            alpha,
+        ));
         dc.FillEllipse(
             &D2D1_ELLIPSE {
                 point: D2D_POINT_2F { x: knob_x, y },
@@ -1917,58 +2019,43 @@ unsafe fn draw_control(
     }
 }
 
-/// The Drawer button: a 3x3 grid of rounded squares (an "app drawer / Launchpad"
-/// feel), drawn as vectors so it stays crisp under magnification.
-unsafe fn draw_drawer(
-    dc: &ID2D1DeviceContext,
-    brush: &ID2D1SolidColorBrush,
-    tile: D2D_RECT_F,
-    rgb: (f32, f32, f32),
-    alpha: f32,
-) {
-    let size = tile.right - tile.left;
-    let pad = size * 0.24;
-    let cell = (size - 2.0 * pad) / 3.0;
-    let dot = cell * 0.40;
-    brush.SetColor(&color(rgb.0, rgb.1, rgb.2, 0.92 * alpha));
-    for row in 0..3 {
-        for col in 0..3 {
-            let cx = tile.left + pad + cell * (col as f32 + 0.5);
-            let cy = tile.top + pad + cell * (row as f32 + 0.5);
-            let pane = D2D1_ROUNDED_RECT {
-                rect: D2D_RECT_F {
-                    left: cx - dot,
-                    top: cy - dot,
-                    right: cx + dot,
-                    bottom: cy + dot,
-                },
-                radiusX: dot * 0.42,
-                radiusY: dot * 0.42,
-            };
-            dc.FillRoundedRectangle(&pane, brush);
-        }
-    }
-}
-
+/// Borderless flat overflow dots in FeatherDock's pastel trio.
 unsafe fn draw_overflow_dots(
     dc: &ID2D1DeviceContext,
     brush: &ID2D1SolidColorBrush,
-    cx: f32,
-    baseline: f32,
-    base: f32,
-    rgb: (f32, f32, f32),
+    tile: D2D_RECT_F,
+    colors: SystemButtonColors,
     alpha: f32,
+    shadow_dy: Option<f32>,
 ) {
-    brush.SetColor(&color(rgb.0, rgb.1, rgb.2, alpha));
-    for offset in [-0.22, 0.0, 0.22] {
+    let size = tile.right - tile.left;
+    let cx = (tile.left + tile.right) * 0.5;
+    let cy = (tile.top + tile.bottom) * 0.5;
+    let dot_r = size * 0.105;
+    let dots = [
+        (-0.28, colors.primary),
+        (0.0, colors.secondary),
+        (0.28, colors.accent),
+    ];
+    for (offset, rgb) in dots {
+        let x = cx + size * offset;
+        if let Some(dy) = shadow_dy {
+            brush.SetColor(&color(0.0, 0.0, 0.0, 0.14 * alpha));
+            dc.FillEllipse(
+                &D2D1_ELLIPSE {
+                    point: D2D_POINT_2F { x, y: cy + dy },
+                    radiusX: dot_r,
+                    radiusY: dot_r,
+                },
+                brush,
+            );
+        }
+        brush.SetColor(&color(rgb.0, rgb.1, rgb.2, alpha));
         dc.FillEllipse(
             &D2D1_ELLIPSE {
-                point: D2D_POINT_2F {
-                    x: cx + base * offset,
-                    y: baseline - base * 0.45,
-                },
-                radiusX: base * 0.045,
-                radiusY: base * 0.045,
+                point: D2D_POINT_2F { x, y: cy },
+                radiusX: dot_r,
+                radiusY: dot_r,
             },
             brush,
         );
@@ -2276,5 +2363,59 @@ mod tests {
             fluent_press.bounds.bottom - fluent_press.bounds.top
                 < rest.bounds.bottom - rest.bounds.top
         );
+    }
+
+    fn relative_luminance(rgb: (f32, f32, f32)) -> f32 {
+        let lin = |c: f32| {
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(rgb.0) + 0.7152 * lin(rgb.1) + 0.0722 * lin(rgb.2)
+    }
+
+    fn contrast_ratio(a: (f32, f32, f32), b: (f32, f32, f32)) -> f32 {
+        let la = relative_luminance(a);
+        let lb = relative_luminance(b);
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    #[test]
+    fn system_buttons_stay_distinct_and_visible_against_dark_and_contrast_backgrounds() {
+        let dark_bg = rgb8(30, 30, 34);
+        let contrast_bg = (0.0, 0.0, 0.0);
+        let start = system_button_colors(ItemRole::Start, ThemePreset::Glass);
+        let drawer = system_button_colors(ItemRole::Drawer, ThemePreset::Glass);
+        let control = system_button_colors(ItemRole::Control, ThemePreset::Glass);
+        assert_ne!(start.primary, drawer.primary);
+        assert_ne!(drawer.primary, control.primary);
+
+        for theme in ThemePreset::ALL {
+            let bg = if theme == ThemePreset::Contrast {
+                contrast_bg
+            } else {
+                dark_bg
+            };
+            for role in [
+                ItemRole::Start,
+                ItemRole::Drawer,
+                ItemRole::Control,
+                ItemRole::Overflow,
+            ] {
+                let c = system_button_colors(role, theme);
+                let min_ratio = if theme == ThemePreset::Contrast {
+                    8.0
+                } else {
+                    4.0
+                };
+                let ratio = contrast_ratio(c.primary, bg);
+                assert!(
+                    ratio >= min_ratio,
+                    "primary color contrast too low ({ratio:.2}) in {theme:?}"
+                );
+            }
+        }
     }
 }
