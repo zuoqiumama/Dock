@@ -921,6 +921,91 @@ unsafe fn draw_container(
     }
 }
 
+#[derive(Clone, Copy)]
+struct IconMotion {
+    scale: f32,
+    press_scale: f32,
+    dy: f32,
+}
+
+fn icon_motion(dock: &Dock, ic: &crate::dock::IconFrame, base: f32) -> IconMotion {
+    let p = ic.presence;
+    let rise = (1.0 - p) * ENTER_RISE * base;
+    let press_scale = if dock.style == DockStyle::Pill {
+        1.0
+    } else {
+        1.0 - 0.055 * ic.press
+    };
+    let press_sink = if dock.style == DockStyle::Pill {
+        0.0
+    } else {
+        1.2 * dock.dpi * ic.press
+    };
+    IconMotion {
+        scale: ic.scale * p * press_scale,
+        press_scale,
+        dy: -ic.bounce_y + rise + press_sink,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BadgeGeometry {
+    bounds: D2D_RECT_F,
+    radius: f32,
+    stroke_width: f32,
+    shadow_spread: f32,
+    text_scale: f32,
+    text_width: f32,
+}
+
+/// Position and scale a corner badge so it stays anchored to the icon's
+/// visual top-right corner across hover magnification, click bounce/press,
+/// and enter/exit transitions.
+fn badge_geometry(
+    dock: &Dock,
+    frame: &crate::dock::Frame,
+    ic: &crate::dock::IconFrame,
+    base: f32,
+    char_count: usize,
+) -> Option<BadgeGeometry> {
+    if ic.presence <= 0.02 {
+        return None;
+    }
+    let motion = icon_motion(dock, ic, base);
+    // Grow sub-linearly on hover magnification so badges move with the icon
+    // without becoming oversized at high magnification settings.
+    let badge_scale = ic.scale.max(1.0).sqrt() * ic.presence * motion.press_scale;
+    let width_factor = match char_count {
+        0 | 1 => 0.34,
+        2 => 0.44,
+        _ => 0.52,
+    };
+    let badge_w = base * width_factor * badge_scale;
+    let badge_h = base * 0.33 * badge_scale;
+    if badge_h <= 1.5 || badge_w <= 1.5 {
+        return None;
+    }
+    let right = ic.cx + base * (0.50 * motion.scale + 0.02 * badge_scale);
+    let top = frame.baseline - base * motion.scale + motion.dy + base * 0.02 * badge_scale;
+    let bounds = D2D_RECT_F {
+        left: right - badge_w,
+        top,
+        right,
+        bottom: top + badge_h,
+    };
+    let radius = (base * 0.12 * badge_scale).min(badge_h * 0.5);
+    let text_scale = badge_h / 18.0;
+    let scale_root = badge_scale.sqrt();
+    Some(BadgeGeometry {
+        bounds,
+        radius,
+        stroke_width: (0.75 * dock.dpi * scale_root).max(0.75),
+        shadow_spread: (0.5 * dock.dpi * scale_root).max(0.4),
+        text_scale,
+        text_width: badge_w / text_scale,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn draw_keycap_tile(
     dc: &ID2D1DeviceContext,
@@ -930,18 +1015,17 @@ unsafe fn draw_keycap_tile(
     ic: &crate::dock::IconFrame,
     base: f32,
     baseline: f32,
-    rise: f32,
     is_foreground: bool,
     palette: &AgentTheme,
 ) {
     let p = ic.presence;
-    let press_scale = 1.0 - 0.055 * ic.press;
-    let s = ic.scale * p * press_scale;
+    let motion = icon_motion(dock, ic, base);
+    let s = motion.scale;
     let layout_dpi = dock.layout_dpi();
     let pad_x = (gap_for(dock.theme) * 0.24).clamp(2.2, 3.6) * layout_dpi;
     let pad_top = 4.5 * layout_dpi;
     let bottom_ext = (6.5 + 1.2 * (ic.scale - 1.0).max(0.0)) * layout_dpi * p;
-    let y_base = baseline - ic.bounce_y + rise + 1.2 * dock.dpi * ic.press;
+    let y_base = baseline + motion.dy;
     let keycap = D2D_RECT_F {
         left: ic.cx - (base * 0.5 + pad_x) * s,
         top: y_base - (base + pad_top) * s,
@@ -1004,14 +1088,14 @@ unsafe fn draw_hover_backplate(
     ic: &crate::dock::IconFrame,
     base: f32,
     baseline: f32,
-    rise: f32,
 ) {
     if ic.hover <= 0.01 || matches!(dock.style, DockStyle::Pill | DockStyle::Tiles) {
         return;
     }
-    let s = ic.scale * ic.presence * (1.0 - 0.055 * ic.press);
+    let motion = icon_motion(dock, ic, base);
+    let s = motion.scale;
     let pad = 4.5 * dock.layout_dpi() * s;
-    let y_base = baseline - ic.bounce_y + rise + 1.2 * dock.dpi * ic.press;
+    let y_base = baseline + motion.dy;
     let half_w = base * 0.5 * s + pad;
     let backplate = D2D1_ROUNDED_RECT {
         rect: D2D_RECT_F {
@@ -1106,7 +1190,6 @@ pub unsafe fn draw(
             continue;
         }
 
-        let rise = (1.0 - p) * ENTER_RISE * base;
         let is_foreground = dock
             .foreground
             .is_some_and(|fg| item.windows.iter().any(|w| w.hwnd == fg));
@@ -1121,30 +1204,15 @@ pub unsafe fn draw(
                 ic,
                 base,
                 frame.baseline,
-                rise,
                 is_foreground,
                 &palette,
             );
         } else {
-            draw_hover_backplate(dc, brush, dock, ic, base, frame.baseline, rise);
+            draw_hover_backplate(dc, brush, dock, ic, base, frame.baseline);
         }
 
-        let press_scale = if dock.style == DockStyle::Pill {
-            1.0
-        } else {
-            1.0 - 0.055 * ic.press
-        };
-        let press_sink = if dock.style == DockStyle::Pill {
-            0.0
-        } else {
-            1.2 * dock.dpi * ic.press
-        };
-        dc.SetTransform(&scale_about(
-            ic.scale * p * press_scale,
-            ic.cx,
-            frame.baseline,
-            -ic.bounce_y + rise + press_sink,
-        ));
+        let motion = icon_motion(dock, ic, base);
+        dc.SetTransform(&scale_about(motion.scale, ic.cx, frame.baseline, motion.dy));
 
         let raw_tile = D2D_RECT_F {
             left: ic.cx - base / 2.0,
@@ -1413,10 +1481,9 @@ pub unsafe fn draw(
                 );
             }
             DockStyle::Tiles => {
-                let press_sink = 1.2 * dock.dpi * ic.press;
-                let y = frame.baseline - ic.bounce_y
-                    + rise
-                    + press_sink
+                let motion = icon_motion(dock, ic, base);
+                let y = frame.baseline
+                    + motion.dy
                     + (3.2 + 0.6 * (ic.scale - 1.0).max(0.0)) * dock.layout_dpi() * ic.presence;
                 let w = if is_foreground {
                     base * 0.48
@@ -1527,59 +1594,64 @@ pub unsafe fn draw(
         };
         if let Some((badge_text, fill_rgb, fg_rgb)) = badge_spec {
             let char_count = badge_text.chars().count();
-            let width_factor = match char_count {
-                0 | 1 => 0.34,
-                2 => 0.44,
-                _ => 0.52,
-            };
-            let right = ic.cx + base * 0.52;
-            let bounds = D2D_RECT_F {
-                left: right - base * width_factor,
-                top: frame.baseline - base * 0.98,
-                right,
-                bottom: frame.baseline - base * 0.65,
-            };
-            let rr = D2D1_ROUNDED_RECT {
-                rect: bounds,
-                radiusX: base * 0.12,
-                radiusY: base * 0.12,
-            };
-            brush.SetColor(&color(
-                fill_rgb.0,
-                fill_rgb.1,
-                fill_rgb.2,
-                0.96 * ic.presence,
-            ));
-            dc.FillRoundedRectangle(&rr, brush);
-            brush.SetColor(&color(1.0, 1.0, 1.0, 0.22 * ic.presence));
-            dc.DrawRoundedRectangle(&rr, brush, (0.75 * dock.dpi).max(0.75), None);
-            brush.SetColor(&color(fg_rgb.0, fg_rgb.1, fg_rgb.2, ic.presence));
-            let text: Vec<u16> = badge_text.encode_utf16().collect();
-            let height = (bounds.bottom - bounds.top).max(1.0);
-            let scale = height / 18.0;
-            let draw_w = (bounds.right - bounds.left) / scale;
-            dc.SetTransform(&Matrix3x2 {
-                M11: scale,
-                M12: 0.0,
-                M21: 0.0,
-                M22: scale,
-                M31: bounds.left,
-                M32: bounds.top,
-            });
-            dc.DrawText(
-                &text,
-                &materials.badge,
-                &D2D_RECT_F {
-                    left: 0.0,
-                    top: 0.0,
-                    right: draw_w,
-                    bottom: 18.0,
-                },
-                brush,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                DWRITE_MEASURING_MODE_NATURAL,
-            );
-            dc.SetTransform(&IDENTITY);
+            if let Some(geom) = badge_geometry(dock, &frame, ic, base, char_count) {
+                let shadow_rr = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: geom.bounds.left - geom.shadow_spread,
+                        top: geom.bounds.top + geom.shadow_spread * 0.5,
+                        right: geom.bounds.right + geom.shadow_spread,
+                        bottom: geom.bounds.bottom + geom.shadow_spread * 2.0,
+                    },
+                    radiusX: geom.radius + geom.shadow_spread * 0.6,
+                    radiusY: geom.radius + geom.shadow_spread * 0.6,
+                };
+                brush.SetColor(&color(0.0, 0.0, 0.0, 0.18 * ic.presence));
+                dc.FillRoundedRectangle(&shadow_rr, brush);
+
+                let rr = D2D1_ROUNDED_RECT {
+                    rect: geom.bounds,
+                    radiusX: geom.radius,
+                    radiusY: geom.radius,
+                };
+                brush.SetColor(&color(
+                    fill_rgb.0,
+                    fill_rgb.1,
+                    fill_rgb.2,
+                    0.96 * ic.presence,
+                ));
+                dc.FillRoundedRectangle(&rr, brush);
+                let border_alpha = if dock.theme == ThemePreset::Contrast {
+                    0.62
+                } else {
+                    0.22
+                };
+                brush.SetColor(&color(1.0, 1.0, 1.0, border_alpha * ic.presence));
+                dc.DrawRoundedRectangle(&rr, brush, geom.stroke_width, None);
+                brush.SetColor(&color(fg_rgb.0, fg_rgb.1, fg_rgb.2, ic.presence));
+                let text: Vec<u16> = badge_text.encode_utf16().collect();
+                dc.SetTransform(&Matrix3x2 {
+                    M11: geom.text_scale,
+                    M12: 0.0,
+                    M21: 0.0,
+                    M22: geom.text_scale,
+                    M31: geom.bounds.left,
+                    M32: geom.bounds.top,
+                });
+                dc.DrawText(
+                    &text,
+                    &materials.badge,
+                    &D2D_RECT_F {
+                        left: 0.0,
+                        top: 0.0,
+                        right: geom.text_width,
+                        bottom: 18.0,
+                    },
+                    brush,
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+                dc.SetTransform(&IDENTITY);
+            }
         }
     }
     dc.SetTransform(&IDENTITY);
@@ -2054,5 +2126,155 @@ mod tests {
                 pair[1]
             );
         }
+    }
+
+    fn approx_eq(a: f32, b: f32) {
+        assert!((a - b).abs() < 1e-3, "expected {b}, got {a}");
+    }
+
+    #[test]
+    fn badge_matches_resting_corner_and_widths() {
+        let items = vec![
+            test_item(ItemRole::Start, None, None),
+            test_item(ItemRole::Pinned, Some("C:\\App1.exe"), None),
+            test_item(ItemRole::Control, None, None),
+        ];
+        let dock = Dock::new(items, 1.0, 1200.0, 200.0, ThemePreset::Glass);
+        let frame = dock.frame();
+        let base = dock.base_icon();
+        let ic = &frame.icons[1];
+
+        let one = badge_geometry(&dock, &frame, ic, base, 1).expect("visible badge");
+        approx_eq(one.bounds.right, ic.cx + base * 0.52);
+        approx_eq(one.bounds.top, frame.baseline - base * 0.98);
+        approx_eq(one.bounds.bottom, frame.baseline - base * 0.65);
+        approx_eq(one.bounds.right - one.bounds.left, base * 0.34);
+
+        let two = badge_geometry(&dock, &frame, ic, base, 2).expect("visible badge");
+        approx_eq(two.bounds.right - two.bounds.left, base * 0.44);
+
+        let three = badge_geometry(&dock, &frame, ic, base, 3).expect("visible badge");
+        approx_eq(three.bounds.right - three.bounds.left, base * 0.52);
+    }
+
+    #[test]
+    fn badge_tracks_hover_magnification_and_stays_in_headroom() {
+        let items = vec![
+            test_item(ItemRole::Start, None, None),
+            test_item(ItemRole::Pinned, Some("C:\\App1.exe"), None),
+            test_item(ItemRole::Control, None, None),
+        ];
+        let prefs = crate::settings::Layout::default();
+        let (w, h) = crate::dock::window_size_with_style(
+            &items,
+            1.5,
+            prefs,
+            ThemePreset::Glass,
+            DockStyle::Tiles,
+        );
+        let mut dock = Dock::new(items, 1.5, w as f32, h as f32, ThemePreset::Glass);
+        dock.style = DockStyle::Tiles;
+        let frame = dock.frame();
+        let base = dock.base_icon();
+
+        let mut hovered = crate::dock::IconFrame {
+            idx: frame.icons[1].idx,
+            cx: frame.icons[1].cx + 12.0,
+            scale: 1.9,
+            bounce_y: 0.0,
+            presence: 1.0,
+            running_presence: 1.0,
+            hover: 1.0,
+            press: 0.0,
+        };
+        let rest = badge_geometry(&dock, &frame, &frame.icons[1], base, 2).unwrap();
+        let mag = badge_geometry(&dock, &frame, &hovered, base, 2).unwrap();
+
+        let icon_top = frame.baseline - base * 1.9;
+        let icon_right = hovered.cx + base * 0.5 * 1.9;
+        let badge_scale = 1.9_f32.sqrt();
+        approx_eq(mag.bounds.top, icon_top + base * 0.02 * badge_scale);
+        approx_eq(mag.bounds.right, icon_right + base * 0.02 * badge_scale);
+        assert!(mag.bounds.bottom - mag.bounds.top > rest.bounds.bottom - rest.bounds.top);
+        assert!(mag.bounds.top < rest.bounds.top - base * 0.8);
+
+        hovered.bounce_y = crate::dock::BOUNCE_AMP * base;
+        let bounced = badge_geometry(&dock, &frame, &hovered, base, 2).unwrap();
+        assert!(
+            bounced.bounds.top > 0.0,
+            "magnified + bouncing badge clipped top edge: {}",
+            bounced.bounds.top
+        );
+    }
+
+    #[test]
+    fn badge_tracks_bounce_presence_and_press() {
+        let items = vec![
+            test_item(ItemRole::Start, None, None),
+            test_item(ItemRole::Pinned, Some("C:\\App1.exe"), None),
+            test_item(ItemRole::Control, None, None),
+        ];
+        let mut dock = Dock::new(items, 1.0, 1200.0, 200.0, ThemePreset::Glass);
+        let frame = dock.frame();
+        let base = dock.base_icon();
+        let base_ic = &frame.icons[1];
+
+        let rest = badge_geometry(&dock, &frame, base_ic, base, 1).unwrap();
+
+        let bouncing = crate::dock::IconFrame {
+            idx: base_ic.idx,
+            cx: base_ic.cx,
+            scale: 1.0,
+            bounce_y: 14.0,
+            presence: 1.0,
+            running_presence: 1.0,
+            hover: 0.0,
+            press: 0.0,
+        };
+        let bounced = badge_geometry(&dock, &frame, &bouncing, base, 1).unwrap();
+        approx_eq(bounced.bounds.top, rest.bounds.top - 14.0);
+        approx_eq(bounced.bounds.bottom, rest.bounds.bottom - 14.0);
+
+        let entering = crate::dock::IconFrame {
+            presence: 0.5,
+            ..bouncing
+        };
+        let enter_geom = badge_geometry(&dock, &frame, &entering, base, 1).unwrap();
+        let rise = 0.5 * ENTER_RISE * base;
+        approx_eq(
+            enter_geom.bounds.top,
+            frame.baseline - base * 0.49 - 14.0 + rise,
+        );
+        approx_eq(
+            enter_geom.bounds.bottom - enter_geom.bounds.top,
+            (rest.bounds.bottom - rest.bounds.top) * 0.5,
+        );
+
+        let invisible = crate::dock::IconFrame {
+            presence: 0.01,
+            ..bouncing
+        };
+        assert!(badge_geometry(&dock, &frame, &invisible, base, 1).is_none());
+
+        let pressed_ic = crate::dock::IconFrame {
+            idx: base_ic.idx,
+            cx: base_ic.cx,
+            scale: 1.0,
+            bounce_y: 0.0,
+            presence: 1.0,
+            running_presence: 1.0,
+            hover: 1.0,
+            press: 1.0,
+        };
+        let pill_press = badge_geometry(&dock, &frame, &pressed_ic, base, 1).unwrap();
+        approx_eq(pill_press.bounds.top, rest.bounds.top);
+
+        dock.style = DockStyle::Fluent;
+        let fluent_press = badge_geometry(&dock, &frame, &pressed_ic, base, 1).unwrap();
+        assert!(fluent_press.bounds.top > rest.bounds.top);
+        assert!(
+            fluent_press.bounds.bottom - fluent_press.bounds.top
+                < rest.bounds.bottom - rest.bounds.top
+        );
     }
 }
