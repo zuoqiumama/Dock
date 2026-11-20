@@ -58,6 +58,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::System::Com::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
@@ -2010,10 +2011,28 @@ unsafe fn reveal_in_explorer(path: &str) {
     );
 }
 
-/// Shared tray / Start-button menu: add content, toggle dock mode, settings, exit.
-unsafe fn run_tray_menu(hwnd: HWND, app: &mut App) {
+unsafe fn open_task_manager() -> Result<()> {
+    let mut directory = [0; MAX_PATH as usize];
+    let length = GetSystemDirectoryW(Some(&mut directory)) as usize;
+    if length == 0 {
+        return Err(Error::from_win32());
+    }
+    if length >= directory.len() {
+        return Err(Error::new(E_FAIL, "Windows 系统目录路径超出长度限制"));
+    }
+    let directory = String::from_utf16_lossy(&directory[..length]);
+    open_content_raw(&format!("{directory}\\Taskmgr.exe"))
+}
+
+/// Run a command from the Dock Start button or notification icon menu.
+unsafe fn run_tray_menu(hwnd: HWND, app: &mut App, source: tray::MenuSource) {
     let always = app.settings.dock_mode == settings::DockMode::Always;
-    match app.tray.show_menu(hwnd, always) {
+    match app.tray.show_menu(hwnd, always, source) {
+        Some(tray::ID_TASK_MANAGER) if !native_tray::fullscreen_foreground_present() => {
+            if let Err(error) = open_task_manager() {
+                show_error(hwnd, "打开任务管理器失败", error);
+            }
+        }
         Some(tray::ID_EXIT) => PostQuitMessage(0),
         Some(tray::ID_AUTOSTART) => {
             if let Err(error) = autostart::set(!autostart::is_enabled()) {
@@ -3466,7 +3485,11 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                                 show_pinned_menu(hwnd, app, &path, &windows);
                             }
                         }
-                        dock::ItemRole::Start => run_tray_menu(hwnd, app),
+                        dock::ItemRole::Start => {
+                            if !native_tray::fullscreen_foreground_present() {
+                                run_tray_menu(hwnd, app, tray::MenuSource::StartButton);
+                            }
+                        }
                         // Keep settings reachable directly from the dock even
                         // when Explorer has put its notification icon in overflow.
                         dock::ItemRole::Control => settings_window::open(hwnd),
@@ -3479,7 +3502,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_TRAY => {
                 if Tray::is_menu_event(lparam) {
-                    run_tray_menu(hwnd, app);
+                    run_tray_menu(hwnd, app, tray::MenuSource::NotificationIcon);
                 }
                 LRESULT(0)
             }

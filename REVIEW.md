@@ -2,6 +2,12 @@
 
 本文件只保留**最新有效结论**和必要的历史摘要。下一次审查直接更新对应小节，不再新建日期版审查文档。待办统一进入 `PLAN.md`。
 
+## 2026-11-20 · 任务管理器菜单
+
+- Dock 左侧「唤出任务栏」按钮的右键菜单顶部新增「打开任务管理器」。通过 Win32 获取系统目录后调用现有 Shell 启动路径，失败时显示错误。打开菜单和执行新命令前检查前台全屏状态。
+- `build.cmd -Verify -Stage` 通过格式、严格 Clippy、**272/272 项测试**和 release 构建。Win32 路径探针确认本机系统目录包含 `Taskmgr.exe`。构建产物已暂存于 `outputs/pending/FeatherDock.exe`。
+- 执行环境为隔离桌面（`EnumWindows=0`）。根目录发布与实际右键点选验收留在 `PLAN.md`。
+
 ## 当前工作区结论 · 2026-11-18（Agent 历史时间窗与主会话聚合）
 
 - 新增 `agent_history_minutes`，默认 **30 分钟**；「布局与快捷键… → Agent 空闲历史」提供 30 分钟、1 小时、6 小时、24 小时、全部五档，复用预览/取消/保存。仅过期 Track B Idle 被显示筛选，Track A、Running/Error/Waiting 与未读 Done 始终保留；过滤不删除文件、Registry、已读标记或 Tombstone，角标与弹层共用同一摘要。

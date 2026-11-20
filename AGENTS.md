@@ -52,6 +52,7 @@ FeatherDock 是 Windows 10+ 的轻量原生 Dock：
 - 首批 Agent 为 `antigravity`、`codex`、`dsh`；同一 Agent 的固定项和运行窗口聚合成一个槽位。
 - Agent 区为空时隐藏；普通项与 Agent 固定项各自内部排序，不跨区拖拽。
 - 溢出时优先保留 `Waiting`、`Error`、`Running` 等活跃 Agent，再保留普通运行项。
+- Dock 左侧「唤出任务栏」按钮的右键菜单提供「打开任务管理器」，用于启动 Windows 自带的任务管理器。遵守全屏免打扰。
 - 系统托盘按钮按需唤出 Explorer 的原生「隐藏的图标」面板。任务栏完全隐藏时保持透明和自动隐藏，点击只打开托盘面板。遵守全屏免打扰。
 - 非标准可执行文件名必须在 `featherdock.toml` 显式声明，例如 DeepSeek Harness：
 

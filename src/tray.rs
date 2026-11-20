@@ -16,10 +16,17 @@ pub const ID_SETTINGS: usize = 1005;
 pub const ID_TOGGLE_DOCK_MODE: usize = 1006;
 // Keep retrying if Explorer is still starting or restarting when NIM_ADD runs.
 pub const TIMER_TRAY_RETRY: usize = 1007;
+pub const ID_TASK_MANAGER: usize = 1008;
 const TRAY_RETRY_MS: u32 = 1000;
 const TRAY_ICON_ID: u32 = 1;
 // shellapi.h defines this expression as a macro, omitted by windows 0.58.
 const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MenuSource {
+    StartButton,
+    NotificationIcon,
+}
 
 pub struct Tray {
     nid: NOTIFYICONDATAW,
@@ -132,12 +139,21 @@ impl Tray {
 
     /// Show the context menu and return the chosen command id (the caller acts on it).
     /// `always_mode` controls the check next to the "resident at bottom" toggle.
-    pub unsafe fn show_menu(&self, hwnd: HWND, always_mode: bool) -> Option<usize> {
+    pub unsafe fn show_menu(
+        &self,
+        hwnd: HWND,
+        always_mode: bool,
+        source: MenuSource,
+    ) -> Option<usize> {
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         let Ok(menu) = CreatePopupMenu() else {
             return None;
         };
+        if source == MenuSource::StartButton {
+            let _ = AppendMenuW(menu, MF_STRING, ID_TASK_MANAGER, w!("打开任务管理器"));
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        }
         let add: Vec<u16> = "添加文件或应用…\0".encode_utf16().collect();
         let _ = AppendMenuW(menu, MF_STRING, ID_ADD, PCWSTR(add.as_ptr()));
         let add_folder: Vec<u16> = "添加文件夹…\0".encode_utf16().collect();
